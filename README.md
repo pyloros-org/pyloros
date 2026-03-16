@@ -188,6 +188,21 @@ export NODE_EXTRA_CA_CERTS=/path/to/certs/ca.crt
 
 Node.js does **not** use the system CA store, so `NODE_EXTRA_CA_CERTS` is required. This applies to all Node.js-based tools including Claude Code.
 
+### Haskell (wreq)
+
+wreq uses http-client-tls, which respects `HTTPS_PROXY` / `HTTP_PROXY` environment variables automatically.
+
+For the CA certificate, point the system cert store at your CA cert:
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:8080
+export SSL_CERT_FILE=/path/to/certs/ca.crt
+```
+
+**Gotchas:**
+- wreq/http-client check **uppercase** `HTTPS_PROXY` and `HTTP_PROXY` (unlike curl which needs lowercase for HTTP).
+- `SSL_CERT_FILE` works because http-client-tls reads system certs via `x509-system`, which respects this variable on Linux.
+
 ## Configuration
 
 Configuration uses TOML format. Pass it via `--config` or set values with CLI flags.
