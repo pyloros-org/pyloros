@@ -75,6 +75,17 @@ impl<'a> RequestInfo<'a> {
     }
 }
 
+/// Branch filter with allow and deny pattern lists.
+///
+/// A ref is allowed if:
+/// 1. It does NOT match any deny pattern, AND
+/// 2. Either the allow list is empty (implicit allow-all) or it matches at least one allow pattern.
+#[derive(Debug, Clone)]
+pub struct BranchFilter {
+    pub allow: Vec<PatternMatcher>,
+    pub deny: Vec<PatternMatcher>,
+}
+
 /// A compiled rule ready for efficient matching
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
@@ -84,8 +95,8 @@ pub struct CompiledRule {
     url: UrlPattern,
     /// Whether this rule is for WebSocket connections
     websocket: bool,
-    /// Branch patterns for git push restriction (if Some, body inspection required)
-    branch_patterns: Option<Vec<PatternMatcher>>,
+    /// Branch filter for git push restriction (if Some, body inspection required)
+    branch_filter: Option<BranchFilter>,
     /// Allowed LFS operations (if Some, body inspection required for LFS batch endpoint)
     lfs_operations: Option<Vec<String>>,
 }
@@ -109,7 +120,7 @@ impl CompiledRule {
             method,
             url,
             websocket: rule.websocket,
-            branch_patterns: None,
+            branch_filter: None,
             lfs_operations: None,
         })
     }
@@ -155,15 +166,21 @@ impl CompiledRule {
                 "GET",
                 None,
             )?);
-            // POST <repo>/git-receive-pack (with optional branch patterns)
-            let branch_patterns = rule
+            // POST <repo>/git-receive-pack (with optional branch filter)
+            let branch_filter = rule
                 .branches
                 .as_ref()
                 .map(|branches| {
-                    branches
-                        .iter()
-                        .map(|b| PatternMatcher::new(b))
-                        .collect::<Result<Vec<_>>>()
+                    let mut allow = Vec::new();
+                    let mut deny = Vec::new();
+                    for b in branches {
+                        if let Some(stripped) = b.strip_prefix('!') {
+                            deny.push(PatternMatcher::new(stripped)?);
+                        } else {
+                            allow.push(PatternMatcher::new(b)?);
+                        }
+                    }
+                    Ok::<BranchFilter, crate::error::Error>(BranchFilter { allow, deny })
                 })
                 .transpose()?;
             rules.push(Self::compile_git_endpoint(
@@ -171,7 +188,7 @@ impl CompiledRule {
                 "/git-receive-pack",
                 None,
                 "POST",
-                branch_patterns,
+                branch_filter,
             )?);
         }
 
@@ -196,7 +213,7 @@ impl CompiledRule {
         path_suffix: &str,
         query: Option<&str>,
         method: &str,
-        branch_patterns: Option<Vec<PatternMatcher>>,
+        branch_filter: Option<BranchFilter>,
     ) -> Result<Self> {
         // Build the full URL by appending the suffix to the base URL's path
         let full_url = match query {
@@ -211,7 +228,7 @@ impl CompiledRule {
             method: method_matcher,
             url,
             websocket: false,
-            branch_patterns,
+            branch_filter,
             lfs_operations: None,
         })
     }
@@ -226,7 +243,7 @@ impl CompiledRule {
             method: method_matcher,
             url,
             websocket: false,
-            branch_patterns: None,
+            branch_filter: None,
             lfs_operations: Some(lfs_operations),
         })
     }
@@ -264,7 +281,7 @@ pub enum FilterResult {
     /// Request is allowed (a rule matched with no branch restriction)
     Allowed,
     /// Request is allowed but requires branch-level body inspection
-    AllowedWithBranchCheck(Vec<PatternMatcher>),
+    AllowedWithBranchCheck(BranchFilter),
     /// Request is allowed but requires LFS operation body inspection.
     /// Carries the merged list of allowed operations (e.g., ["download", "upload"]).
     AllowedWithLfsCheck(Vec<String>),
@@ -306,8 +323,8 @@ impl FilterEngine {
 
         for rule in &self.rules {
             if rule.matches(request) {
-                if let Some(ref patterns) = rule.branch_patterns {
-                    return FilterResult::AllowedWithBranchCheck(patterns.clone());
+                if let Some(ref filter) = rule.branch_filter {
+                    return FilterResult::AllowedWithBranchCheck(filter.clone());
                 }
                 if let Some(ref ops) = rule.lfs_operations {
                     // Accumulate LFS operations across matching rules (merged-scan)

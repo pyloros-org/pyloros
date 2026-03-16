@@ -68,9 +68,40 @@ The optional `branches` field restricts which refs a push can target. It is only
 
 - Bare patterns like `feature/*` match against `refs/heads/feature/*`.
 - Patterns starting with `refs/` are matched literally (escape hatch for tags, notes, etc.).
+- Patterns prefixed with `!` are **deny** patterns — they exclude matching refs.
 - Omitting `branches` means any ref is allowed.
 - If a push updates multiple refs and **any** ref is disallowed, the **entire push** is blocked.
 - When a push is blocked by branch restrictions, the proxy returns a proper git `receive-pack` response (HTTP 200 with `report-status` and sideband error messages) instead of HTTP 451. This allows git clients to display clear per-ref errors like `! [remote rejected] main -> main (blocked by proxy policy)`.
+
+**Deny pattern semantics (`!` prefix):**
+
+- Patterns without `!` are allow patterns (existing behavior).
+- Patterns with `!` prefix are deny patterns — the `!` is stripped before matching.
+- **Deny wins**: if a ref matches both an allow and a deny pattern, it is blocked.
+- If only deny patterns are present (no explicit allow patterns), there is an implicit allow-all (`*`). So `["!main"]` means "all branches except main".
+- A bare `!` (empty pattern after stripping the prefix) is a config validation error.
+
+**Examples:**
+
+```toml
+# Allow push to any branch except main and release/*
+[[rules]]
+git = "push"
+url = "https://github.com/myorg/*"
+branches = ["*", "!main", "!release/*"]
+
+# Allow push only to feature/* but not feature/dangerous
+[[rules]]
+git = "push"
+url = "https://github.com/myorg/deploy-tools"
+branches = ["feature/*", "!feature/dangerous"]
+
+# Shorthand: allow all except main (implicit allow-all)
+[[rules]]
+git = "push"
+url = "https://github.com/myorg/repo"
+branches = ["!main"]
+```
 
 See `INTERNALS.md` for implementation details (smart HTTP endpoint mapping, pkt-line inspection, compilation model).
 
@@ -278,6 +309,12 @@ url = "https://github.com/myorg/*"
 git = "push"
 url = "https://github.com/myorg/agent-workspace"
 branches = ["feature/*", "fix/*"]
+
+# Allow push to any branch except main and release/*
+[[rules]]
+git = "push"
+url = "https://github.com/myorg/shared-repo"
+branches = ["*", "!main", "!release/*"]
 
 # Credential injection — inject API keys/tokens into matching requests
 

@@ -210,7 +210,7 @@ impl TunnelHandler {
                 });
                 return Ok(blocked_response(&method, &full_url));
             }
-            FilterResult::AllowedWithBranchCheck(ref patterns) => {
+            FilterResult::AllowedWithBranchCheck(ref filter) => {
                 if self.log_allowed_requests {
                     tracing::info!(
                         method = %method,
@@ -232,7 +232,7 @@ impl TunnelHandler {
                     })?
                     .to_bytes();
 
-                let blocked = pktline::blocked_refs(&body_bytes, patterns);
+                let blocked = pktline::blocked_refs_with_filter(&body_bytes, filter);
                 if !blocked.is_empty() {
                     if self.log_blocked_requests {
                         tracing::warn!(
