@@ -33,6 +33,27 @@ cargo run -- generate-ca --out ./certs/                  # Generate CA cert/key
 cargo run -- validate-config --config config.toml        # Validate config
 ```
 
+## Manual Testing
+
+Use `scripts/pyloros-test-proxy.sh` to quickly test the proxy against real servers. It generates a temporary CA, starts the proxy, runs a command with all proxy env vars set, and cleans up on exit.
+
+```bash
+# Test curl through proxy
+scripts/pyloros-test-proxy.sh --rule 'GET https://httpbin.org/*' -- curl -sS https://httpbin.org/get
+
+# Test wget through proxy
+scripts/pyloros-test-proxy.sh --rule 'GET https://www.google.com/*' -- wget -O /dev/null https://www.google.com/
+
+# Multiple rules
+scripts/pyloros-test-proxy.sh --rule 'GET https://api.github.com/*' --rule '* https://httpbin.org/*' \
+  -- curl -sS https://api.github.com/zen
+
+# Interactive shell with proxy configured
+scripts/pyloros-test-proxy.sh --rule '* https://*.example.com/*' -- bash
+```
+
+Use this for ad-hoc verification when automated tests pass but you want to confirm behavior against real servers (different TLS stacks, h2 negotiation, etc.).
+
 ## Development process
 
 `devdocs/SPEC.md` is a declarative specification of what we want this product to be: features, technical choices (libraries, protocols, testing strategy), and configuration format. Code should ultimately be maintained to match the requirements here. When we want to change something in the product, we first modify the SPEC.
