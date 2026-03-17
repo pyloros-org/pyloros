@@ -300,18 +300,7 @@ impl ProxyHandler {
     }
 }
 
-/// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1).
-const HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
+use super::HOP_BY_HOP_HEADERS;
 
 /// Forward a plain HTTP request to the upstream server.
 async fn forward_http_request(

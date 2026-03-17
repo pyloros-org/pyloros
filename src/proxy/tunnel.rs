@@ -400,6 +400,7 @@ impl TunnelHandler {
             // Set the upstream Host header BEFORE signing so the signature covers
             // the final host value that the upstream server will see.
             let (mut parts, body) = req.into_parts();
+            super::strip_hop_by_hop_headers(&mut parts.headers);
             let upstream_host_value = if connect_port == 443 {
                 host.to_string()
             } else {
@@ -432,6 +433,7 @@ impl TunnelHandler {
             .await
         } else {
             let (mut parts, body) = req.into_parts();
+            super::strip_hop_by_hop_headers(&mut parts.headers);
             self.credential_engine
                 .inject(&request_info, &mut parts.headers);
             let req = rebuild_request_for_upstream(parts, body.boxed(), host, connect_port);
@@ -463,7 +465,7 @@ impl TunnelHandler {
     /// Shared by branch-check and LFS-check arms.
     async fn forward_buffered(
         &self,
-        parts: hyper::http::request::Parts,
+        mut parts: hyper::http::request::Parts,
         body_bytes: Bytes,
         host: &str,
         port: u16,
@@ -476,6 +478,7 @@ impl TunnelHandler {
             .as_deref()
             .unwrap_or(host)
             .to_string();
+        super::strip_hop_by_hop_headers(&mut parts.headers);
         let full_body = Full::new(body_bytes).map_err(|e| match e {}).boxed();
         let req = match rebuild_request_for_upstream(parts, full_body, host, connect_port) {
             Ok(r) => r,
@@ -562,11 +565,42 @@ fn rebuild_request_for_upstream<B>(
     host: &str,
     port: u16,
 ) -> Result<Request<B>> {
-    let mut builder = Request::builder().method(parts.method).uri(parts.uri);
+    // If the URI is path-only (e.g. "/" from an HTTP/1.1 client inside a CONNECT
+    // tunnel), reconstruct the full absolute URI so that hyper's HTTP/2 client can
+    // derive the :scheme and :authority pseudo-headers. Without this, h2 servers
+    // reject the request with PROTOCOL_ERROR.
+    let uri = if parts.uri.scheme().is_none() {
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let authority = if port == 443 {
+            host.to_string()
+        } else {
+            format!("{}:{}", host, port)
+        };
+        hyper::Uri::builder()
+            .scheme("https")
+            .authority(authority)
+            .path_and_query(path_and_query)
+            .build()
+            .map_err(|e| Error::proxy(format!("Failed to build URI: {}", e)))?
+    } else {
+        parts.uri
+    };
+
+    let host_value = if port == 443 {
+        host.to_string()
+    } else {
+        format!("{}:{}", host, port)
+    };
+
+    let mut builder = Request::builder().method(parts.method).uri(uri);
 
     for (name, value) in parts.headers.iter() {
         if name == hyper::header::HOST {
-            builder = builder.header(name, format!("{}:{}", host, port));
+            builder = builder.header(name, &host_value);
         } else {
             builder = builder.header(name, value);
         }
@@ -579,7 +613,7 @@ fn rebuild_request_for_upstream<B>(
 
 /// Forward a request with a BoxBody to the upstream server (supports h1 and h2 via ALPN).
 async fn forward_request_boxed(
-    req: Request<BoxBody<Bytes, hyper::Error>>,
+    mut req: Request<BoxBody<Bytes, hyper::Error>>,
     connect_host: String,
     port: u16,
     sni_host: String,
@@ -613,6 +647,11 @@ async fn forward_request_boxed(
                 tracing::debug!("HTTP/2 connection error: {}", e);
             }
         });
+
+        // In HTTP/2, the :authority pseudo-header is derived from the URI.
+        // Some servers (e.g. Google) reject requests that have both :authority
+        // and a Host header, even when they match. Remove Host since it's redundant.
+        req.headers_mut().remove(hyper::header::HOST);
 
         let resp = sender.send_request(req).await.map_err(|e| {
             Error::proxy(format!("{} {}: HTTP/2 request failed: {}", method, uri, e))

@@ -196,17 +196,9 @@ fn build_curl_command_with_auth(
         format!("http://127.0.0.1:{}", proxy_port)
     };
     let mut cmd = Command::new("curl");
-    cmd.env("HTTPS_PROXY", &proxy_url).args([
-        "-s",
-        "-S",
-        "--cacert",
-        ca_cert_path,
-        "-w",
-        "\n%{http_code}",
-        "--max-time",
-        "10",
-        url,
-    ]);
+    cmd.env("HTTPS_PROXY", &proxy_url)
+        .env("SSL_CERT_FILE", ca_cert_path)
+        .args(["-s", "-S", "-w", "\n%{http_code}", "--max-time", "10", url]);
     cmd
 }
 
@@ -305,6 +297,112 @@ async fn test_binary_allowed_get_returns_200() {
 
     t.assert_eq("Response status", &status, &200u16);
     t.assert_eq("Response body", &body.as_str(), &"hello binary");
+
+    child.kill().ok();
+    child.wait().ok();
+    upstream.shutdown();
+}
+
+/// Spawn the binary with auth, wget an allowed HTTPS request, verify 200 + body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_allowed_get_returns_200_wget() {
+    let t = test_report!("Binary: allowed HTTPS GET returns 200 via wget (with auth)");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("hello binary wget"))
+        .report(&t, "returns 'hello binary wget'")
+        .start()
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let config_toml = build_config_toml_with_auth(
+        &ca.cert_path,
+        &ca.key_path,
+        upstream.port(),
+        &ca.cert_path,
+        &[("GET", "https://localhost/*")],
+        Some(("testuser", "testpass")),
+    );
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let (mut child, proxy_port) = spawn_proxy_reported(&t, &config_path);
+
+    let proxy_url = format!("http://testuser:testpass@127.0.0.1:{}", proxy_port);
+    let mut cmd = Command::new("wget");
+    cmd.env("https_proxy", &proxy_url)
+        .env("SSL_CERT_FILE", &ca.cert_path)
+        .args(["-q", "-O", "-", "https://localhost/test"]);
+    let output = common::run_command_reported(&t, &mut cmd);
+
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    t.assert_true("wget exited successfully", output.status.success());
+    t.assert_eq("Response body", &body.as_str(), &"hello binary wget");
+
+    if !output.status.success() {
+        panic!("wget failed: exit={}, stderr={}", output.status, stderr);
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    upstream.shutdown();
+}
+
+/// Verify wget's hop-by-hop headers (Connection, Proxy-Connection) are stripped.
+/// wget sends these by default inside the CONNECT tunnel; the proxy must remove
+/// them before forwarding upstream per RFC 7230 §6.1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_wget_hop_by_hop_stripped() {
+    let t = test_report!("Binary: wget hop-by-hop headers stripped before upstream");
+
+    let ca = TestCa::generate();
+    // Use h1-only upstream to avoid hyper's h2 auto-stripping masking the bug.
+    let upstream = TestUpstream::builder(&ca, common::echo_handler())
+        .h1_only()
+        .report(&t, "echoes request details (h1 only)")
+        .start()
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let config_toml = build_config_toml_with_auth(
+        &ca.cert_path,
+        &ca.key_path,
+        upstream.port(),
+        &ca.cert_path,
+        &[("GET", "https://localhost/*")],
+        Some(("testuser", "testpass")),
+    );
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let (mut child, proxy_port) = spawn_proxy_reported(&t, &config_path);
+
+    let proxy_url = format!("http://testuser:testpass@127.0.0.1:{}", proxy_port);
+    let mut cmd = Command::new("wget");
+    cmd.env("https_proxy", &proxy_url)
+        .env("SSL_CERT_FILE", &ca.cert_path)
+        .args(["-q", "-O", "-", "https://localhost/test"]);
+    let output = common::run_command_reported(&t, &mut cmd);
+
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    t.assert_true("wget exited successfully", output.status.success());
+    // The echo handler returns the upstream-received headers. Verify hop-by-hop
+    // headers are not forwarded (they would cause a 502 on h2 upstream).
+    t.assert_not_contains("No connection header forwarded", &body, "connection:");
+    t.assert_not_contains(
+        "No proxy-connection header forwarded",
+        &body,
+        "proxy-connection:",
+    );
+    t.assert_not_contains("No keep-alive header forwarded", &body, "keep-alive:");
+
+    if !output.status.success() {
+        panic!("wget failed: exit={}, stderr={}", output.status, stderr);
+    }
 
     child.kill().ok();
     child.wait().ok();
