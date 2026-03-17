@@ -196,17 +196,9 @@ fn build_curl_command_with_auth(
         format!("http://127.0.0.1:{}", proxy_port)
     };
     let mut cmd = Command::new("curl");
-    cmd.env("HTTPS_PROXY", &proxy_url).args([
-        "-s",
-        "-S",
-        "--cacert",
-        ca_cert_path,
-        "-w",
-        "\n%{http_code}",
-        "--max-time",
-        "10",
-        url,
-    ]);
+    cmd.env("HTTPS_PROXY", &proxy_url)
+        .env("SSL_CERT_FILE", ca_cert_path)
+        .args(["-s", "-S", "-w", "\n%{http_code}", "--max-time", "10", url]);
     cmd
 }
 
@@ -338,14 +330,9 @@ async fn test_binary_allowed_get_returns_200_wget() {
 
     let proxy_url = format!("http://testuser:testpass@127.0.0.1:{}", proxy_port);
     let mut cmd = Command::new("wget");
-    cmd.env("https_proxy", &proxy_url).args([
-        "-q",
-        "-O",
-        "-",
-        "--ca-certificate",
-        &ca.cert_path,
-        "https://localhost/test",
-    ]);
+    cmd.env("https_proxy", &proxy_url)
+        .env("SSL_CERT_FILE", &ca.cert_path)
+        .args(["-q", "-O", "-", "https://localhost/test"]);
     let output = common::run_command_reported(&t, &mut cmd);
 
     let body = String::from_utf8_lossy(&output.stdout).to_string();
