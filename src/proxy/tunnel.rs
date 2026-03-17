@@ -151,8 +151,8 @@ impl TunnelHandler {
         Ok(())
     }
 
-    /// Handle a request that came through the MITM tunnel
-    async fn handle_tunneled_request(
+    /// Handle a request that came through the MITM tunnel or direct HTTPS listener.
+    pub async fn handle_tunneled_request(
         &self,
         req: Request<Incoming>,
         host: &str,

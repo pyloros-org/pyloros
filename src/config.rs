@@ -144,6 +144,12 @@ pub struct ProxyConfig {
     /// Path to PEM CA cert to trust for upstream TLS (testing only)
     #[serde(default)]
     pub upstream_tls_ca: Option<String>,
+
+    /// Address to bind the direct HTTPS listener (optional).
+    /// When set, the proxy accepts raw TLS connections (not proxy protocol)
+    /// and uses SNI to determine the target hostname.
+    #[serde(default)]
+    pub direct_https_bind: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -156,6 +162,7 @@ impl Default for ProxyConfig {
             auth_password: None,
             upstream_override_port: None,
             upstream_tls_ca: None,
+            direct_https_bind: None,
         }
     }
 }
@@ -427,12 +434,66 @@ impl Config {
                 auth_password: None,
                 upstream_override_port: None,
                 upstream_tls_ca: None,
+                direct_https_bind: None,
             },
             logging: LoggingConfig::default(),
             rules: Vec::new(),
             credentials: Vec::new(),
         }
     }
+
+    /// Extract literal hostnames from all rule URL patterns.
+    ///
+    /// Returns `(literal_hosts, wildcard_hosts)`:
+    /// - `literal_hosts`: hostnames that can go in `/etc/hosts` (no wildcards)
+    /// - `wildcard_hosts`: host patterns containing `*` (skipped, for user warnings)
+    ///
+    /// Hostnames are deduplicated and sorted.
+    pub fn extract_hosts(&self) -> (Vec<String>, Vec<String>) {
+        let mut literal = std::collections::BTreeSet::new();
+        let mut wildcard = std::collections::BTreeSet::new();
+
+        for rule in &self.rules {
+            if let Some(host) = extract_host_from_url(&rule.url) {
+                if host.contains('*') {
+                    wildcard.insert(host);
+                } else {
+                    literal.insert(host);
+                }
+            }
+        }
+
+        for cred in &self.credentials {
+            if let Some(host) = extract_host_from_url(cred.url()) {
+                if host.contains('*') {
+                    wildcard.insert(host);
+                } else {
+                    literal.insert(host);
+                }
+            }
+        }
+
+        (
+            literal.into_iter().collect(),
+            wildcard.into_iter().collect(),
+        )
+    }
+}
+
+/// Extract the host portion from a URL pattern like `https://host.example.com/path`.
+/// Returns the host without port, or None if the URL can't be parsed.
+fn extract_host_from_url(url: &str) -> Option<String> {
+    // Strip scheme (e.g. "https://", "http://", "wss://")
+    let after_scheme = url.find("://").map(|i| &url[i + 3..])?;
+    // Take up to the next '/' or ':'
+    let host = after_scheme
+        .split(['/', ':'])
+        .next()
+        .unwrap_or(after_scheme);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 /// Resolve `${ENV_VAR}` placeholders in a credential value string.

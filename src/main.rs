@@ -36,6 +36,10 @@ enum Commands {
         #[arg(short, long)]
         bind: Option<String>,
 
+        /// Direct HTTPS listener bind address (optional, enables SNI-based direct TLS mode)
+        #[arg(long)]
+        direct_https_bind: Option<String>,
+
         /// Log level (error, warn, info, debug, trace)
         #[arg(short, long, default_value = "info")]
         log_level: String,
@@ -62,6 +66,17 @@ enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
+
+    /// Generate /etc/hosts entries for direct HTTPS mode
+    GenerateHosts {
+        /// Path to configuration file
+        #[arg(short, long)]
+        config: PathBuf,
+
+        /// IP address to map hostnames to
+        #[arg(long, default_value = "127.0.0.12")]
+        ip: String,
+    },
 }
 
 #[tokio::main]
@@ -76,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca_cert,
             ca_key,
             bind,
+            direct_https_bind,
             log_level,
         } => {
             // Initialize logging
@@ -106,6 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(addr) = bind {
                 cfg.proxy.bind_address = addr;
+            }
+            if let Some(addr) = direct_https_bind {
+                cfg.proxy.direct_https_bind = Some(addr);
             }
 
             // Validate required fields
@@ -303,6 +322,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "All {} credentials compiled successfully.",
                     cred_engine.credential_count()
+                );
+            }
+        }
+
+        Commands::GenerateHosts { config, ip } => {
+            let cfg = Config::from_file(&config)?;
+            let (literal_hosts, wildcard_hosts) = cfg.extract_hosts();
+
+            // Warn about skipped wildcard patterns
+            for pattern in &wildcard_hosts {
+                eprintln!(
+                    "Warning: skipping wildcard pattern '{}' (cannot be used in /etc/hosts)",
+                    pattern
+                );
+            }
+
+            // Output /etc/hosts format
+            for host in &literal_hosts {
+                println!("{} {}", ip, host);
+            }
+
+            if literal_hosts.is_empty() {
+                eprintln!("Warning: no literal hostnames found in config rules");
+            } else {
+                eprintln!(
+                    "Generated {} host entries ({} wildcard patterns skipped)",
+                    literal_hosts.len(),
+                    wildcard_hosts.len()
                 );
             }
         }
