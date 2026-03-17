@@ -311,6 +311,58 @@ async fn test_binary_allowed_get_returns_200() {
     upstream.shutdown();
 }
 
+/// Spawn the binary with auth, wget an allowed HTTPS request, verify 200 + body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_allowed_get_returns_200_wget() {
+    let t = test_report!("Binary: allowed HTTPS GET returns 200 via wget (with auth)");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("hello binary wget"))
+        .report(&t, "returns 'hello binary wget'")
+        .start()
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let config_toml = build_config_toml_with_auth(
+        &ca.cert_path,
+        &ca.key_path,
+        upstream.port(),
+        &ca.cert_path,
+        &[("GET", "https://localhost/*")],
+        Some(("testuser", "testpass")),
+    );
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let (mut child, proxy_port) = spawn_proxy_reported(&t, &config_path);
+
+    let proxy_url = format!("http://testuser:testpass@127.0.0.1:{}", proxy_port);
+    let mut cmd = Command::new("wget");
+    cmd.env("https_proxy", &proxy_url).args([
+        "-q",
+        "-O",
+        "-",
+        "--ca-certificate",
+        &ca.cert_path,
+        "https://localhost/test",
+    ]);
+    let output = common::run_command_reported(&t, &mut cmd);
+
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    t.assert_true("wget exited successfully", output.status.success());
+    t.assert_eq("Response body", &body.as_str(), &"hello binary wget");
+
+    if !output.status.success() {
+        panic!("wget failed: exit={}, stderr={}", output.status, stderr);
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    upstream.shutdown();
+}
+
 /// Spawn the binary with auth, curl a blocked HTTPS request, verify 451.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_binary_blocked_request_returns_451() {
