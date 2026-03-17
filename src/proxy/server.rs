@@ -1,9 +1,8 @@
 //! Main proxy server
 
-use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use std::fmt;
 use std::net::SocketAddr;
@@ -235,89 +234,17 @@ impl ProxyServer {
     /// For Unix sockets, the path from the config is returned.
     /// Call `serve()` afterwards to start accepting connections.
     pub async fn bind(&mut self) -> Result<ListenAddress> {
-        let bind_address = &self.config.proxy.bind_address;
-
-        // If the bind address contains '/', treat it as a Unix socket path
-        #[cfg(unix)]
-        if bind_address.contains('/') {
-            let path = PathBuf::from(bind_address);
-
-            // Remove stale socket file if it exists
-            if path.exists() {
-                std::fs::remove_file(&path).map_err(|e| {
-                    Error::proxy(format!(
-                        "Failed to remove stale socket '{}': {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
-            }
-
-            let listener = UnixListener::bind(&path).map_err(|e| {
-                Error::proxy(format!("Failed to bind to {}: {}", path.display(), e))
-            })?;
-
-            self.listener = Some(BoundListener::Unix(listener));
-            return Ok(ListenAddress::Unix(path));
-        }
-
-        // Otherwise parse as TCP address
-        let addr: SocketAddr = bind_address.parse().map_err(|e| {
-            Error::config(format!("Invalid bind address '{}': {}", bind_address, e))
-        })?;
-
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| Error::proxy(format!("Failed to bind to {}: {}", addr, e)))?;
-
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| Error::proxy(format!("Failed to get local address: {}", e)))?;
-
-        self.listener = Some(BoundListener::Tcp(listener));
-        Ok(ListenAddress::Tcp(local_addr))
+        let (listener, addr) = bind_listener(&self.config.proxy.bind_address).await?;
+        self.listener = Some(listener);
+        Ok(addr)
     }
 
     /// Bind the direct HTTPS listener to the given address.
     /// The address can be a TCP socket address or a Unix socket path (containing '/').
     pub async fn bind_direct_https(&mut self, bind_address: &str) -> Result<ListenAddress> {
-        #[cfg(unix)]
-        if bind_address.contains('/') {
-            let path = PathBuf::from(bind_address);
-            if path.exists() {
-                std::fs::remove_file(&path).map_err(|e| {
-                    Error::proxy(format!(
-                        "Failed to remove stale socket '{}': {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
-            }
-            let listener = UnixListener::bind(&path).map_err(|e| {
-                Error::proxy(format!(
-                    "Failed to bind direct HTTPS to {}: {}",
-                    path.display(),
-                    e
-                ))
-            })?;
-            self.direct_https_listener = Some(BoundListener::Unix(listener));
-            return Ok(ListenAddress::Unix(path));
-        }
-
-        let addr: SocketAddr = bind_address.parse().map_err(|e| {
-            Error::config(format!(
-                "Invalid direct HTTPS bind address '{}': {}",
-                bind_address, e
-            ))
-        })?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| Error::proxy(format!("Failed to bind direct HTTPS to {}: {}", addr, e)))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| Error::proxy(format!("Failed to get local address: {}", e)))?;
-        self.direct_https_listener = Some(BoundListener::Tcp(listener));
-        Ok(ListenAddress::Tcp(local_addr))
+        let (listener, addr) = bind_listener(bind_address).await?;
+        self.direct_https_listener = Some(listener);
+        Ok(addr)
     }
 
     /// Serve connections using a previously bound listener, with graceful shutdown.
@@ -329,13 +256,20 @@ impl ProxyServer {
             .take()
             .expect("must call bind() before serve()");
 
-        let mut tunnel_handler = Arc::new(self.make_tunnel_handler());
+        // Use a watch channel for the tunnel handler so both the proxy and
+        // direct HTTPS listeners see reloaded configs.
+        let (tunnel_handler_tx, tunnel_handler_rx) =
+            tokio::sync::watch::channel(Arc::new(self.make_tunnel_handler()));
 
-        // Spawn direct HTTPS listener if bound
+        // Spawn direct HTTPS listener if bound (shares the watch receiver)
         if let Some(direct_listener) = self.direct_https_listener.take() {
             let tls_config = self.mitm_generator.sni_server_config();
             let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
-            self.spawn_direct_https_listener(direct_listener, tls_acceptor, &tunnel_handler);
+            spawn_direct_https_accept_loop(
+                direct_listener,
+                tls_acceptor,
+                tunnel_handler_rx.clone(),
+            );
         }
 
         // Set up reload channel. We always create one so the select! branch blocks.
@@ -365,7 +299,7 @@ impl ProxyServer {
                         return Ok(());
                     }
                     Some(()) = reload_rx.recv() => {
-                        self.apply_reload(&mut tunnel_handler);
+                        self.apply_reload(&tunnel_handler_tx);
                     }
                     result = tcp_listener.accept() => {
                         let (stream, client_addr) = match result {
@@ -377,7 +311,8 @@ impl ProxyServer {
                         };
 
                         tracing::debug!(client = %client_addr, "New connection");
-                        self.spawn_connection(stream, client_addr.to_string(), &tunnel_handler);
+                        let handler = tunnel_handler_rx.borrow().clone();
+                        self.spawn_connection(stream, client_addr.to_string(), &handler);
                     }
                 }
             },
@@ -389,7 +324,7 @@ impl ProxyServer {
                         return Ok(());
                     }
                     Some(()) = reload_rx.recv() => {
-                        self.apply_reload(&mut tunnel_handler);
+                        self.apply_reload(&tunnel_handler_tx);
                     }
                     result = unix_listener.accept() => {
                         let (stream, _addr) = match result {
@@ -401,7 +336,8 @@ impl ProxyServer {
                         };
 
                         tracing::debug!(client = "unix", "New connection");
-                        self.spawn_connection(stream, "unix".to_string(), &tunnel_handler);
+                        let handler = tunnel_handler_rx.borrow().clone();
+                        self.spawn_connection(stream, "unix".to_string(), &handler);
                     }
                 }
             },
@@ -409,7 +345,7 @@ impl ProxyServer {
     }
 
     /// Apply a config reload from the config file on disk.
-    fn apply_reload(&mut self, tunnel_handler: &mut Arc<TunnelHandler>) {
+    fn apply_reload(&mut self, tunnel_handler_tx: &tokio::sync::watch::Sender<Arc<TunnelHandler>>) {
         let config_path = match &self.config_path {
             Some(p) => p.clone(),
             None => return,
@@ -438,6 +374,9 @@ impl ProxyServer {
         }
         if new_config.proxy.ca_key != self.config.proxy.ca_key {
             tracing::warn!("ca_key changed but requires restart to take effect");
+        }
+        if new_config.proxy.direct_https_bind != self.config.proxy.direct_https_bind {
+            tracing::warn!("direct_https_bind changed but requires restart to take effect");
         }
 
         // Compile new filter engine
@@ -499,8 +438,8 @@ impl ProxyServer {
         self.resolved_auth = new_auth;
         self.config = new_config;
 
-        // Recreate tunnel handler with updated config
-        *tunnel_handler = Arc::new(self.make_tunnel_handler());
+        // Broadcast new tunnel handler to all listeners (proxy + direct HTTPS)
+        let _ = tunnel_handler_tx.send(Arc::new(self.make_tunnel_handler()));
 
         tracing::info!(
             rules = self.filter_engine.rule_count(),
@@ -577,61 +516,6 @@ impl ProxyServer {
         handler
     }
 
-    /// Spawn the direct HTTPS accept loop as a background task.
-    fn spawn_direct_https_listener(
-        &self,
-        listener: BoundListener,
-        tls_acceptor: TlsAcceptor,
-        tunnel_handler: &Arc<TunnelHandler>,
-    ) {
-        let tunnel_handler = tunnel_handler.clone();
-        let tls_acceptor = tls_acceptor;
-
-        match listener {
-            BoundListener::Tcp(tcp_listener) => {
-                tokio::spawn(async move {
-                    loop {
-                        let (stream, client_addr) = match tcp_listener.accept().await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                tracing::error!(error = %e, "Direct HTTPS: failed to accept connection");
-                                continue;
-                            }
-                        };
-                        tracing::debug!(client = %client_addr, "Direct HTTPS: new connection");
-                        spawn_direct_https_connection(
-                            stream,
-                            client_addr.to_string(),
-                            tls_acceptor.clone(),
-                            tunnel_handler.clone(),
-                        );
-                    }
-                });
-            }
-            #[cfg(unix)]
-            BoundListener::Unix(unix_listener) => {
-                tokio::spawn(async move {
-                    loop {
-                        let (stream, _addr) = match unix_listener.accept().await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                tracing::error!(error = %e, "Direct HTTPS: failed to accept connection");
-                                continue;
-                            }
-                        };
-                        tracing::debug!(client = "unix", "Direct HTTPS: new connection");
-                        spawn_direct_https_connection(
-                            stream,
-                            "unix".to_string(),
-                            tls_acceptor.clone(),
-                            tunnel_handler.clone(),
-                        );
-                    }
-                });
-            }
-        }
-    }
-
     /// Get the bind address
     pub fn bind_address(&self) -> &str {
         &self.config.proxy.bind_address
@@ -648,10 +532,118 @@ impl ProxyServer {
     }
 }
 
+/// Bind a listener to a TCP address or Unix socket path.
+/// Returns the bound listener and the address it's listening on.
+async fn bind_listener(bind_address: &str) -> Result<(BoundListener, ListenAddress)> {
+    #[cfg(unix)]
+    if bind_address.contains('/') {
+        let path = PathBuf::from(bind_address);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                Error::proxy(format!(
+                    "Failed to remove stale socket '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        }
+        let listener = UnixListener::bind(&path)
+            .map_err(|e| Error::proxy(format!("Failed to bind to {}: {}", path.display(), e)))?;
+        return Ok((BoundListener::Unix(listener), ListenAddress::Unix(path)));
+    }
+
+    let addr: SocketAddr = bind_address
+        .parse()
+        .map_err(|e| Error::config(format!("Invalid bind address '{}': {}", bind_address, e)))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| Error::proxy(format!("Failed to bind to {}: {}", addr, e)))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| Error::proxy(format!("Failed to get local address: {}", e)))?;
+    Ok((BoundListener::Tcp(listener), ListenAddress::Tcp(local_addr)))
+}
+
+/// Spawn the direct HTTPS accept loop as a background task.
+///
+/// Reads the current `TunnelHandler` from the watch receiver for each new
+/// connection, so config reloads take effect. The task exits when the watch
+/// sender is dropped (server shutdown).
+fn spawn_direct_https_accept_loop(
+    listener: BoundListener,
+    tls_acceptor: TlsAcceptor,
+    tunnel_handler_rx: tokio::sync::watch::Receiver<Arc<TunnelHandler>>,
+) {
+    match listener {
+        BoundListener::Tcp(tcp_listener) => {
+            tokio::spawn(accept_loop_direct_https(
+                tcp_listener,
+                tls_acceptor,
+                tunnel_handler_rx,
+            ));
+        }
+        #[cfg(unix)]
+        BoundListener::Unix(unix_listener) => {
+            tokio::spawn(accept_loop_direct_https(
+                unix_listener,
+                tls_acceptor,
+                tunnel_handler_rx,
+            ));
+        }
+    }
+}
+
+/// Generic accept loop for the direct HTTPS listener (works for both TCP and Unix).
+async fn accept_loop_direct_https<L>(
+    listener: L,
+    tls_acceptor: TlsAcceptor,
+    tunnel_handler_rx: tokio::sync::watch::Receiver<Arc<TunnelHandler>>,
+) where
+    L: DirectAccept,
+{
+    loop {
+        let (stream, client_addr) = match listener.accept_conn().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = %e, "Direct HTTPS: failed to accept connection");
+                continue;
+            }
+        };
+        tracing::debug!(client = %client_addr, "Direct HTTPS: new connection");
+        let handler = tunnel_handler_rx.borrow().clone();
+        spawn_direct_https_connection(stream, client_addr, tls_acceptor.clone(), handler);
+    }
+}
+
+/// Trait abstracting over TCP and Unix listeners for the accept loop.
+trait DirectAccept {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    fn accept_conn(
+        &self,
+    ) -> impl std::future::Future<Output = std::io::Result<(Self::Stream, String)>> + Send;
+}
+
+impl DirectAccept for TcpListener {
+    type Stream = tokio::net::TcpStream;
+    async fn accept_conn(&self) -> std::io::Result<(Self::Stream, String)> {
+        let (stream, addr) = self.accept().await?;
+        Ok((stream, addr.to_string()))
+    }
+}
+
+#[cfg(unix)]
+impl DirectAccept for UnixListener {
+    type Stream = tokio::net::UnixStream;
+    async fn accept_conn(&self) -> std::io::Result<(Self::Stream, String)> {
+        let (stream, _addr) = self.accept().await?;
+        Ok((stream, "unix".to_string()))
+    }
+}
+
 /// Spawn a task to handle a single direct HTTPS connection.
 ///
 /// Performs TLS accept (using SNI-based cert resolution), then serves HTTP requests
-/// over the TLS stream, routing them through the tunnel handler.
+/// over the TLS stream using `TunnelHandler::serve_tls_http`.
 fn spawn_direct_https_connection<S>(
     stream: S,
     client_addr: String,
@@ -661,7 +653,6 @@ fn spawn_direct_https_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        // Accept TLS handshake
         let tls_stream = match tls_acceptor.accept(stream).await {
             Ok(s) => s,
             Err(e) => {
@@ -670,7 +661,6 @@ fn spawn_direct_https_connection<S>(
             }
         };
 
-        // Extract hostname from SNI (stored in the server connection after handshake)
         let (_, server_conn) = tls_stream.get_ref();
         let hostname = match server_conn.server_name() {
             Some(name) => name.to_string(),
@@ -681,32 +671,9 @@ fn spawn_direct_https_connection<S>(
         };
 
         tracing::debug!(client = %client_addr, host = %hostname, "Direct HTTPS: TLS handshake complete");
-
-        let host = hostname.clone();
-        let handler = tunnel_handler;
-
-        let service = service_fn(move |req: hyper::Request<Incoming>| {
-            let host = host.clone();
-            let handler = Arc::clone(&handler);
-            async move { handler.handle_tunneled_request(req, &host, 443).await }
-        });
-
-        // Serve HTTP/1.1 or HTTP/2 over the TLS connection (auto-detected via ALPN)
-        let io = TokioIo::new(tls_stream);
-        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-        builder.http1().preserve_header_case(true).half_close(true);
-
-        if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
-            let err_str = e.to_string();
-            if !err_str.contains("connection closed") && !err_str.contains("early eof") {
-                tracing::debug!(
-                    client = %client_addr,
-                    host = %hostname,
-                    error = %e,
-                    "Direct HTTPS: connection error"
-                );
-            }
-        }
+        tunnel_handler
+            .serve_tls_http(tls_stream, &hostname, 443)
+            .await;
     });
 }
 

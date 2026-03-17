@@ -9,6 +9,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rustls::ClientConfig;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -125,7 +126,19 @@ impl TunnelHandler {
 
         tracing::debug!(host = %host, "TLS handshake with client complete");
 
-        // Create service to handle HTTP requests over TLS
+        self.serve_tls_http(client_tls, host, port).await;
+
+        Ok(())
+    }
+
+    /// Serve HTTP requests over an established TLS connection.
+    ///
+    /// Shared by CONNECT tunnel (after MITM handshake) and direct HTTPS listener
+    /// (after SNI-based handshake). Handles HTTP/1.1 and HTTP/2 via ALPN.
+    pub async fn serve_tls_http<S>(self: &Arc<Self>, tls_stream: S, host: &str, port: u16)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let host = host.to_string();
         let handler = Arc::clone(self);
 
@@ -135,20 +148,16 @@ impl TunnelHandler {
             async move { handler.handle_tunneled_request(req, &host, port).await }
         });
 
-        // Serve HTTP/1.1 or HTTP/2 over the TLS connection (auto-detected via ALPN)
-        let io = TokioIo::new(client_tls);
+        let io = TokioIo::new(tls_stream);
         let mut builder = auto::Builder::new(TokioExecutor::new());
         builder.http1().preserve_header_case(true).half_close(true);
 
         if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
-            // Connection closed errors are normal
             let err_str = e.to_string();
             if !err_str.contains("connection closed") && !err_str.contains("early eof") {
                 tracing::debug!("HTTP service error: {}", e);
             }
         }
-
-        Ok(())
     }
 
     /// Handle a request that came through the MITM tunnel or direct HTTPS listener.
