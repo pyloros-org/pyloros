@@ -210,6 +210,7 @@ bwrap \
     --setenv CURL_CA_BUNDLE "$INNER_CA" \
     --setenv NODE_EXTRA_CA_CERTS "$INNER_CA" \
     --setenv REQUESTS_CA_BUNDLE "$INNER_CA" \
+    --setenv SYSTEM_CERTIFICATE_PATH "$INNER_CA" \
     "${BWRAP_EXTRA_ARGS[@]+"${BWRAP_EXTRA_ARGS[@]}"}" \
     -- sh -c "
         socat TCP-LISTEN:${PROXY_PORT},fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:${INNER_SOCK} &
