@@ -127,6 +127,36 @@ Git-LFS uses a separate HTTP endpoint (`POST {repo}/info/lfs/objects/batch`) to 
 - Per-host certificate generation with in-memory LRU cache (1000 entries, 12h TTL)
 - CLI command to generate CA cert/key pair
 
+### Direct HTTPS Mode
+
+In addition to the standard explicit HTTP proxy mode, pyloros supports a **direct HTTPS mode** where
+clients connect directly to the proxy's TLS listener without using proxy protocol. This is useful in
+sandboxed environments where programs don't respect `HTTP_PROXY` environment variables.
+
+**How it works:**
+1. The proxy listens on an additional address (e.g. `127.0.0.12:443`) for raw TLS connections
+2. When a client connects, the proxy extracts the target hostname from TLS SNI (Server Name Indication)
+3. The proxy generates/caches a MITM certificate for that hostname (reusing the same CA)
+4. Once TLS is established, HTTP requests are handled identically to CONNECT tunnel requests — same
+   filtering, credential injection, and upstream forwarding
+
+**Configuration:**
+```toml
+[proxy]
+direct_https_bind = "127.0.0.12:443"  # optional, enables direct HTTPS mode
+```
+
+The `direct_https_bind` field is optional. When set, the proxy spawns an additional TLS listener alongside
+the standard proxy listener. Both can run simultaneously. The standard proxy listener handles `HTTP_PROXY`
+traffic; the direct HTTPS listener handles transparent TLS interception.
+
+**Integration with `/etc/hosts`:** In a bwrap sandbox, an `/etc/hosts` file maps allowed hostnames to
+the loopback address where pyloros listens. Programs connect to what they think is the real server, but
+traffic is routed to the proxy for filtering and forwarding.
+
+The `generate-hosts` CLI subcommand extracts literal hostnames from config rules and outputs them in
+`/etc/hosts` format for this purpose.
+
 ### CLI
 
 subcommands:
@@ -134,6 +164,7 @@ subcommands:
 - `run --config config.toml` — start proxy
 - `generate-ca --out ./certs/` — generate CA cert/key
 - `validate-config --config config.toml` — validate config file
+- `generate-hosts --config config.toml --ip 127.0.0.12` — generate `/etc/hosts` entries for direct HTTPS mode
 
 ### Configuration Live-Reload
 
@@ -455,6 +486,30 @@ The script handles: prerequisite checks (`bwrap`, `socat`, pyloros binary), temp
 socket lifecycle, proxy startup/shutdown, CA cert mounting, environment variable injection, and
 cleanup on exit. A companion test script (`scripts/test-bwrap.sh`) verifies allowed/blocked behavior
 and network isolation, following the same pattern as the Docker Compose tests.
+
+#### Direct HTTPS mode (`--direct-https`)
+
+When the `--direct-https` flag is passed, the bwrap script additionally:
+1. Starts pyloros with a second Unix socket for direct HTTPS connections (`direct.sock`)
+2. Generates `/etc/hosts` via `pyloros generate-hosts` mapping allowed hostnames to a loopback address (e.g. `127.0.0.12`)
+3. Runs a second socat bridge: `127.0.0.12:443` → `direct.sock`
+4. Mounts the generated hosts file into bwrap as `/etc/hosts`
+
+This eliminates the need for `HTTP_PROXY` env vars for HTTPS traffic — programs connect directly to
+hostnames that resolve to the proxy's listener. The standard proxy mode remains active for plain HTTP
+traffic (e.g. apt) and as a fallback.
+
+Architecture with `--direct-https`:
+```
+Host:  pyloros proxy ── proxy.sock (explicit proxy mode)
+                     └─ direct.sock (direct HTTPS mode)
+                                          │ (bind-mounted)
+bwrap:  socat TCP-LISTEN:8080 ── UNIX-CONNECT:/run/pyloros-proxy.sock  (for HTTP_PROXY)
+        socat TCP-LISTEN:443,bind=127.0.0.12 ── UNIX-CONNECT:/run/pyloros-direct.sock  (for direct HTTPS)
+         ↑
+        /etc/hosts: 127.0.0.12 github.com api.example.com ...
+        sandboxed command (connects to github.com:443 → hits 127.0.0.12:443 → proxy)
+```
 
 ## Documentation
 

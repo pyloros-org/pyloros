@@ -1,6 +1,8 @@
 //! MITM certificate generation with caching
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::ServerConfig;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +96,54 @@ impl MitmCertificateGenerator {
     /// Get cache statistics
     pub fn cache_size(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Create a rustls ServerConfig that uses SNI to resolve certificates dynamically.
+    ///
+    /// This is used by the direct HTTPS listener, where the proxy accepts raw TLS
+    /// connections and determines the target host from the ClientHello SNI extension.
+    pub fn sni_server_config(self: &Arc<Self>) -> ServerConfig {
+        let resolver = SniCertResolver {
+            generator: self.clone(),
+        };
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config
+    }
+}
+
+/// A `ResolvesServerCert` implementation that generates MITM certs based on SNI.
+#[derive(Debug)]
+struct SniCertResolver {
+    generator: Arc<MitmCertificateGenerator>,
+}
+
+impl ResolvesServerCert for SniCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let hostname = client_hello.server_name()?;
+
+        let (cert, key) = match self.generator.get_cert_for_host(hostname) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(hostname = %hostname, error = %e, "Failed to generate cert for SNI");
+                return None;
+            }
+        };
+
+        let ca_cert = self.generator.ca_cert_der().clone();
+        let cert_chain = vec![cert, ca_cert];
+
+        let signing_key = match rustls::crypto::aws_lc_rs::sign::any_supported_type(&key) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(hostname = %hostname, error = %e, "Failed to create signing key");
+                return None;
+            }
+        };
+
+        Some(Arc::new(CertifiedKey::new(cert_chain, signing_key)))
     }
 }
 
