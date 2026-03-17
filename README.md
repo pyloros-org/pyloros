@@ -188,20 +188,24 @@ export NODE_EXTRA_CA_CERTS=/path/to/certs/ca.crt
 
 Node.js does **not** use the system CA store, so `NODE_EXTRA_CA_CERTS` is required. This applies to all Node.js-based tools including Claude Code.
 
-### Haskell (wreq)
+### Haskell (http-client-tls / wreq / amazonka)
 
-wreq uses http-client-tls, which respects `HTTPS_PROXY` / `HTTP_PROXY` environment variables automatically.
+http-client-tls respects `HTTPS_PROXY` / `HTTP_PROXY` environment variables (case-insensitive).
 
-For the CA certificate, point the system cert store at your CA cert:
+For the CA certificate, the Haskell TLS stack (`x509-system` / `crypton-x509-system`) does **not** read `SSL_CERT_FILE`. Instead, it uses `SYSTEM_CERTIFICATE_PATH`. When set, this **replaces** the default system paths, so you must create a combined bundle:
 
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:8080
-export SSL_CERT_FILE=/path/to/certs/ca.crt
+
+# Create a combined CA bundle (system certs + proxy CA)
+cat /etc/ssl/certs/ca-certificates.crt /path/to/certs/ca.crt > /tmp/combined-ca.crt
+export SYSTEM_CERTIFICATE_PATH=/tmp/combined-ca.crt
 ```
 
 **Gotchas:**
-- wreq/http-client check **uppercase** `HTTPS_PROXY` and `HTTP_PROXY` (unlike curl which needs lowercase for HTTP).
-- `SSL_CERT_FILE` works because http-client-tls reads system certs via `x509-system`, which respects this variable on Linux.
+- `SSL_CERT_FILE` is **ignored** by the Haskell TLS stack — use `SYSTEM_CERTIFICATE_PATH` instead.
+- `SYSTEM_CERTIFICATE_PATH` replaces (not supplements) the default cert paths. Always include the system bundle.
+- The cert store is loaded once at process startup and cached globally. The env var must be set before the process starts.
 
 ## Configuration
 
