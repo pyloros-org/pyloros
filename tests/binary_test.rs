@@ -350,12 +350,12 @@ async fn test_binary_allowed_get_returns_200_wget() {
     upstream.shutdown();
 }
 
-/// Spawn the binary, wget an allowed HTTPS request against an h2-capable upstream.
-/// wget sends `Connection: Keep-Alive` and `Proxy-Connection: Keep-Alive` by default;
-/// without hop-by-hop stripping this causes 502 when the proxy negotiates h2 upstream.
+/// Verify wget's hop-by-hop headers (Connection, Proxy-Connection) are stripped.
+/// wget sends these by default inside the CONNECT tunnel; the proxy must remove
+/// them before forwarding upstream per RFC 7230 §6.1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_binary_wget_to_h2_upstream() {
-    let t = test_report!("Binary: wget to h2-capable upstream succeeds");
+async fn test_binary_wget_hop_by_hop_stripped() {
+    let t = test_report!("Binary: wget hop-by-hop headers stripped before upstream");
 
     let ca = TestCa::generate();
     // Use h1-only upstream to avoid hyper's h2 auto-stripping masking the bug.

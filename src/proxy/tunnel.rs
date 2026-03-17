@@ -400,6 +400,7 @@ impl TunnelHandler {
             // Set the upstream Host header BEFORE signing so the signature covers
             // the final host value that the upstream server will see.
             let (mut parts, body) = req.into_parts();
+            super::strip_hop_by_hop_headers(&mut parts.headers);
             let upstream_host_value = if connect_port == 443 {
                 host.to_string()
             } else {
@@ -432,6 +433,7 @@ impl TunnelHandler {
             .await
         } else {
             let (mut parts, body) = req.into_parts();
+            super::strip_hop_by_hop_headers(&mut parts.headers);
             self.credential_engine
                 .inject(&request_info, &mut parts.headers);
             let req = rebuild_request_for_upstream(parts, body.boxed(), host, connect_port);
@@ -463,7 +465,7 @@ impl TunnelHandler {
     /// Shared by branch-check and LFS-check arms.
     async fn forward_buffered(
         &self,
-        parts: hyper::http::request::Parts,
+        mut parts: hyper::http::request::Parts,
         body_bytes: Bytes,
         host: &str,
         port: u16,
@@ -476,6 +478,7 @@ impl TunnelHandler {
             .as_deref()
             .unwrap_or(host)
             .to_string();
+        super::strip_hop_by_hop_headers(&mut parts.headers);
         let full_body = Full::new(body_bytes).map_err(|e| match e {}).boxed();
         let req = match rebuild_request_for_upstream(parts, full_body, host, connect_port) {
             Ok(r) => r,
