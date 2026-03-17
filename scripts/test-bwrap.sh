@@ -162,6 +162,77 @@ else
     tail -5 "$RESULT_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (no output)"
 fi
 
+# =====================================================
+# Direct HTTPS mode tests
+# =====================================================
+echo ""
+echo "=== Direct HTTPS Mode Tests ==="
+echo ""
+
+# Use a high port for direct HTTPS to avoid needing root for port 443.
+# In production, port 443 is used, but tests run unprivileged.
+DIRECT_PORT=8443
+
+# Helper: run bwrap script with --direct-https
+run_bwrap_direct() {
+    timeout 30 "$BWRAP_SCRIPT" --config "$CONFIG" --pyloros "$BINARY" \
+        --direct-https --direct-port "$DIRECT_PORT" -- "$@" \
+        > "$RESULT_FILE" 2>"$STDERR_FILE"
+}
+
+# Test 4: Allowed HTTPS request via direct HTTPS (no proxy env, using /etc/hosts)
+echo "Test 4: Allowed HTTPS request via direct HTTPS mode"
+set +e
+# --noproxy '*' ensures curl does NOT use HTTP_PROXY, so it connects directly
+# to example.com via /etc/hosts -> 127.0.0.12. We must specify the port since
+# we use a non-standard port in tests.
+run_bwrap_direct curl --noproxy '*' -sf "https://example.com:${DIRECT_PORT}/"
+EXIT_CODE=$?
+set -e
+
+if [[ $EXIT_CODE -eq 0 ]] && grep -q "Example Domain" "$RESULT_FILE" 2>/dev/null; then
+    pass "Direct HTTPS: allowed request succeeds without HTTP_PROXY"
+else
+    fail "Direct HTTPS: allowed request (exit=$EXIT_CODE)"
+    echo "    stdout (last 10 lines):"
+    tail -10 "$RESULT_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+    echo "    stderr (last 10 lines):"
+    tail -10 "$STDERR_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+fi
+
+# Test 5: Blocked host is not in /etc/hosts so DNS fails
+echo "Test 5: Blocked host fails to resolve (not in generated /etc/hosts)"
+set +e
+run_bwrap_direct curl --noproxy '*' --connect-timeout 3 -so /dev/null "https://httpbin.org:${DIRECT_PORT}/get"
+EXIT_CODE=$?
+set -e
+
+if [[ $EXIT_CODE -ne 0 ]]; then
+    pass "Direct HTTPS: blocked host cannot be reached (exit=$EXIT_CODE)"
+else
+    fail "Direct HTTPS: blocked host should have failed but succeeded"
+    echo "    Output (last 5 lines):"
+    tail -5 "$RESULT_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (no output)"
+fi
+
+# Test 6: Proxy-mode still works alongside direct HTTPS
+echo "Test 6: HTTP_PROXY still works in direct HTTPS mode"
+set +e
+# Without --noproxy, curl uses HTTP_PROXY (proxy mode still active in --direct-https)
+run_bwrap_direct curl -sf https://example.com/
+EXIT_CODE=$?
+set -e
+
+if [[ $EXIT_CODE -eq 0 ]] && grep -q "Example Domain" "$RESULT_FILE" 2>/dev/null; then
+    pass "Direct HTTPS: proxy mode coexists with direct HTTPS"
+else
+    fail "Direct HTTPS: proxy mode alongside direct (exit=$EXIT_CODE)"
+    echo "    stdout (last 10 lines):"
+    tail -10 "$RESULT_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+    echo "    stderr (last 10 lines):"
+    tail -10 "$STDERR_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+fi
+
 # Summary
 echo ""
 echo "=== Results: $PASSED passed, $FAILED failed, $SKIPPED skipped ==="

@@ -19,6 +19,7 @@
 #   --proxy-port PORT  TCP port for socat relay inside sandbox (default: 8080)
 #   --direct-https     Enable direct HTTPS mode (generate /etc/hosts, SNI listener)
 #   --direct-ip IP     IP address for direct HTTPS hosts entries (default: 127.0.0.12)
+#   --direct-port PORT TCP port for direct HTTPS socat relay (default: 443)
 #   --bwrap-arg ARG    Extra argument passed to bwrap (repeatable)
 #   --keep             Don't clean up temp dir on exit (for debugging)
 #   -h, --help         Show this help message
@@ -33,6 +34,7 @@ PYLOROS=""
 PROXY_PORT=8080
 DIRECT_HTTPS=false
 DIRECT_IP="127.0.0.12"
+DIRECT_PORT=443
 KEEP=false
 BWRAP_EXTRA_ARGS=()
 
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --proxy-port) PROXY_PORT="$2"; shift 2 ;;
         --direct-https) DIRECT_HTTPS=true; shift ;;
         --direct-ip)  DIRECT_IP="$2"; shift 2 ;;
+        --direct-port) DIRECT_PORT="$2"; shift 2 ;;
         --bwrap-arg)  BWRAP_EXTRA_ARGS+=("$2"); shift 2 ;;
         --keep)     KEEP=true; shift ;;
         -h|--help)  usage 0 ;;
