@@ -353,6 +353,25 @@ cargo clippy                  # Lint
 cargo fmt --check             # Check formatting
 ```
 
+### Manual testing with real servers
+
+`scripts/pyloros-test-proxy.sh` starts a temporary proxy and runs a command with all proxy env vars configured:
+
+```bash
+# Test with curl
+scripts/pyloros-test-proxy.sh --rule 'GET https://httpbin.org/*' -- curl -sS https://httpbin.org/get
+
+# Test with wget
+scripts/pyloros-test-proxy.sh --rule 'GET https://www.google.com/*' -- wget -O /dev/null https://www.google.com/
+
+# Interactive shell
+scripts/pyloros-test-proxy.sh --rule '* https://*.example.com/*' -- bash
+```
+
+See `scripts/pyloros-test-proxy.sh --help` for all options.
+
+### Test coverage
+
 Test coverage (requires one-time setup: `rustup component add llvm-tools-preview && cargo install cargo-llvm-cov`):
 
 ```bash
