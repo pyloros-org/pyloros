@@ -212,13 +212,9 @@ bwrap \
     --setenv REQUESTS_CA_BUNDLE "$INNER_CA" \
     "${BWRAP_EXTRA_ARGS[@]+"${BWRAP_EXTRA_ARGS[@]}"}" \
     -- sh -c "
-        # Build combined CA bundle for Haskell (x509-system / crypton-x509-system).
-        # SYSTEM_CERTIFICATE_PATH replaces the default cert paths, so we must
-        # concatenate the system bundle with the proxy CA.
-        COMBINED_CA=/tmp/pyloros-combined-ca.crt
-        cat /etc/ssl/certs/ca-certificates.crt ${INNER_CA} > \"\$COMBINED_CA\" 2>/dev/null \
-            || cp ${INNER_CA} \"\$COMBINED_CA\"
-        export SYSTEM_CERTIFICATE_PATH=\"\$COMBINED_CA\"
+        # Haskell's x509-system/crypton-x509-system ignores SSL_CERT_FILE;
+        # it reads SYSTEM_CERTIFICATE_PATH instead.
+        export SYSTEM_CERTIFICATE_PATH=\"${INNER_CA}\"
 
         socat TCP-LISTEN:${PROXY_PORT},fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:${INNER_SOCK} &
         SOCAT_PID=\$!

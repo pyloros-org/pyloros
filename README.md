@@ -192,19 +192,16 @@ Node.js does **not** use the system CA store, so `NODE_EXTRA_CA_CERTS` is requir
 
 http-client-tls respects `HTTPS_PROXY` / `HTTP_PROXY` environment variables (case-insensitive).
 
-For the CA certificate, the Haskell TLS stack (`x509-system` / `crypton-x509-system`) does **not** read `SSL_CERT_FILE`. Instead, it uses `SYSTEM_CERTIFICATE_PATH`. When set, this **replaces** the default system paths, so you must create a combined bundle:
+For the CA certificate, the Haskell TLS stack (`x509-system` / `crypton-x509-system`) does **not** read `SSL_CERT_FILE`. Instead, it uses `SYSTEM_CERTIFICATE_PATH`:
 
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:8080
-
-# Create a combined CA bundle (system certs + proxy CA)
-cat /etc/ssl/certs/ca-certificates.crt /path/to/certs/ca.crt > /tmp/combined-ca.crt
-export SYSTEM_CERTIFICATE_PATH=/tmp/combined-ca.crt
+export SYSTEM_CERTIFICATE_PATH=/path/to/certs/ca.crt
 ```
 
 **Gotchas:**
 - `SSL_CERT_FILE` is **ignored** by the Haskell TLS stack — use `SYSTEM_CERTIFICATE_PATH` instead.
-- `SYSTEM_CERTIFICATE_PATH` replaces (not supplements) the default cert paths. Always include the system bundle.
+- `SYSTEM_CERTIFICATE_PATH` replaces (not supplements) the default cert paths. This is fine when all traffic goes through the proxy (which handles upstream TLS), but if the process also makes direct HTTPS connections you'll need a combined bundle.
 - The cert store is loaded once at process startup and cached globally. The env var must be set before the process starts.
 
 ## Configuration
