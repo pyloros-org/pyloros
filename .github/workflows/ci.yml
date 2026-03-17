@@ -73,6 +73,8 @@ jobs:
           path: |
             test-report.md
             test-report.html
+      - name: Run test-proxy.sh tests
+        run: scripts/test-proxy.sh
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Add musl target
