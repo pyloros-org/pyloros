@@ -103,6 +103,30 @@ pub fn blocked_refs(data: &[u8], patterns: &[PatternMatcher]) -> Vec<String> {
         .collect()
 }
 
+/// Return the list of refs blocked by a `BranchFilter` (allow + deny patterns).
+///
+/// A ref is blocked if:
+/// - It matches any deny pattern, OR
+/// - The allow list is non-empty and the ref doesn't match any allow pattern.
+///
+/// If the allow list is empty, all refs are implicitly allowed (before deny check).
+pub fn blocked_refs_with_filter(data: &[u8], filter: &super::rules::BranchFilter) -> Vec<String> {
+    let refs = extract_push_refs(data);
+    refs.into_iter()
+        .filter(|refname| {
+            // Denied if matches any deny pattern
+            if ref_matches_any_pattern(refname, &filter.deny) {
+                return true;
+            }
+            // If allow list is non-empty, must match at least one allow pattern
+            if !filter.allow.is_empty() && !ref_matches_any_pattern(refname, &filter.allow) {
+                return true;
+            }
+            false
+        })
+        .collect()
+}
+
 /// Build a git `report-status` response body for blocked refs.
 ///
 /// Constructs a valid receive-pack result that git clients will parse and
@@ -282,11 +306,12 @@ fn ref_matches_any_pattern(refname: &str, patterns: &[PatternMatcher]) -> bool {
                 return true;
             }
         } else {
-            // Bare branch pattern — match against refs/heads/<pattern>
-            let full_ref = format!(
-                "refs/heads/{}",
-                refname.strip_prefix("refs/heads/").unwrap_or(refname)
-            );
+            // Bare branch pattern — only matches refs under refs/heads/
+            let branch_name = match refname.strip_prefix("refs/heads/") {
+                Some(name) => name,
+                None => continue, // Non-branch refs don't match bare patterns
+            };
+            let full_ref = format!("refs/heads/{}", branch_name);
             let full_pattern = format!("refs/heads/{}", pat);
             // We need to create a temporary PatternMatcher for the full pattern
             if let Ok(full_matcher) = PatternMatcher::new(&full_pattern) {
@@ -844,5 +869,173 @@ mod tests {
             result_str.contains("ng refs/heads/main blocked by proxy policy"),
         );
         t.assert_true("ends with flush", result_str.ends_with("0000"));
+    }
+
+    // --- Tests for blocked_refs_with_filter ---
+
+    fn make_branch_filter(allow: &[&str], deny: &[&str]) -> super::super::rules::BranchFilter {
+        super::super::rules::BranchFilter {
+            allow: allow
+                .iter()
+                .map(|p| PatternMatcher::new(p).unwrap())
+                .collect(),
+            deny: deny
+                .iter()
+                .map(|p| PatternMatcher::new(p).unwrap())
+                .collect(),
+        }
+    }
+
+    fn make_push_data(refs: &[&str]) -> Vec<u8> {
+        let old = "0000000000000000000000000000000000000000";
+        let new = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut data = Vec::new();
+        for (i, refname) in refs.iter().enumerate() {
+            if i == 0 {
+                data.extend(pktline(&format!(
+                    "{} {} {}\0report-status side-band-64k\n",
+                    old, new, refname
+                )));
+            } else {
+                data.extend(pktline(&format!("{} {} {}\n", old, new, refname)));
+            }
+        }
+        data.extend(flush());
+        data
+    }
+
+    #[test]
+    fn test_branch_filter_deny_blocks_matching() {
+        let t = test_report!("BranchFilter deny pattern blocks matching refs");
+        let data = make_push_data(&["refs/heads/main"]);
+        let filter = make_branch_filter(&["*"], &["main"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq("blocked ref", &blocked[0].as_str(), &"refs/heads/main");
+    }
+
+    #[test]
+    fn test_branch_filter_deny_allows_non_matching() {
+        let t = test_report!("BranchFilter deny pattern allows non-matching refs");
+        let data = make_push_data(&["refs/heads/feature/test"]);
+        let filter = make_branch_filter(&["*"], &["main"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &0usize);
+    }
+
+    #[test]
+    fn test_branch_filter_deny_wins_over_allow() {
+        let t = test_report!("BranchFilter deny wins when ref matches both allow and deny");
+        let data = make_push_data(&["refs/heads/feature/dangerous"]);
+        let filter = make_branch_filter(&["feature/*"], &["feature/dangerous"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq(
+            "blocked ref",
+            &blocked[0].as_str(),
+            &"refs/heads/feature/dangerous",
+        );
+    }
+
+    #[test]
+    fn test_branch_filter_deny_only_implicit_allow_all() {
+        let t = test_report!("BranchFilter with only deny patterns implicitly allows all others");
+        let data = make_push_data(&["refs/heads/feature/ok", "refs/heads/main"]);
+        let filter = make_branch_filter(&[], &["main"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq("blocked ref", &blocked[0].as_str(), &"refs/heads/main");
+    }
+
+    #[test]
+    fn test_branch_filter_deny_wildcard() {
+        let t = test_report!("BranchFilter deny wildcard pattern blocks matching refs");
+        let data = make_push_data(&[
+            "refs/heads/release/1.0",
+            "refs/heads/release/2.0",
+            "refs/heads/feature/ok",
+        ]);
+        let filter = make_branch_filter(&["*"], &["release/*"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &2usize);
+        t.assert_true(
+            "release/1.0 blocked",
+            blocked.contains(&"refs/heads/release/1.0".to_string()),
+        );
+        t.assert_true(
+            "release/2.0 blocked",
+            blocked.contains(&"refs/heads/release/2.0".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_branch_filter_empty_data() {
+        let t = test_report!("BranchFilter with empty push data returns empty");
+        let filter = make_branch_filter(&["*"], &["main"]);
+        let blocked = blocked_refs_with_filter(b"0000", &filter);
+        t.assert_eq("blocked count", &blocked.len(), &0usize);
+    }
+
+    #[test]
+    fn test_branch_filter_no_deny_patterns() {
+        let t = test_report!("BranchFilter with no deny patterns behaves like allow-only");
+        let data = make_push_data(&["refs/heads/feature/test", "refs/heads/main"]);
+        let filter = make_branch_filter(&["feature/*"], &[]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq("blocked ref", &blocked[0].as_str(), &"refs/heads/main");
+    }
+
+    #[test]
+    fn test_branch_filter_deny_blocks_full_ref() {
+        let t = test_report!("Bare deny !main blocks refs/heads/main (full ref form)");
+        let data = make_push_data(&["refs/heads/main"]);
+        let filter = make_branch_filter(&["*"], &["main"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq("blocked ref", &blocked[0].as_str(), &"refs/heads/main");
+    }
+
+    #[test]
+    fn test_branch_filter_deny_cannot_bypass_via_tag_ref() {
+        let t = test_report!("Cannot bypass !main deny by pushing to refs/tags/main");
+        let data = make_push_data(&["refs/tags/main"]);
+        // branches = ["*", "!main"] — bare * only matches refs/heads/,
+        // so refs/tags/main has no allow match and is blocked
+        let filter = make_branch_filter(&["*"], &["main"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq("blocked ref", &blocked[0].as_str(), &"refs/tags/main");
+    }
+
+    #[test]
+    fn test_branch_filter_deny_cannot_bypass_via_arbitrary_ref() {
+        let t = test_report!("Cannot bypass !main deny by pushing to refs/for/main");
+        let data = make_push_data(&["refs/for/main"]);
+        let filter = make_branch_filter(&["*"], &["main"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq("blocked ref", &blocked[0].as_str(), &"refs/for/main");
+    }
+
+    #[test]
+    fn test_branch_filter_refs_prefix_deny_blocks_literally() {
+        let t = test_report!("refs/-prefixed deny pattern !refs/tags/* blocks tags");
+        let data = make_push_data(&["refs/tags/v1.0", "refs/heads/main"]);
+        // Allow all branches, deny all tags
+        let filter = make_branch_filter(&["*"], &["refs/tags/*"]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("blocked count", &blocked.len(), &1usize);
+        t.assert_eq("blocked ref", &blocked[0].as_str(), &"refs/tags/v1.0");
+    }
+
+    #[test]
+    fn test_bare_allow_only_matches_branches() {
+        let t = test_report!("Bare allow pattern * only matches refs/heads/ refs");
+        // Push a tag — bare * should NOT match it
+        let data = make_push_data(&["refs/tags/v1.0"]);
+        let filter = make_branch_filter(&["*"], &[]);
+        let blocked = blocked_refs_with_filter(&data, &filter);
+        t.assert_eq("tag blocked (no allow match)", &blocked.len(), &1usize);
     }
 }

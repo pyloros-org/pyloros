@@ -9,4 +9,4 @@ pub mod sigv4;
 
 pub use credentials::CredentialEngine;
 pub use matcher::PatternMatcher;
-pub use rules::{CompiledRule, FilterEngine, FilterResult, RequestInfo};
+pub use rules::{BranchFilter, CompiledRule, FilterEngine, FilterResult, RequestInfo};

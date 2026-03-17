@@ -343,6 +343,18 @@ impl Config {
             return Err(ctx("`branches` is only valid on git rules"));
         }
 
+        // Validate branch patterns: bare "!" (empty after prefix strip) is an error
+        if let Some(ref branches) = rule.branches {
+            for (j, pattern) in branches.iter().enumerate() {
+                if pattern == "!" {
+                    return Err(ctx(&format!(
+                        "branch pattern #{} is bare `!` (empty pattern after prefix strip)",
+                        j + 1
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -792,6 +804,47 @@ url = "https://github.com/*"
             "[[rules]]\nmethod = \"POST\"\nurl = \"https://example.com/*\"\nbranches = [\"main\"]",
             Some("git rules"),
         );
+    }
+
+    #[test]
+    fn test_git_rule_validation_bare_bang_branch() {
+        assert_config_rejects(
+            "Reject bare ! branch pattern",
+            "[[rules]]\ngit = \"push\"\nurl = \"https://example.com/*\"\nbranches = [\"!\"]",
+            Some("bare `!`"),
+        );
+    }
+
+    #[test]
+    fn test_git_rule_with_deny_branch_patterns_parses() {
+        let t = test_report!("Git push rule with deny branch patterns parses correctly");
+        let toml = r#"
+[[rules]]
+git = "push"
+url = "https://github.com/myorg/repo"
+branches = ["*", "!main", "!release/*"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        let branches = config.rules[0].branches.as_ref().unwrap();
+        t.assert_eq("branch count", &branches.len(), &3usize);
+        t.assert_eq("branch[0]", &branches[0].as_str(), &"*");
+        t.assert_eq("branch[1]", &branches[1].as_str(), &"!main");
+        t.assert_eq("branch[2]", &branches[2].as_str(), &"!release/*");
+    }
+
+    #[test]
+    fn test_git_rule_deny_only_branches_parses() {
+        let t = test_report!("Git push rule with deny-only branch patterns parses correctly");
+        let toml = r#"
+[[rules]]
+git = "push"
+url = "https://github.com/myorg/repo"
+branches = ["!main"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        let branches = config.rules[0].branches.as_ref().unwrap();
+        t.assert_eq("branch count", &branches.len(), &1usize);
+        t.assert_eq("branch[0]", &branches[0].as_str(), &"!main");
     }
 
     // --- Credential config tests ---
