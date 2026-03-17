@@ -350,6 +350,65 @@ async fn test_binary_allowed_get_returns_200_wget() {
     upstream.shutdown();
 }
 
+/// Spawn the binary, wget an allowed HTTPS request against an h2-capable upstream.
+/// wget sends `Connection: Keep-Alive` and `Proxy-Connection: Keep-Alive` by default;
+/// without hop-by-hop stripping this causes 502 when the proxy negotiates h2 upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_wget_to_h2_upstream() {
+    let t = test_report!("Binary: wget to h2-capable upstream succeeds");
+
+    let ca = TestCa::generate();
+    // Use h1-only upstream to avoid hyper's h2 auto-stripping masking the bug.
+    let upstream = TestUpstream::builder(&ca, common::echo_handler())
+        .h1_only()
+        .report(&t, "echoes request details (h1 only)")
+        .start()
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let config_toml = build_config_toml_with_auth(
+        &ca.cert_path,
+        &ca.key_path,
+        upstream.port(),
+        &ca.cert_path,
+        &[("GET", "https://localhost/*")],
+        Some(("testuser", "testpass")),
+    );
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let (mut child, proxy_port) = spawn_proxy_reported(&t, &config_path);
+
+    let proxy_url = format!("http://testuser:testpass@127.0.0.1:{}", proxy_port);
+    let mut cmd = Command::new("wget");
+    cmd.env("https_proxy", &proxy_url)
+        .env("SSL_CERT_FILE", &ca.cert_path)
+        .args(["-q", "-O", "-", "https://localhost/test"]);
+    let output = common::run_command_reported(&t, &mut cmd);
+
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    t.assert_true("wget exited successfully", output.status.success());
+    // The echo handler returns the upstream-received headers. Verify hop-by-hop
+    // headers are not forwarded (they would cause a 502 on h2 upstream).
+    t.assert_not_contains("No connection header forwarded", &body, "connection:");
+    t.assert_not_contains(
+        "No proxy-connection header forwarded",
+        &body,
+        "proxy-connection:",
+    );
+    t.assert_not_contains("No keep-alive header forwarded", &body, "keep-alive:");
+
+    if !output.status.success() {
+        panic!("wget failed: exit={}, stderr={}", output.status, stderr);
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    upstream.shutdown();
+}
+
 /// Spawn the binary with auth, curl a blocked HTTPS request, verify 451.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_binary_blocked_request_returns_451() {
