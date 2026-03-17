@@ -33,7 +33,7 @@
 
 services:
   proxy:
-    image: ${PROXY_IMAGE:-ghcr.io/zyla/pyloros:latest}
+    image: ${PROXY_IMAGE:-ghcr.io/pyloros-org/pyloros:latest}
     volumes:
       - ./config.toml:/etc/pyloros/config.toml:ro
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.crt:/etc/pyloros/ca.crt:ro

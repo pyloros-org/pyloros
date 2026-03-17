@@ -91,8 +91,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/zyla/pyloros:${{ github.ref_name }}
-            ghcr.io/zyla/pyloros:latest
+            ghcr.io/pyloros-org/pyloros:${{ github.ref_name }}
+            ghcr.io/pyloros-org/pyloros:latest
 
   latest:
     name: Latest Build
@@ -176,4 +176,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/zyla/pyloros:edge
+          tags: ghcr.io/pyloros-org/pyloros:edge
