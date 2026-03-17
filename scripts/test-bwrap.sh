@@ -169,24 +169,29 @@ echo ""
 echo "=== Direct HTTPS Mode Tests ==="
 echo ""
 
-# Use a high port for direct HTTPS to avoid needing root for port 443.
-# In production, port 443 is used, but tests run unprivileged.
-DIRECT_PORT=8443
+# Direct HTTPS tests need sudo bwrap so socat can bind port 443 as root
+# (the user command still runs unprivileged via su).
+# Skip these tests if passwordless sudo is not available.
+if ! sudo -n true 2>/dev/null; then
+    echo "Passwordless sudo not available. Skipping direct HTTPS tests."
+    skip "Direct HTTPS: allowed request (needs sudo)"
+    skip "Direct HTTPS: blocked host (needs sudo)"
+    skip "Direct HTTPS: proxy coexistence (needs sudo)"
+else
 
-# Helper: run bwrap script with --direct-https
+# Helper: run bwrap script with --direct-https and --sudo-bwrap
 run_bwrap_direct() {
     timeout 30 "$BWRAP_SCRIPT" --config "$CONFIG" --pyloros "$BINARY" \
-        --direct-https --direct-port "$DIRECT_PORT" -- "$@" \
+        --direct-https --sudo-bwrap -- "$@" \
         > "$RESULT_FILE" 2>"$STDERR_FILE"
 }
 
 # Test 4: Allowed HTTPS request via direct HTTPS (no proxy env, using /etc/hosts)
-echo "Test 4: Allowed HTTPS request via direct HTTPS mode"
+echo "Test 4: Allowed HTTPS request via direct HTTPS mode (port 443)"
 set +e
 # --noproxy '*' ensures curl does NOT use HTTP_PROXY, so it connects directly
-# to example.com via /etc/hosts -> 127.0.0.12. We must specify the port since
-# we use a non-standard port in tests.
-run_bwrap_direct curl --noproxy '*' -sf "https://example.com:${DIRECT_PORT}/"
+# to example.com:443 which /etc/hosts resolves to 127.0.0.12 -> proxy.
+run_bwrap_direct curl --noproxy '*' -sf https://example.com/
 EXIT_CODE=$?
 set -e
 
@@ -203,7 +208,7 @@ fi
 # Test 5: Blocked host is not in /etc/hosts so DNS fails
 echo "Test 5: Blocked host fails to resolve (not in generated /etc/hosts)"
 set +e
-run_bwrap_direct curl --noproxy '*' --connect-timeout 3 -so /dev/null "https://httpbin.org:${DIRECT_PORT}/get"
+run_bwrap_direct curl --noproxy '*' --connect-timeout 3 -so /dev/null https://httpbin.org/get
 EXIT_CODE=$?
 set -e
 
@@ -232,6 +237,8 @@ else
     echo "    stderr (last 10 lines):"
     tail -10 "$STDERR_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
 fi
+
+fi # end sudo check
 
 # Summary
 echo ""
