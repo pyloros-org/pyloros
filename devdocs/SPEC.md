@@ -166,6 +166,17 @@ subcommands:
 - `validate-config --config config.toml` — validate config file
 - `generate-hosts --config config.toml --ip 127.0.0.12` — generate `/etc/hosts` entries for direct HTTPS mode
 
+### Permissive Mode
+
+When deploying pyloros for the first time, operators may not know what rules they need. Permissive mode provides a "learning" phase where unmatched requests are allowed through but logged distinctly, so operators can discover traffic patterns and build rules from the audit log. Named after SELinux's permissive mode.
+
+- Enabled via `permissive = true` in `[proxy]` (default: `false`)
+- Only converts `FilterResult::Blocked` (no matching rule) to allow-through
+- All other block reasons (branch restriction, LFS check, body-inspection-requires-HTTPS, non-HTTPS CONNECT, auth failure) still block — those represent matched rules with failed constraints
+- Permitted requests emit a distinct audit event `"request_permitted"` with `decision: "allowed"`, `reason: "no_matching_rule"` — easy to grep, distinct from `"request_allowed"` (which means a rule matched)
+- Permitted requests ALWAYS emit a tracing log line (regardless of `log_allowed_requests`/`log_blocked_requests`) since the point is visibility
+- Requests matching an explicit rule are logged normally as `"request_allowed"`
+
 ### Configuration Live-Reload
 
 When a config file is provided (`--config`), the proxy watches it for changes using OS-native
@@ -176,6 +187,7 @@ modification. On Unix systems, sending `SIGHUP` to the proxy process also trigge
 - `[[rules]]` — filter rules
 - `[[credentials]]` — credential injection entries
 - `[proxy]` `auth_username` / `auth_password` — proxy authentication (re-resolves `${ENV_VAR}`)
+- `[proxy]` `permissive` — permissive mode toggle
 - `[logging]` `log_requests` — request logging flags
 - `[logging]` `audit_log` — audit log file path
 
@@ -300,6 +312,8 @@ bind_address = "127.0.0.1:8080"   # TCP (default)
 # bind_address = "/tmp/pyloros.sock" # Unix domain socket
 ca_cert = "/path/to/ca.crt"
 ca_key = "/path/to/ca.key"
+# Optional: allow unmatched requests through (learning mode, default false)
+# permissive = true
 # Optional: require proxy authentication (both fields required if either is set)
 # auth_username = "agent"
 # auth_password = "${PROXY_PASSWORD}"
