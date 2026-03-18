@@ -225,47 +225,32 @@ impl ProxyHandler {
         match self.filter_engine.check(&request_info) {
             FilterResult::Blocked => {
                 if self.permissive {
-                    // Permissive mode: allow through but log distinctly
-                    tracing::warn!(
-                        method = %method,
-                        url = %full_url,
-                        "PERMITTED (HTTP)"
-                    );
-                    self.emit_audit(AuditEntry {
-                        timestamp: crate::audit::now_iso8601(),
-                        event: AuditEvent::RequestPermitted,
-                        method: method.clone(),
-                        url: full_url.clone(),
-                        host: host.clone(),
-                        scheme: scheme.to_string(),
-                        protocol: "http".to_string(),
-                        decision: AuditDecision::Allowed,
-                        reason: AuditReason::NoMatchingRule,
-                        credential: None,
-                        git: None,
-                    });
-                    // Fall through to forwarding
-                } else {
-                    if self.log_blocked_requests {
-                        tracing::warn!(
-                            method = %method,
-                            url = %full_url,
-                            "BLOCKED (HTTP)"
-                        );
-                    }
-                    self.emit_audit(AuditEntry {
-                        timestamp: crate::audit::now_iso8601(),
-                        event: AuditEvent::RequestBlocked,
-                        method: method.clone(),
-                        url: full_url.clone(),
-                        host: host.clone(),
-                        scheme: scheme.to_string(),
-                        protocol: "http".to_string(),
-                        decision: AuditDecision::Blocked,
-                        reason: AuditReason::NoMatchingRule,
-                        credential: None,
-                        git: None,
-                    });
+                    tracing::warn!(method = %method, url = %full_url, "PERMITTED (HTTP)");
+                } else if self.log_blocked_requests {
+                    tracing::warn!(method = %method, url = %full_url, "BLOCKED (HTTP)");
+                }
+                self.emit_audit(AuditEntry {
+                    timestamp: crate::audit::now_iso8601(),
+                    event: if self.permissive {
+                        AuditEvent::RequestPermitted
+                    } else {
+                        AuditEvent::RequestBlocked
+                    },
+                    method: method.clone(),
+                    url: full_url.clone(),
+                    host: host.clone(),
+                    scheme: scheme.to_string(),
+                    protocol: "http".to_string(),
+                    decision: if self.permissive {
+                        AuditDecision::Allowed
+                    } else {
+                        AuditDecision::Blocked
+                    },
+                    reason: AuditReason::NoMatchingRule,
+                    credential: None,
+                    git: None,
+                });
+                if !self.permissive {
                     return Ok(blocked_response(&method, &full_url));
                 }
             }
