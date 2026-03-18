@@ -117,6 +117,23 @@ Git-LFS uses a separate HTTP endpoint (`POST {repo}/info/lfs/objects/batch`) to 
 - **Plain HTTP is blocked** for LFS batch requests (same default-deny principle as branch checks — body inspection requires HTTPS)
 - **Transfer URLs**: LFS batch responses contain transfer URLs (often on external hosts like S3) for the actual object upload/download. These are **not** automatically allowed — users must add separate HTTP rules for the transfer hosts (e.g., `method = "GET", url = "https://github-cloud.s3.amazonaws.com/*"`)
 
+#### Git-LFS Locks API
+
+Git-LFS has a [locks API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/locking.md) for file-level locking coordination. Git rules automatically generate rules for the lock endpoints so that `git lfs locks` and lock verification work without additional manual rules.
+
+Lock endpoints are plain pass-through rules (no body inspection needed):
+
+| Method | Path | `fetch` | `push` | `*` |
+|--------|------|---------|--------|-----|
+| GET | `{repo}/info/lfs/locks` | yes | yes | yes |
+| POST | `{repo}/info/lfs/locks` | no | yes | yes |
+| POST | `{repo}/info/lfs/locks/verify` | yes | yes | yes |
+| POST | `{repo}/info/lfs/locks/*/unlock` | no | yes | yes |
+
+- `git = "push"` includes all four endpoints (create, list, verify, unlock)
+- `git = "fetch"` includes list (GET) and verify (POST) only — these are informational and prevent the git-lfs client from warning "Remote does not support the Git LFS locking API"
+- `git = "*"` includes all four (superset of push)
+
 ### Protocol Support
 - HTTP/1.1
 - HTTP/2
