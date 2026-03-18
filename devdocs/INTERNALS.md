@@ -54,6 +54,21 @@ last two; `git = "*"` into all four. The `url` from the rule is used as the `<re
 prefix — wildcards in the URL carry through naturally (e.g.
 `https://github.com/org/*` → `https://github.com/org/*/info/refs?service=git-upload-pack`).
 
+Additionally, each git rule generates LFS endpoints:
+
+| Operation | Method | URL | fetch | push |
+|-----------|--------|-----|-------|------|
+| LFS batch | POST | `<repo>/info/lfs/objects/batch` | yes (body-inspected) | yes (body-inspected) |
+| Lock list | GET | `<repo>/info/lfs/locks` | yes | yes |
+| Lock create | POST | `<repo>/info/lfs/locks` | no | yes |
+| Lock verify | POST | `<repo>/info/lfs/locks/verify` | yes | yes |
+| Lock unlock | POST | `<repo>/info/lfs/locks/*/unlock` | no | yes |
+
+The LFS batch endpoint uses `AllowedWithLfsCheck` for body inspection of the
+`operation` field. Lock endpoints are plain `Allowed` rules (no body inspection
+needed). For `git = "*"`, the push superset of lock endpoints is used (via
+`else if` to avoid duplicates).
+
 ### Branch restriction via pkt-line inspection
 
 The `branches` field on push rules requires inspecting the request body of the
