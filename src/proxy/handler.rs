@@ -23,6 +23,7 @@ pub struct ProxyHandler {
     audit_logger: Option<Arc<AuditLogger>>,
     log_allowed_requests: bool,
     log_blocked_requests: bool,
+    permissive: bool,
 }
 
 impl ProxyHandler {
@@ -34,6 +35,7 @@ impl ProxyHandler {
             audit_logger: None,
             log_allowed_requests: true,
             log_blocked_requests: true,
+            permissive: false,
         }
     }
 
@@ -50,6 +52,11 @@ impl ProxyHandler {
 
     pub fn with_audit_logger(mut self, logger: Option<Arc<AuditLogger>>) -> Self {
         self.audit_logger = logger;
+        self
+    }
+
+    pub fn with_permissive(mut self, permissive: bool) -> Self {
+        self.permissive = permissive;
         self
     }
 
@@ -217,27 +224,35 @@ impl ProxyHandler {
         // Check filter
         match self.filter_engine.check(&request_info) {
             FilterResult::Blocked => {
-                if self.log_blocked_requests {
-                    tracing::warn!(
-                        method = %method,
-                        url = %full_url,
-                        "BLOCKED (HTTP)"
-                    );
+                if self.permissive {
+                    tracing::warn!(method = %method, url = %full_url, "PERMITTED (HTTP)");
+                } else if self.log_blocked_requests {
+                    tracing::warn!(method = %method, url = %full_url, "BLOCKED (HTTP)");
                 }
                 self.emit_audit(AuditEntry {
                     timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestBlocked,
+                    event: if self.permissive {
+                        AuditEvent::RequestPermitted
+                    } else {
+                        AuditEvent::RequestBlocked
+                    },
                     method: method.clone(),
                     url: full_url.clone(),
                     host: host.clone(),
                     scheme: scheme.to_string(),
                     protocol: "http".to_string(),
-                    decision: AuditDecision::Blocked,
+                    decision: if self.permissive {
+                        AuditDecision::Allowed
+                    } else {
+                        AuditDecision::Blocked
+                    },
                     reason: AuditReason::NoMatchingRule,
                     credential: None,
                     git: None,
                 });
-                return Ok(blocked_response(&method, &full_url));
+                if !self.permissive {
+                    return Ok(blocked_response(&method, &full_url));
+                }
             }
             FilterResult::AllowedWithBranchCheck(_) | FilterResult::AllowedWithLfsCheck(_) => {
                 // Git rules with branch restrictions or LFS operation checks

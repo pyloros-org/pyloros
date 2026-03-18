@@ -269,6 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "  Audit log: {}",
                 cfg.logging.audit_log.as_deref().unwrap_or("disabled")
             );
+            println!("  Permissive mode: {}", cfg.proxy.permissive);
             if let (Some(username), Some(password)) =
                 (&cfg.proxy.auth_username, &cfg.proxy.auth_password)
             {

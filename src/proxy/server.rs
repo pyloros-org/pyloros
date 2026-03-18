@@ -465,6 +465,7 @@ impl ProxyServer {
         let log_allowed = self.config.logging.log_allowed_requests;
         let log_blocked = self.config.logging.log_blocked_requests;
         let audit_logger = self.audit_logger.clone();
+        let permissive = self.config.proxy.permissive;
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -473,7 +474,8 @@ impl ProxyServer {
                 let handler = ProxyHandler::new(tunnel_handler.clone(), filter_engine.clone())
                     .with_request_logging(log_allowed, log_blocked)
                     .with_auth(auth.clone())
-                    .with_audit_logger(audit_logger.clone());
+                    .with_audit_logger(audit_logger.clone())
+                    .with_permissive(permissive);
                 async move { handler.handle(req).await }
             });
 
@@ -500,7 +502,8 @@ impl ProxyServer {
         .with_request_logging(
             self.config.logging.log_allowed_requests,
             self.config.logging.log_blocked_requests,
-        );
+        )
+        .with_permissive(self.config.proxy.permissive);
         if let Some(port) = self.upstream_port_override {
             handler = handler.with_upstream_port_override(port);
         }

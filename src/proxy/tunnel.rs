@@ -34,6 +34,7 @@ pub struct TunnelHandler {
     upstream_tls_config: Option<Arc<ClientConfig>>,
     log_allowed_requests: bool,
     log_blocked_requests: bool,
+    permissive: bool,
 }
 
 impl TunnelHandler {
@@ -52,6 +53,7 @@ impl TunnelHandler {
             upstream_tls_config: None,
             log_allowed_requests: true,
             log_blocked_requests: true,
+            permissive: false,
         }
     }
 
@@ -84,6 +86,12 @@ impl TunnelHandler {
     pub fn with_request_logging(mut self, log_allowed: bool, log_blocked: bool) -> Self {
         self.log_allowed_requests = log_allowed;
         self.log_blocked_requests = log_blocked;
+        self
+    }
+
+    /// Enable permissive mode (allow unmatched requests through with logging).
+    pub fn with_permissive(mut self, permissive: bool) -> Self {
+        self.permissive = permissive;
         self
     }
 
@@ -197,27 +205,35 @@ impl TunnelHandler {
 
         match filter_result {
             FilterResult::Blocked => {
-                if self.log_blocked_requests {
-                    tracing::warn!(
-                        method = %method,
-                        url = %full_url,
-                        "BLOCKED"
-                    );
+                if self.permissive {
+                    tracing::warn!(method = %method, url = %full_url, "PERMITTED");
+                } else if self.log_blocked_requests {
+                    tracing::warn!(method = %method, url = %full_url, "BLOCKED");
                 }
                 self.emit_audit(AuditEntry {
                     timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestBlocked,
+                    event: if self.permissive {
+                        AuditEvent::RequestPermitted
+                    } else {
+                        AuditEvent::RequestBlocked
+                    },
                     method: method.clone(),
                     url: full_url.clone(),
                     host: host.to_string(),
                     scheme: "https".to_string(),
                     protocol: "https".to_string(),
-                    decision: AuditDecision::Blocked,
+                    decision: if self.permissive {
+                        AuditDecision::Allowed
+                    } else {
+                        AuditDecision::Blocked
+                    },
                     reason: AuditReason::NoMatchingRule,
                     credential: None,
                     git: None,
                 });
-                return Ok(blocked_response(&method, &full_url));
+                if !self.permissive {
+                    return Ok(blocked_response(&method, &full_url));
+                }
             }
             FilterResult::AllowedWithBranchCheck(ref filter) => {
                 if self.log_allowed_requests {
