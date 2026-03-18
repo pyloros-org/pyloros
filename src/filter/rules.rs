@@ -192,6 +192,55 @@ impl CompiledRule {
             )?);
         }
 
+        // LFS lock endpoints (plain Allowed rules, no body inspection)
+        if needs_push {
+            // Push needs all lock endpoints
+            rules.push(Self::compile_git_endpoint(
+                base_url,
+                "/info/lfs/locks",
+                None,
+                "GET",
+                None,
+            )?);
+            rules.push(Self::compile_git_endpoint(
+                base_url,
+                "/info/lfs/locks",
+                None,
+                "POST",
+                None,
+            )?);
+            rules.push(Self::compile_git_endpoint(
+                base_url,
+                "/info/lfs/locks/verify",
+                None,
+                "POST",
+                None,
+            )?);
+            rules.push(Self::compile_git_endpoint(
+                base_url,
+                "/info/lfs/locks/*/unlock",
+                None,
+                "POST",
+                None,
+            )?);
+        } else if needs_fetch {
+            // Fetch needs list + verify (informational, avoids client warning)
+            rules.push(Self::compile_git_endpoint(
+                base_url,
+                "/info/lfs/locks",
+                None,
+                "GET",
+                None,
+            )?);
+            rules.push(Self::compile_git_endpoint(
+                base_url,
+                "/info/lfs/locks/verify",
+                None,
+                "POST",
+                None,
+            )?);
+        }
+
         // LFS batch endpoint: POST <repo>/info/lfs/objects/batch
         {
             let mut lfs_ops = Vec::new();
@@ -732,8 +781,8 @@ mod tests {
         let engine =
             FilterEngine::new(vec![make_git_rule("fetch", "https://github.com/org/repo")]).unwrap();
 
-        // fetch = 2 smart HTTP endpoints + 1 LFS batch = 3
-        t.assert_eq("rule count", &engine.rule_count(), &3usize);
+        // fetch = 2 smart HTTP + 2 lock (GET list, POST verify) + 1 LFS batch = 5
+        t.assert_eq("rule count", &engine.rule_count(), &5usize);
 
         let lfs_req = RequestInfo::http(
             "POST",
@@ -758,8 +807,8 @@ mod tests {
         let engine =
             FilterEngine::new(vec![make_git_rule("push", "https://github.com/org/repo")]).unwrap();
 
-        // push = 2 smart HTTP endpoints + 1 LFS batch = 3
-        t.assert_eq("rule count", &engine.rule_count(), &3usize);
+        // push = 2 smart HTTP + 4 lock (GET list, POST create, POST verify, POST unlock) + 1 LFS batch = 7
+        t.assert_eq("rule count", &engine.rule_count(), &7usize);
 
         let lfs_req = RequestInfo::http(
             "POST",
@@ -784,8 +833,8 @@ mod tests {
         let engine =
             FilterEngine::new(vec![make_git_rule("*", "https://github.com/org/repo")]).unwrap();
 
-        // star = 4 smart HTTP endpoints + 1 LFS batch = 5
-        t.assert_eq("rule count", &engine.rule_count(), &5usize);
+        // star = 4 smart HTTP + 4 lock + 1 LFS batch = 9
+        t.assert_eq("rule count", &engine.rule_count(), &9usize);
 
         let lfs_req = RequestInfo::http(
             "POST",
@@ -885,5 +934,225 @@ mod tests {
             }
             other => panic!("expected AllowedWithLfsCheck, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_lfs_locks_fetch_allows_list_and_verify() {
+        let t = test_report!("Git fetch rule allows lock list (GET) and verify (POST)");
+        let engine =
+            FilterEngine::new(vec![make_git_rule("fetch", "https://github.com/org/repo")]).unwrap();
+
+        let list = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks",
+            None,
+        );
+        t.assert_true(
+            "GET /info/lfs/locks allowed",
+            matches!(engine.check(&list), FilterResult::Allowed),
+        );
+
+        let verify = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks/verify",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks/verify allowed",
+            matches!(engine.check(&verify), FilterResult::Allowed),
+        );
+    }
+
+    #[test]
+    fn test_lfs_locks_fetch_blocks_create_and_unlock() {
+        let t = test_report!("Git fetch rule blocks lock create (POST) and unlock");
+        let engine =
+            FilterEngine::new(vec![make_git_rule("fetch", "https://github.com/org/repo")]).unwrap();
+
+        let create = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks blocked (create)",
+            matches!(engine.check(&create), FilterResult::Blocked),
+        );
+
+        let unlock = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks/123/unlock",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks/123/unlock blocked",
+            matches!(engine.check(&unlock), FilterResult::Blocked),
+        );
+    }
+
+    #[test]
+    fn test_lfs_locks_push_allows_all() {
+        let t = test_report!("Git push rule allows all lock endpoints");
+        let engine =
+            FilterEngine::new(vec![make_git_rule("push", "https://github.com/org/repo")]).unwrap();
+
+        let list = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks",
+            None,
+        );
+        t.assert_true(
+            "GET /info/lfs/locks allowed",
+            matches!(engine.check(&list), FilterResult::Allowed),
+        );
+
+        let create = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks allowed (create)",
+            matches!(engine.check(&create), FilterResult::Allowed),
+        );
+
+        let verify = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks/verify",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks/verify allowed",
+            matches!(engine.check(&verify), FilterResult::Allowed),
+        );
+
+        let unlock = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks/42/unlock",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks/42/unlock allowed",
+            matches!(engine.check(&unlock), FilterResult::Allowed),
+        );
+    }
+
+    #[test]
+    fn test_lfs_locks_star_allows_all() {
+        let t = test_report!("Git * rule allows all lock endpoints");
+        let engine =
+            FilterEngine::new(vec![make_git_rule("*", "https://github.com/org/repo")]).unwrap();
+
+        let list = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks",
+            None,
+        );
+        t.assert_true(
+            "GET /info/lfs/locks allowed",
+            matches!(engine.check(&list), FilterResult::Allowed),
+        );
+
+        let create = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks allowed (create)",
+            matches!(engine.check(&create), FilterResult::Allowed),
+        );
+
+        let verify = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks/verify",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks/verify allowed",
+            matches!(engine.check(&verify), FilterResult::Allowed),
+        );
+
+        let unlock = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks/999/unlock",
+            None,
+        );
+        t.assert_true(
+            "POST /info/lfs/locks/999/unlock allowed",
+            matches!(engine.check(&unlock), FilterResult::Allowed),
+        );
+    }
+
+    #[test]
+    fn test_lfs_locks_return_allowed_not_lfs_check() {
+        let t =
+            test_report!("Lock endpoints return FilterResult::Allowed (not AllowedWithLfsCheck)");
+        let engine =
+            FilterEngine::new(vec![make_git_rule("push", "https://github.com/org/repo")]).unwrap();
+
+        let list = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks",
+            None,
+        );
+        let result = engine.check(&list);
+        t.assert_true(
+            "lock list returns Allowed (not AllowedWithLfsCheck)",
+            matches!(result, FilterResult::Allowed),
+        );
+
+        let verify = RequestInfo::http(
+            "POST",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/lfs/locks/verify",
+            None,
+        );
+        let result = engine.check(&verify);
+        t.assert_true(
+            "lock verify returns Allowed (not AllowedWithLfsCheck)",
+            matches!(result, FilterResult::Allowed),
+        );
     }
 }
