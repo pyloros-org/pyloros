@@ -529,6 +529,267 @@ async fn test_lfs_transfer_url_allowed_with_separate_rule() {
 }
 
 // ---------------------------------------------------------------------------
+// LFS Locks API tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lfs_locks_list_allowed_by_fetch_rule() {
+    let t = test_report!("LFS lock list (GET) allowed by git=fetch rule");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let upstream = TestUpstream::builder(&ca, ok_handler("locks-list-ok"))
+        .report(&t, "LFS locks mock")
+        .start()
+        .await;
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("fetch", "https://localhost/org/repo")],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client
+        .get("https://localhost/org/repo/info/lfs/locks")
+        .await;
+    t.assert_eq("status 200", &resp.status().as_u16(), &200u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_lfs_locks_verify_allowed_by_fetch_rule() {
+    let t = test_report!("LFS lock verify (POST) allowed by git=fetch rule");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let upstream = TestUpstream::builder(&ca, ok_handler("locks-verify-ok"))
+        .report(&t, "LFS locks mock")
+        .start()
+        .await;
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("fetch", "https://localhost/org/repo")],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks/verify")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks/verify");
+    t.assert_eq("status 200", &resp.status().as_u16(), &200u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_lfs_locks_create_blocked_by_fetch_rule() {
+    let t = test_report!("LFS lock create (POST) blocked by git=fetch rule");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let upstream = TestUpstream::builder(&ca, ok_handler("should-not-reach"))
+        .report(&t, "LFS locks mock")
+        .start()
+        .await;
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("fetch", "https://localhost/org/repo")],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks")
+        .body(r#"{"path":"test.bin"}"#)
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks (create, should be blocked)");
+    t.assert_eq("status 451", &resp.status().as_u16(), &451u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_lfs_locks_unlock_blocked_by_fetch_rule() {
+    let t = test_report!("LFS lock unlock blocked by git=fetch rule");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let upstream = TestUpstream::builder(&ca, ok_handler("should-not-reach"))
+        .report(&t, "LFS locks mock")
+        .start()
+        .await;
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("fetch", "https://localhost/org/repo")],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks/123/unlock")
+        .body(r#"{"force":false}"#)
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks/123/unlock (should be blocked)");
+    t.assert_eq("status 451", &resp.status().as_u16(), &451u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_lfs_locks_all_allowed_by_push_rule() {
+    let t = test_report!("All LFS lock endpoints allowed by git=push rule");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let upstream = TestUpstream::builder(&ca, ok_handler("locks-ok"))
+        .report(&t, "LFS locks mock")
+        .start()
+        .await;
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("push", "https://localhost/org/repo")],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+
+    let resp = client
+        .get("https://localhost/org/repo/info/lfs/locks")
+        .await;
+    t.assert_eq("GET list status 200", &resp.status().as_u16(), &200u16);
+
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks")
+        .body(r#"{"path":"test.bin"}"#)
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks (create)");
+    t.assert_eq("POST create status 200", &resp.status().as_u16(), &200u16);
+
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks/verify")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks/verify");
+    t.assert_eq("POST verify status 200", &resp.status().as_u16(), &200u16);
+
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks/42/unlock")
+        .body(r#"{"force":false}"#)
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks/42/unlock");
+    t.assert_eq("POST unlock status 200", &resp.status().as_u16(), &200u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_lfs_locks_all_allowed_by_star_rule() {
+    let t = test_report!("All LFS lock endpoints allowed by git=* rule");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let upstream = TestUpstream::builder(&ca, ok_handler("locks-ok"))
+        .report(&t, "LFS locks mock")
+        .start()
+        .await;
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("*", "https://localhost/org/repo")],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+
+    let resp = client
+        .get("https://localhost/org/repo/info/lfs/locks")
+        .await;
+    t.assert_eq("GET list status 200", &resp.status().as_u16(), &200u16);
+
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks")
+        .body(r#"{"path":"test.bin"}"#)
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks (create)");
+    t.assert_eq("POST create status 200", &resp.status().as_u16(), &200u16);
+
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks/verify")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks/verify");
+    t.assert_eq("POST verify status 200", &resp.status().as_u16(), &200u16);
+
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/locks/42/unlock")
+        .body(r#"{"force":false}"#)
+        .send()
+        .await
+        .unwrap();
+    t.action("POST /info/lfs/locks/42/unlock");
+    t.assert_eq("POST unlock status 200", &resp.status().as_u16(), &200u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // E2e tests with real git-lfs binary
 // ---------------------------------------------------------------------------
 
