@@ -16,10 +16,10 @@ Blocked requests receive HTTP 451 (Unavailable For Legal Reasons).
 
 ### Pre-built binary (Linux x86_64)
 
-Download the latest statically-linked binary from [GitHub Releases](https://github.com/zyla/pyloros/releases/latest):
+Download the latest statically-linked binary from [GitHub Releases](https://github.com/pyloros-org/pyloros/releases/latest):
 
 ```bash
-curl -sL https://github.com/zyla/pyloros/releases/latest/download/pyloros-$(curl -sL https://api.github.com/repos/zyla/pyloros/releases/latest | grep tag_name | cut -d '"' -f4)-x86_64-unknown-linux-musl.tar.gz | tar xz
+curl -sL https://github.com/pyloros-org/pyloros/releases/latest/download/pyloros-$(curl -sL https://api.github.com/repos/pyloros-org/pyloros/releases/latest | grep tag_name | cut -d '"' -f4)-x86_64-unknown-linux-musl.tar.gz | tar xz
 sudo mv pyloros-*/pyloros /usr/local/bin/
 ```
 
@@ -27,16 +27,16 @@ Or download a specific version:
 
 ```bash
 VERSION=v0.1.0
-curl -sL https://github.com/zyla/pyloros/releases/download/${VERSION}/pyloros-${VERSION}-x86_64-unknown-linux-musl.tar.gz | tar xz
+curl -sL https://github.com/pyloros-org/pyloros/releases/download/${VERSION}/pyloros-${VERSION}-x86_64-unknown-linux-musl.tar.gz | tar xz
 sudo mv pyloros-${VERSION}-x86_64-unknown-linux-musl/pyloros /usr/local/bin/
 ```
 
 ### Docker image
 
-A Docker image is published to `ghcr.io/zyla/pyloros`:
+A Docker image is published to `ghcr.io/pyloros-org/pyloros`:
 
 ```bash
-docker pull ghcr.io/zyla/pyloros:latest
+docker pull ghcr.io/pyloros-org/pyloros:latest
 ```
 
 Available tags:
@@ -51,7 +51,7 @@ docker run --rm \
   -v ./config.toml:/etc/pyloros/config.toml:ro \
   -v ./certs:/certs:ro \
   -p 8080:8080 \
-  ghcr.io/zyla/pyloros:latest \
+  ghcr.io/pyloros-org/pyloros:latest \
   run --config /etc/pyloros/config.toml \
       --ca-cert /certs/ca.crt --ca-key /certs/ca.key \
       --bind 0.0.0.0:8080
@@ -62,7 +62,7 @@ docker run --rm \
 A rolling pre-release is built from `main` on every push:
 
 ```bash
-curl -sL https://github.com/zyla/pyloros/releases/download/latest/pyloros-latest-x86_64-unknown-linux-musl.tar.gz | tar xz
+curl -sL https://github.com/pyloros-org/pyloros/releases/download/latest/pyloros-latest-x86_64-unknown-linux-musl.tar.gz | tar xz
 sudo mv pyloros-latest-x86_64-unknown-linux-musl/pyloros /usr/local/bin/
 ```
 
@@ -71,7 +71,7 @@ sudo mv pyloros-latest-x86_64-unknown-linux-musl/pyloros /usr/local/bin/
 Prerequisites: [Rust](https://www.rust-lang.org/tools/install) (stable toolchain).
 
 ```bash
-git clone https://github.com/zyla/pyloros.git
+git clone https://github.com/pyloros-org/pyloros.git
 cd pyloros
 cargo build --release
 ```

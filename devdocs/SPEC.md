@@ -445,7 +445,7 @@ A rolling `latest` pre-release is built from `main` on every push. It uses a fix
 
 ### Docker Image
 
-A Docker image is published to `ghcr.io/zyla/pyloros` with the following tags:
+A Docker image is published to `ghcr.io/pyloros-org/pyloros` with the following tags:
 - `v1.2.3` + `latest` — on version tags
 - `edge` — on every push to `main`
 
