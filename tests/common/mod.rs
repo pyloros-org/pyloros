@@ -439,39 +439,32 @@ pub struct TestProxy {
 }
 
 impl TestProxy {
-    async fn start_inner(
-        ca: &TestCa,
-        rules: Vec<pyloros::config::Rule>,
-        credentials: Vec<pyloros::config::Credential>,
-        upstream_port: u16,
-        upstream_host: Option<String>,
-        auth: Option<(String, String)>,
-        audit_log: Option<String>,
-    ) -> Self {
+    async fn start_from_builder(builder: &TestProxyBuilder<'_>) -> Self {
         let mut config = Config::minimal(
             "127.0.0.1:0".to_string(),
-            ca.cert_path.clone(),
-            ca.key_path.clone(),
+            builder.ca.cert_path.clone(),
+            builder.ca.key_path.clone(),
         );
-        config.rules = rules;
-        config.credentials = credentials;
-        if let Some((username, password)) = auth {
-            config.proxy.auth_username = Some(username);
-            config.proxy.auth_password = Some(password);
+        config.rules = builder.rules.clone();
+        config.credentials = builder.credentials.clone();
+        config.proxy.permissive = builder.permissive;
+        if let Some((ref username, ref password)) = builder.auth {
+            config.proxy.auth_username = Some(username.clone());
+            config.proxy.auth_password = Some(password.clone());
         }
         config.logging.log_allowed_requests = false;
         config.logging.log_blocked_requests = false;
 
-        let client_tls = ca.client_tls_config();
+        let client_tls = builder.ca.client_tls_config();
 
         let mut server = ProxyServer::new(config).unwrap();
         server = server
-            .with_upstream_port_override(upstream_port)
+            .with_upstream_port_override(builder.upstream_port)
             .with_upstream_tls(client_tls);
-        if let Some(host) = upstream_host {
-            server = server.with_upstream_host_override(host);
+        if let Some(ref host) = builder.upstream_host {
+            server = server.with_upstream_host_override(host.clone());
         }
-        if let Some(ref path) = audit_log {
+        if let Some(ref path) = builder.audit_log {
             let logger = pyloros::AuditLogger::open(path).unwrap();
             server = server.with_audit_logger(Arc::new(logger));
         }
@@ -508,6 +501,7 @@ impl TestProxy {
             upstream_host: None,
             auth: None,
             audit_log: None,
+            permissive: false,
             report: None,
         }
     }
@@ -521,6 +515,7 @@ pub struct TestProxyBuilder<'a> {
     upstream_host: Option<String>,
     auth: Option<(String, String)>,
     audit_log: Option<String>,
+    permissive: bool,
     report: Option<&'a TestReport>,
 }
 
@@ -542,6 +537,11 @@ impl<'a> TestProxyBuilder<'a> {
 
     pub fn audit_log(mut self, path: &str) -> Self {
         self.audit_log = Some(path.to_string());
+        self
+    }
+
+    pub fn permissive(mut self, enabled: bool) -> Self {
+        self.permissive = enabled;
         self
     }
 
@@ -584,16 +584,7 @@ impl<'a> TestProxyBuilder<'a> {
             }
         }
 
-        TestProxy::start_inner(
-            self.ca,
-            self.rules,
-            self.credentials,
-            self.upstream_port,
-            self.upstream_host,
-            self.auth,
-            self.audit_log,
-        )
-        .await
+        TestProxy::start_from_builder(&self).await
     }
 }
 
