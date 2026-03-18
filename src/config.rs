@@ -150,6 +150,11 @@ pub struct ProxyConfig {
     /// and uses SNI to determine the target hostname.
     #[serde(default)]
     pub direct_https_bind: Option<String>,
+
+    /// Permissive mode: allow unmatched requests through while logging them
+    /// as "request_permitted" for traffic discovery. Default: false.
+    #[serde(default)]
+    pub permissive: bool,
 }
 
 impl Default for ProxyConfig {
@@ -163,6 +168,7 @@ impl Default for ProxyConfig {
             upstream_override_port: None,
             upstream_tls_ca: None,
             direct_https_bind: None,
+            permissive: false,
         }
     }
 }
@@ -435,6 +441,7 @@ impl Config {
                 upstream_override_port: None,
                 upstream_tls_ca: None,
                 direct_https_bind: None,
+                permissive: false,
             },
             logging: LoggingConfig::default(),
             rules: Vec::new(),

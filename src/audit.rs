@@ -9,6 +9,7 @@ use std::path::Path;
 pub enum AuditEvent {
     RequestAllowed,
     RequestBlocked,
+    RequestPermitted,
     AuthFailed,
 }
 
@@ -229,9 +230,11 @@ mod tests {
         let t = test_report!("All AuditEvent variants serialize correctly");
         let allowed = serde_json::to_string(&AuditEvent::RequestAllowed).unwrap();
         let blocked = serde_json::to_string(&AuditEvent::RequestBlocked).unwrap();
+        let permitted = serde_json::to_string(&AuditEvent::RequestPermitted).unwrap();
         let auth = serde_json::to_string(&AuditEvent::AuthFailed).unwrap();
         t.assert_eq("allowed", &allowed.as_str(), &"\"request_allowed\"");
         t.assert_eq("blocked", &blocked.as_str(), &"\"request_blocked\"");
+        t.assert_eq("permitted", &permitted.as_str(), &"\"request_permitted\"");
         t.assert_eq("auth_failed", &auth.as_str(), &"\"auth_failed\"");
     }
 
