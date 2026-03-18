@@ -1065,6 +1065,36 @@ fn tungstenite_accept_key(key: &str) -> String {
 /// In-memory LFS object store, keyed by OID (SHA-256 hex string).
 pub type LfsStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
+/// In-memory LFS lock store for testing the locks API.
+pub type LfsLockStore = Arc<Mutex<LfsLockState>>;
+
+/// State for the LFS locks API mock.
+pub struct LfsLockState {
+    locks: Vec<LfsLock>,
+    next_id: u64,
+}
+
+/// A single LFS lock entry.
+#[derive(Clone)]
+struct LfsLock {
+    id: String,
+    path: String,
+}
+
+impl LfsLockState {
+    pub fn new() -> Self {
+        Self {
+            locks: Vec::new(),
+            next_id: 1,
+        }
+    }
+}
+
+/// Create a new empty LFS lock store.
+pub fn new_lfs_lock_store() -> LfsLockStore {
+    Arc::new(Mutex::new(LfsLockState::new()))
+}
+
 /// Check whether `git lfs` is available on this system.
 pub fn git_lfs_available() -> bool {
     std::process::Command::new("git")
@@ -1086,13 +1116,52 @@ fn extract_lfs_object_oid(path: &str) -> Option<String> {
     }
 }
 
+/// Detect if a path is an LFS locks API endpoint.
+/// Returns the lock endpoint type if matched.
+enum LfsLockEndpoint {
+    /// GET /info/lfs/locks — list locks
+    List,
+    /// POST /info/lfs/locks — create lock
+    Create,
+    /// POST /info/lfs/locks/verify — verify locks
+    Verify,
+    /// POST /info/lfs/locks/<id>/unlock — delete lock
+    Unlock(String),
+}
+
+fn detect_lfs_lock_endpoint(path: &str, method: &hyper::Method) -> Option<LfsLockEndpoint> {
+    // Check for /info/lfs/locks in the path
+    let idx = path.find("/info/lfs/locks")?;
+    let after = &path[idx + "/info/lfs/locks".len()..];
+
+    match (method.as_str(), after) {
+        ("GET", "" | "/") => Some(LfsLockEndpoint::List),
+        ("POST", "" | "/") => Some(LfsLockEndpoint::Create),
+        ("POST", "/verify" | "/verify/") => Some(LfsLockEndpoint::Verify),
+        ("POST", suffix) => {
+            // Match /info/lfs/locks/<id>/unlock
+            let suffix = suffix.strip_prefix('/')?;
+            let suffix = suffix
+                .strip_suffix("/unlock")
+                .or_else(|| suffix.strip_suffix("/unlock/"))?;
+            if !suffix.is_empty() && !suffix.contains('/') {
+                Some(LfsLockEndpoint::Unlock(suffix.to_string()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Create an upstream handler that serves both git smart HTTP (via `git http-backend`)
-/// and Git-LFS batch API + object transfers.
+/// and Git-LFS batch API + object transfers + locks API.
 ///
 /// Routing:
 /// - `POST .../info/lfs/objects/batch` → LFS batch API (parse JSON, return transfer URLs)
 /// - `GET .../lfs/objects/<oid>` → serve LFS object from in-memory store
 /// - `PUT .../lfs/objects/<oid>` → store LFS object in in-memory store
+/// - `GET/POST .../info/lfs/locks[/...]` → LFS locks API
 /// - Everything else → delegate to `git http-backend` CGI
 pub fn lfs_git_handler(
     backend_path: std::path::PathBuf,
@@ -1102,13 +1171,18 @@ pub fn lfs_git_handler(
 ) -> UpstreamHandler {
     let lfs_request_log = request_log.clone();
     let git_handler = git_cgi_handler(backend_path, git_root, request_log);
+    let lock_store = new_lfs_lock_store();
 
     Arc::new(move |req: Request<Incoming>| {
         let path = req.uri().path().to_string();
         let method = req.method().clone();
 
         // Log LFS requests (git CGI requests are logged by git_cgi_handler)
-        if path.ends_with("/info/lfs/objects/batch") || extract_lfs_object_oid(&path).is_some() {
+        let is_lfs_lock = path.contains("/info/lfs/locks");
+        if path.ends_with("/info/lfs/objects/batch")
+            || extract_lfs_object_oid(&path).is_some()
+            || is_lfs_lock
+        {
             lfs_request_log
                 .lock()
                 .unwrap()
@@ -1242,6 +1316,105 @@ pub fn lfs_git_handler(
                         .unwrap())
                 })
             }
+        } else if let Some(lock_endpoint) = detect_lfs_lock_endpoint(&path, &method) {
+            let lock_store = lock_store.clone();
+            Box::pin(async move {
+                // Consume body (needed for POST endpoints)
+                let body_bytes = req.collect().await.unwrap().to_bytes();
+                let mut store = lock_store.lock().unwrap();
+
+                let response_body = match lock_endpoint {
+                    LfsLockEndpoint::List => {
+                        let locks: Vec<serde_json::Value> = store
+                            .locks
+                            .iter()
+                            .map(|l| {
+                                serde_json::json!({
+                                    "id": l.id,
+                                    "path": l.path,
+                                    "locked_at": "2024-01-01T00:00:00Z",
+                                    "owner": { "name": "test-user" }
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({ "locks": locks })
+                    }
+                    LfsLockEndpoint::Create => {
+                        let parsed: serde_json::Value =
+                            serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+                        let lock_path = parsed
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let id = store.next_id.to_string();
+                        store.next_id += 1;
+                        store.locks.push(LfsLock {
+                            id: id.clone(),
+                            path: lock_path.clone(),
+                        });
+                        serde_json::json!({
+                            "lock": {
+                                "id": id,
+                                "path": lock_path,
+                                "locked_at": "2024-01-01T00:00:00Z",
+                                "owner": { "name": "test-user" }
+                            }
+                        })
+                    }
+                    LfsLockEndpoint::Verify => {
+                        let ours: Vec<serde_json::Value> = store
+                            .locks
+                            .iter()
+                            .map(|l| {
+                                serde_json::json!({
+                                    "id": l.id,
+                                    "path": l.path,
+                                    "locked_at": "2024-01-01T00:00:00Z",
+                                    "owner": { "name": "test-user" }
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({ "ours": ours, "theirs": [] })
+                    }
+                    LfsLockEndpoint::Unlock(ref lock_id) => {
+                        if let Some(pos) = store.locks.iter().position(|l| l.id == *lock_id) {
+                            let removed = store.locks.remove(pos);
+                            serde_json::json!({
+                                "lock": {
+                                    "id": removed.id,
+                                    "path": removed.path,
+                                    "locked_at": "2024-01-01T00:00:00Z",
+                                    "owner": { "name": "test-user" }
+                                }
+                            })
+                        } else {
+                            return Ok(Response::builder()
+                                .status(404)
+                                .header("Content-Type", "application/vnd.git-lfs+json")
+                                .body(
+                                    Full::new(Bytes::from(
+                                        serde_json::json!({"message": "lock not found"})
+                                            .to_string(),
+                                    ))
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                                )
+                                .unwrap());
+                        }
+                    }
+                };
+
+                Ok(Response::builder()
+                    .status(200)
+                    .header("Content-Type", "application/vnd.git-lfs+json")
+                    .body(
+                        Full::new(Bytes::from(response_body.to_string()))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
+                    .unwrap())
+            })
         } else {
             git_handler(req)
         }
