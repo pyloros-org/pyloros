@@ -14,6 +14,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::response::{blocked_response, error_response, git_blocked_push_response};
+use super::{RequestContext, RequestLogger};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
 };
@@ -28,13 +29,10 @@ pub struct TunnelHandler {
     mitm_generator: Arc<MitmCertificateGenerator>,
     filter_engine: Arc<FilterEngine>,
     credential_engine: Arc<CredentialEngine>,
-    audit_logger: Option<Arc<AuditLogger>>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
-    log_allowed_requests: bool,
-    log_blocked_requests: bool,
-    permissive: bool,
+    logger: RequestLogger,
 }
 
 impl TunnelHandler {
@@ -47,13 +45,10 @@ impl TunnelHandler {
             mitm_generator,
             filter_engine,
             credential_engine,
-            audit_logger: None,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
-            log_allowed_requests: true,
-            log_blocked_requests: true,
-            permissive: false,
+            logger: RequestLogger::new(),
         }
     }
 
@@ -78,27 +73,20 @@ impl TunnelHandler {
 
     /// Set the audit logger for structured request logging.
     pub fn with_audit_logger(mut self, logger: Arc<AuditLogger>) -> Self {
-        self.audit_logger = Some(logger);
+        self.logger = self.logger.with_audit_logger(Some(logger));
         self
     }
 
     /// Configure request logging.
     pub fn with_request_logging(mut self, log_allowed: bool, log_blocked: bool) -> Self {
-        self.log_allowed_requests = log_allowed;
-        self.log_blocked_requests = log_blocked;
+        self.logger = self.logger.with_request_logging(log_allowed, log_blocked);
         self
     }
 
     /// Enable permissive mode (allow unmatched requests through with logging).
     pub fn with_permissive(mut self, permissive: bool) -> Self {
-        self.permissive = permissive;
+        self.logger = self.logger.with_permissive(permissive);
         self
-    }
-
-    fn emit_audit(&self, entry: AuditEntry) {
-        if let Some(ref logger) = self.audit_logger {
-            logger.log(&entry);
-        }
     }
 
     /// Build the first matching credential info for the audit entry.
@@ -203,40 +191,24 @@ impl TunnelHandler {
         // Check filter
         let filter_result = self.filter_engine.check(&request_info);
 
+        let ctx = RequestContext {
+            method: &method,
+            url: &full_url,
+            host,
+            scheme: "https",
+            protocol: "https",
+            credential: None,
+            label: "",
+        };
+
         match filter_result {
             FilterResult::Blocked => {
-                if self.permissive {
-                    tracing::warn!(method = %method, url = %full_url, "PERMITTED");
-                } else if self.log_blocked_requests {
-                    tracing::warn!(method = %method, url = %full_url, "BLOCKED");
-                }
-                self.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: if self.permissive {
-                        AuditEvent::RequestPermitted
-                    } else {
-                        AuditEvent::RequestBlocked
-                    },
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.to_string(),
-                    scheme: "https".to_string(),
-                    protocol: "https".to_string(),
-                    decision: if self.permissive {
-                        AuditDecision::Allowed
-                    } else {
-                        AuditDecision::Blocked
-                    },
-                    reason: AuditReason::NoMatchingRule,
-                    credential: None,
-                    git: None,
-                });
-                if !self.permissive {
-                    return Ok(blocked_response(&method, &full_url));
+                if let Some(resp) = self.logger.log_blocked(&ctx) {
+                    return Ok(resp);
                 }
             }
             FilterResult::AllowedWithBranchCheck(ref filter) => {
-                if self.log_allowed_requests {
+                if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
                         url = %full_url,
@@ -259,7 +231,7 @@ impl TunnelHandler {
 
                 let blocked = pktline::blocked_refs_with_filter(&body_bytes, filter);
                 if !blocked.is_empty() {
-                    if self.log_blocked_requests {
+                    if self.logger.log_blocked_requests {
                         tracing::warn!(
                             method = %method,
                             url = %full_url,
@@ -267,7 +239,7 @@ impl TunnelHandler {
                             "BLOCKED (branch restriction)"
                         );
                     }
-                    self.emit_audit(AuditEntry {
+                    self.logger.emit_audit(AuditEntry {
                         timestamp: crate::audit::now_iso8601(),
                         event: AuditEvent::RequestBlocked,
                         method: method.clone(),
@@ -286,19 +258,11 @@ impl TunnelHandler {
                 }
 
                 // Allowed after branch check
-                self.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestAllowed,
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.to_string(),
-                    scheme: "https".to_string(),
-                    protocol: "https".to_string(),
-                    decision: AuditDecision::Allowed,
-                    reason: AuditReason::RuleMatched,
+                let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
-                    git: None,
-                });
+                    ..ctx
+                };
+                self.logger.log_allowed(&allowed_ctx);
 
                 // Inject credentials (body already buffered)
                 self.credential_engine.inject_with_body(
@@ -312,7 +276,7 @@ impl TunnelHandler {
                     .await;
             }
             FilterResult::AllowedWithLfsCheck(ref allowed_ops) => {
-                if self.log_allowed_requests {
+                if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
                         url = %full_url,
@@ -332,7 +296,7 @@ impl TunnelHandler {
                     .to_bytes();
 
                 if !lfs::check_lfs_operation(&body_bytes, allowed_ops) {
-                    if self.log_blocked_requests {
+                    if self.logger.log_blocked_requests {
                         tracing::warn!(
                             method = %method,
                             url = %full_url,
@@ -340,7 +304,7 @@ impl TunnelHandler {
                             "BLOCKED (LFS operation not allowed)"
                         );
                     }
-                    self.emit_audit(AuditEntry {
+                    self.logger.emit_audit(AuditEntry {
                         timestamp: crate::audit::now_iso8601(),
                         event: AuditEvent::RequestBlocked,
                         method: method.clone(),
@@ -357,45 +321,22 @@ impl TunnelHandler {
                 }
 
                 // Allowed after LFS check
-                self.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestAllowed,
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.to_string(),
-                    scheme: "https".to_string(),
-                    protocol: "https".to_string(),
-                    decision: AuditDecision::Allowed,
-                    reason: AuditReason::RuleMatched,
+                let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
-                    git: None,
-                });
+                    ..ctx
+                };
+                self.logger.log_allowed(&allowed_ctx);
 
                 return self
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
                     .await;
             }
             FilterResult::Allowed => {
-                if self.log_allowed_requests {
-                    tracing::info!(
-                        method = %method,
-                        url = %full_url,
-                        "ALLOWED"
-                    );
-                }
-                self.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestAllowed,
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.to_string(),
-                    scheme: "https".to_string(),
-                    protocol: "https".to_string(),
-                    decision: AuditDecision::Allowed,
-                    reason: AuditReason::RuleMatched,
+                let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
-                    git: None,
-                });
+                    ..ctx
+                };
+                self.logger.log_allowed(&allowed_ctx);
             }
         }
 

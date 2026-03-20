@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 
 use super::response::{auth_required_response, blocked_response, error_response};
 use super::tunnel::TunnelHandler;
+use super::{RequestContext, RequestLogger};
 use crate::audit::{AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason};
 use crate::filter::{FilterEngine, FilterResult, RequestInfo};
 
@@ -20,10 +21,7 @@ pub struct ProxyHandler {
     tunnel_handler: Arc<TunnelHandler>,
     filter_engine: Arc<FilterEngine>,
     auth: Option<(String, String)>,
-    audit_logger: Option<Arc<AuditLogger>>,
-    log_allowed_requests: bool,
-    log_blocked_requests: bool,
-    permissive: bool,
+    logger: RequestLogger,
 }
 
 impl ProxyHandler {
@@ -32,16 +30,12 @@ impl ProxyHandler {
             tunnel_handler,
             filter_engine,
             auth: None,
-            audit_logger: None,
-            log_allowed_requests: true,
-            log_blocked_requests: true,
-            permissive: false,
+            logger: RequestLogger::new(),
         }
     }
 
     pub fn with_request_logging(mut self, log_allowed: bool, log_blocked: bool) -> Self {
-        self.log_allowed_requests = log_allowed;
-        self.log_blocked_requests = log_blocked;
+        self.logger = self.logger.with_request_logging(log_allowed, log_blocked);
         self
     }
 
@@ -51,19 +45,13 @@ impl ProxyHandler {
     }
 
     pub fn with_audit_logger(mut self, logger: Option<Arc<AuditLogger>>) -> Self {
-        self.audit_logger = logger;
+        self.logger = self.logger.with_audit_logger(logger);
         self
     }
 
     pub fn with_permissive(mut self, permissive: bool) -> Self {
-        self.permissive = permissive;
+        self.logger = self.logger.with_permissive(permissive);
         self
-    }
-
-    fn emit_audit(&self, entry: AuditEntry) {
-        if let Some(ref logger) = self.audit_logger {
-            logger.log(&entry);
-        }
     }
 
     /// Check the Proxy-Authorization header against configured credentials.
@@ -118,7 +106,7 @@ impl ProxyHandler {
             let url = req.uri().to_string();
             let method = req.method().to_string();
             let host = req.uri().host().unwrap_or("unknown").to_string();
-            self.emit_audit(AuditEntry {
+            self.logger.emit_audit(AuditEntry {
                 timestamp: crate::audit::now_iso8601(),
                 event: AuditEvent::AuthFailed,
                 method,
@@ -156,7 +144,7 @@ impl ProxyHandler {
         if port != 443 {
             tracing::warn!(host = %host, port = %port, "Blocking non-HTTPS CONNECT");
             let url = format!("{}:{}", host, port);
-            self.emit_audit(AuditEntry {
+            self.logger.emit_audit(AuditEntry {
                 timestamp: crate::audit::now_iso8601(),
                 event: AuditEvent::RequestBlocked,
                 method: "CONNECT".to_string(),
@@ -222,50 +210,34 @@ impl ProxyHandler {
         let full_url = request_info.full_url();
 
         // Check filter
+        let ctx = RequestContext {
+            method: &method,
+            url: &full_url,
+            host: &host,
+            scheme,
+            protocol: "http",
+            credential: None,
+            label: " (HTTP)",
+        };
+
         match self.filter_engine.check(&request_info) {
             FilterResult::Blocked => {
-                if self.permissive {
-                    tracing::warn!(method = %method, url = %full_url, "PERMITTED (HTTP)");
-                } else if self.log_blocked_requests {
-                    tracing::warn!(method = %method, url = %full_url, "BLOCKED (HTTP)");
-                }
-                self.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: if self.permissive {
-                        AuditEvent::RequestPermitted
-                    } else {
-                        AuditEvent::RequestBlocked
-                    },
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.clone(),
-                    scheme: scheme.to_string(),
-                    protocol: "http".to_string(),
-                    decision: if self.permissive {
-                        AuditDecision::Allowed
-                    } else {
-                        AuditDecision::Blocked
-                    },
-                    reason: AuditReason::NoMatchingRule,
-                    credential: None,
-                    git: None,
-                });
-                if !self.permissive {
-                    return Ok(blocked_response(&method, &full_url));
+                if let Some(resp) = self.logger.log_blocked(&ctx) {
+                    return Ok(resp);
                 }
             }
             FilterResult::AllowedWithBranchCheck(_) | FilterResult::AllowedWithLfsCheck(_) => {
                 // Git rules with branch restrictions or LFS operation checks
                 // require body inspection, which is only supported over HTTPS
                 // CONNECT tunnels. Block plain HTTP to maintain default-deny.
-                if self.log_blocked_requests {
+                if self.logger.log_blocked_requests {
                     tracing::warn!(
                         method = %method,
                         url = %full_url,
                         "BLOCKED (HTTP: body inspection requires HTTPS)"
                     );
                 }
-                self.emit_audit(AuditEntry {
+                self.logger.emit_audit(AuditEntry {
                     timestamp: crate::audit::now_iso8601(),
                     event: AuditEvent::RequestBlocked,
                     method: method.clone(),
@@ -281,26 +253,7 @@ impl ProxyHandler {
                 return Ok(blocked_response(&method, &full_url));
             }
             FilterResult::Allowed => {
-                if self.log_allowed_requests {
-                    tracing::info!(
-                        method = %method,
-                        url = %full_url,
-                        "ALLOWED (HTTP)"
-                    );
-                }
-                self.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestAllowed,
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.clone(),
-                    scheme: scheme.to_string(),
-                    protocol: "http".to_string(),
-                    decision: AuditDecision::Allowed,
-                    reason: AuditReason::RuleMatched,
-                    credential: None,
-                    git: None,
-                });
+                self.logger.log_allowed(&ctx);
             }
         }
 
@@ -314,8 +267,6 @@ impl ProxyHandler {
         }
     }
 }
-
-use super::HOP_BY_HOP_HEADERS;
 
 /// Forward a plain HTTP request to the upstream server.
 async fn forward_http_request(
@@ -342,7 +293,7 @@ async fn forward_http_request(
     });
 
     // Rebuild request: relative URI, strip hop-by-hop headers, ensure Host header
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
 
     let path_and_query = parts
         .uri
@@ -351,14 +302,13 @@ async fn forward_http_request(
         .unwrap_or("/");
     let new_uri: hyper::Uri = path_and_query.parse()?;
 
+    super::strip_hop_by_hop_headers(&mut parts.headers);
+
     let mut builder = Request::builder().method(parts.method).uri(new_uri);
 
-    // Copy headers, stripping hop-by-hop
+    // Copy remaining headers
     for (name, value) in &parts.headers {
-        let name_lower = name.as_str().to_lowercase();
-        if !HOP_BY_HOP_HEADERS.contains(&name_lower.as_str()) {
-            builder = builder.header(name, value);
-        }
+        builder = builder.header(name, value);
     }
 
     // Ensure Host header is present
