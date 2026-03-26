@@ -219,6 +219,10 @@ modification. On Unix systems, sending `SIGHUP` to the proxy process also trigge
 - Successful reloads are logged at info level with rule/credential counts
 - Failed reloads are logged at error level with the parse/compile failure message
 
+### Signal Handling
+
+The proxy shuts down cleanly on both `SIGINT` (Ctrl+C) and `SIGTERM`. On receiving either signal, the proxy logs a shutdown message and exits with code 0. `SIGTERM` handling is Unix-only (on non-Unix platforms, only Ctrl+C is supported).
+
 ### Logging
 - Configurable log level (error/warn/info/debug/trace)
 - Separate control over logging of allowed and blocked requests (e.g., log only blocked to reduce noise, or only allowed for auditing)
