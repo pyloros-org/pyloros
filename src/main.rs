@@ -40,6 +40,10 @@ enum Commands {
         #[arg(long)]
         direct_https_bind: Option<String>,
 
+        /// Auto-generate CA certificate at configured paths if files don't exist
+        #[arg(long)]
+        auto_generate_ca: bool,
+
         /// Log level (error, warn, info, debug, trace)
         #[arg(short, long, default_value = "info")]
         log_level: String,
@@ -92,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca_key,
             bind,
             direct_https_bind,
+            auto_generate_ca,
             log_level,
         } => {
             // Initialize logging
@@ -127,17 +132,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cfg.proxy.direct_https_bind = Some(addr);
             }
 
-            // Validate required fields
+            // Validate CA cert/key paths are specified
             if cfg.proxy.ca_cert.is_none() || cfg.proxy.ca_key.is_none() {
-                eprintln!("Error: CA certificate and key are required.");
+                eprintln!("Error: CA certificate and key paths are required.");
                 eprintln!();
-                eprintln!(
-                    "Either specify them in the config file or via --ca-cert and --ca-key flags."
-                );
+                eprintln!("Specify them in the config file or via --ca-cert and --ca-key flags.");
+                eprintln!("Use --auto-generate-ca to create them automatically if missing.");
                 eprintln!();
-                eprintln!("To generate a new CA certificate:");
+                eprintln!("To generate a CA certificate manually:");
                 eprintln!("  pyloros generate-ca --out ./certs/");
                 std::process::exit(1);
+            }
+
+            // Auto-generate CA files at configured paths if they don't exist
+            if auto_generate_ca {
+                let cert_path = cfg.proxy.ca_cert.as_ref().unwrap();
+                let key_path = cfg.proxy.ca_key.as_ref().unwrap();
+                if !std::path::Path::new(cert_path).exists()
+                    || !std::path::Path::new(key_path).exists()
+                {
+                    tracing::info!("Auto-generating CA certificate...");
+                    let ca = GeneratedCa::generate()?;
+                    if let Some(parent) = std::path::Path::new(cert_path).parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if let Some(parent) = std::path::Path::new(key_path).parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    ca.save(cert_path, key_path)?;
+                    tracing::info!(
+                        cert = %cert_path,
+                        key = %key_path,
+                        "CA certificate generated"
+                    );
+                }
             }
 
             // Extract optional overrides before moving cfg
