@@ -225,7 +225,7 @@ fn run_fails_with_only_ca_cert() {
     t.assert_contains(
         "Error mentions CA",
         &stderr,
-        "CA certificate and key are required",
+        "CA certificate and key paths are required",
     );
 }
 
@@ -244,30 +244,42 @@ fn run_fails_with_only_ca_key() {
     t.assert_contains(
         "Error mentions CA",
         &stderr,
-        "CA certificate and key are required",
+        "CA certificate and key paths are required",
     );
 }
 
 // ---------- run: --auto-generate-ca ----------
 
 #[test]
-fn run_auto_generate_ca_starts_successfully() {
-    let t = test_report!("run --auto-generate-ca starts proxy without explicit CA");
+fn run_auto_generate_ca_creates_files_and_starts() {
+    let t = test_report!("run --auto-generate-ca generates CA at configured paths");
 
     let dir = TempDir::new().unwrap();
+    let cert_path = dir.path().join("certs").join("ca.crt");
+    let key_path = dir.path().join("certs").join("ca.key");
     let config_path = dir.path().join("config.toml");
     fs::write(
         &config_path,
-        r#"
+        format!(
+            r#"
 [proxy]
 bind_address = "127.0.0.1:0"
+ca_cert = "{}"
+ca_key = "{}"
 
 [[rules]]
 method = "*"
 url = "https://*/*"
 "#,
+            cert_path.display(),
+            key_path.display()
+        ),
     )
     .unwrap();
+
+    // Files should not exist yet
+    t.assert_true("cert does not exist before", !cert_path.exists());
+    t.assert_true("key does not exist before", !key_path.exists());
 
     let bin = assert_cmd::cargo::cargo_bin!("pyloros");
     let mut child = std::process::Command::new(bin)
@@ -284,7 +296,16 @@ url = "https://*/*"
     // Give the proxy a moment to start (or fail)
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // If the process is still running, auto-generate worked
+    // Verify files were created
+    t.assert_true("cert file created", cert_path.exists());
+    t.assert_true("key file created", key_path.exists());
+
+    let cert = fs::read_to_string(&cert_path).unwrap();
+    let key = fs::read_to_string(&key_path).unwrap();
+    t.assert_contains("Cert is PEM", &cert, "BEGIN CERTIFICATE");
+    t.assert_contains("Key is PEM", &key, "BEGIN PRIVATE KEY");
+
+    // If the process is still running, it started successfully
     match child.try_wait().unwrap() {
         None => {
             t.assert_true("Proxy started successfully", true);
