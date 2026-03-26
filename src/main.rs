@@ -191,10 +191,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("  export HTTPS_PROXY=http://{}", server.bind_address());
             }
 
-            // Handle Ctrl+C
+            // Handle SIGINT (Ctrl+C) and SIGTERM
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
+                #[cfg(unix)]
+                {
+                    let mut sigterm =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .expect("failed to install SIGTERM handler");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = sigterm.recv() => {},
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    tokio::signal::ctrl_c().await.ok();
+                }
                 tracing::info!("Shutting down...");
                 let _ = shutdown_tx.send(());
             });
