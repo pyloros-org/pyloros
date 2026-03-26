@@ -40,6 +40,10 @@ enum Commands {
         #[arg(long)]
         direct_https_bind: Option<String>,
 
+        /// Auto-generate CA certificate if not provided (written to a temp directory)
+        #[arg(long)]
+        auto_generate_ca: bool,
+
         /// Log level (error, warn, info, debug, trace)
         #[arg(short, long, default_value = "info")]
         log_level: String,
@@ -92,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca_key,
             bind,
             direct_https_bind,
+            auto_generate_ca,
             log_level,
         } => {
             // Initialize logging
@@ -127,17 +132,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cfg.proxy.direct_https_bind = Some(addr);
             }
 
-            // Validate required fields
+            // Auto-generate CA if requested and not already configured
+            let _ca_tempdir;
             if cfg.proxy.ca_cert.is_none() || cfg.proxy.ca_key.is_none() {
-                eprintln!("Error: CA certificate and key are required.");
-                eprintln!();
-                eprintln!(
-                    "Either specify them in the config file or via --ca-cert and --ca-key flags."
-                );
-                eprintln!();
-                eprintln!("To generate a new CA certificate:");
-                eprintln!("  pyloros generate-ca --out ./certs/");
-                std::process::exit(1);
+                if auto_generate_ca {
+                    let dir = tempfile::tempdir()
+                        .map_err(|e| format!("Failed to create temp directory for CA: {}", e))?;
+                    let cert_path = dir.path().join("ca.crt");
+                    let key_path = dir.path().join("ca.key");
+
+                    tracing::info!("Auto-generating CA certificate...");
+                    let ca = GeneratedCa::generate()?;
+                    ca.save(&cert_path, &key_path)?;
+                    tracing::info!(path = %cert_path.display(), "CA certificate generated");
+
+                    cfg.proxy.ca_cert = Some(cert_path.to_string_lossy().to_string());
+                    cfg.proxy.ca_key = Some(key_path.to_string_lossy().to_string());
+                    // Keep tempdir alive for the lifetime of the process
+                    _ca_tempdir = Some(dir);
+                } else {
+                    eprintln!("Error: CA certificate and key are required.");
+                    eprintln!();
+                    eprintln!(
+                        "Either specify them in the config file, via --ca-cert/--ca-key flags,"
+                    );
+                    eprintln!("or use --auto-generate-ca to generate an ephemeral CA.");
+                    eprintln!();
+                    eprintln!("To generate a persistent CA certificate:");
+                    eprintln!("  pyloros generate-ca --out ./certs/");
+                    std::process::exit(1);
+                }
+            } else {
+                _ca_tempdir = None;
             }
 
             // Extract optional overrides before moving cfg

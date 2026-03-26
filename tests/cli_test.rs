@@ -248,6 +248,82 @@ fn run_fails_with_only_ca_key() {
     );
 }
 
+// ---------- run: --auto-generate-ca ----------
+
+#[test]
+fn run_auto_generate_ca_starts_successfully() {
+    let t = test_report!("run --auto-generate-ca starts proxy without explicit CA");
+
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[proxy]
+bind_address = "127.0.0.1:0"
+
+[[rules]]
+method = "*"
+url = "https://*/*"
+"#,
+    )
+    .unwrap();
+
+    let bin = assert_cmd::cargo::cargo_bin!("pyloros");
+    let mut child = std::process::Command::new(bin)
+        .args([
+            "run",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--auto-generate-ca",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Give the proxy a moment to start (or fail)
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // If the process is still running, auto-generate worked
+    match child.try_wait().unwrap() {
+        None => {
+            t.assert_true("Proxy started successfully", true);
+            child.kill().ok();
+            child.wait().ok();
+        }
+        Some(status) => {
+            let stderr = child
+                .stderr
+                .take()
+                .map(|s| {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::BufReader::new(s).read_to_string(&mut buf).ok();
+                    buf
+                })
+                .unwrap_or_default();
+            t.assert_true(
+                &format!(
+                    "Proxy should not have exited (status={}, stderr={})",
+                    status, stderr
+                ),
+                false,
+            );
+        }
+    }
+}
+
+#[test]
+fn run_no_ca_no_auto_generate_fails() {
+    let t = test_report!("run without CA and without --auto-generate-ca fails");
+
+    let output = run_cli_reported(&t, &["run"]);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    t.assert_true("Exit failure", !output.status.success());
+    t.assert_contains("Mentions auto-generate", &stderr, "--auto-generate-ca");
+}
+
 // ---------- generate-ca ----------
 
 #[test]
