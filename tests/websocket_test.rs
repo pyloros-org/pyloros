@@ -4,7 +4,7 @@ use common::{ok_handler, ws_echo_handler, ws_rule, TestCa, TestProxy, TestReport
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 
 type WsStream = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -366,4 +366,117 @@ async fn test_websocket_ping_pong() {
     ws.close().await;
     proxy.shutdown();
     upstream.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Group 5: HTTP/2 ALPN negotiation
+// ---------------------------------------------------------------------------
+
+/// A strict upstream that uses h2::Builder when ALPN negotiated h2, instead of
+/// auto-detecting from wire bytes. This simulates real servers (e.g. elevenlabs)
+/// that immediately send h2 connection preface after ALPN negotiation.
+async fn start_strict_alpn_upstream(
+    ca: &TestCa,
+    handler: common::UpstreamHandler,
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    use hyper::server::conn::{http1, http2};
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio_rustls::TlsAcceptor;
+
+    let server_config = ca.server_tls_config("localhost");
+    let acceptor = TlsAcceptor::from(server_config);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                result = listener.accept() => {
+                    let (stream, _) = match result {
+                        Ok(conn) => conn,
+                        Err(_) => continue,
+                    };
+                    let acceptor = acceptor.clone();
+                    let handler = handler.clone();
+
+                    tokio::spawn(async move {
+                        let tls_stream = match acceptor.accept(stream).await {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+
+                        // Check what ALPN was actually negotiated
+                        let negotiated_h2 = tls_stream
+                            .get_ref()
+                            .1
+                            .alpn_protocol()
+                            == Some(b"h2".as_slice());
+
+                        let io = TokioIo::new(tls_stream);
+                        let service = service_fn(move |req| {
+                            let handler = handler.clone();
+                            handler(req)
+                        });
+
+                        if negotiated_h2 {
+                            // Strict h2: use h2 builder directly, no fallback
+                            let _ = http2::Builder::new(TokioExecutor::new())
+                                .serve_connection(io, service)
+                                .await;
+                        } else {
+                            let _ = http1::Builder::new()
+                                .serve_connection(io, service)
+                                .with_upgrades()
+                                .await;
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (addr, shutdown_tx)
+}
+
+/// WebSocket through a strict-ALPN upstream that speaks h2 when h2 is negotiated.
+///
+/// Without the h1-only ALPN fix in forward_websocket, the proxy would negotiate
+/// h2 with the upstream, then try to send h1 Upgrade bytes on an h2 connection,
+/// causing "invalid HTTP version parsed".
+#[tokio::test]
+async fn test_websocket_with_h2_preferring_upstream() {
+    let t = test_report!("WebSocket works with h2-preferring upstream (strict ALPN)");
+
+    let ca = TestCa::generate();
+    let (upstream_addr, upstream_shutdown) =
+        start_strict_alpn_upstream(&ca, ws_echo_handler()).await;
+
+    t.setup(format!(
+        "Strict-ALPN upstream on port {}",
+        upstream_addr.port()
+    ));
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![ws_rule("wss://localhost/*")],
+        upstream_addr.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let ws = ws_connect_reported(&t, proxy.addr(), &ca, "/echo").await;
+    let mut ws = ReportingWebSocket::new(ws, &t);
+
+    ws.send(Message::Text("h2 alpn test".into())).await;
+
+    let msg = ws.next().await;
+    t.assert_eq("Echo response", &msg, &Message::Text("h2 alpn test".into()));
+
+    ws.close().await;
+    proxy.shutdown();
+    let _ = upstream_shutdown.send(());
 }

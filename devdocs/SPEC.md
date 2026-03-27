@@ -137,7 +137,7 @@ Lock endpoints are plain pass-through rules (no body inspection needed):
 ### Protocol Support
 - HTTP/1.1
 - HTTP/2
-- WebSocket (upgrade detection + bidirectional frame forwarding)
+- WebSocket (upgrade detection + bidirectional frame forwarding; upstream connections use HTTP/1.1 ALPN only, since the Upgrade mechanism is not available in HTTP/2)
 
 ### Certificate Management
 - User-provided or auto-generated CA certificate/key
