@@ -4,7 +4,7 @@ exclude = ["tools/test-report"]
 
 [package]
 name = "pyloros"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "A filtering HTTPS proxy for agent network access control"
 license = "MIT"

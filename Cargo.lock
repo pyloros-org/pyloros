@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "pyloros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -1261,6 +1261,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "lru",
  "notify",
  "predicates",
@@ -1283,6 +1284,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wait-timeout",
  "webpki-roots 1.0.6",
  "wiremock",
 ]
