@@ -651,6 +651,33 @@ async fn forward_request_boxed(
     }
 }
 
+/// Build a TLS client config that only advertises HTTP/1.1 via ALPN.
+///
+/// WebSocket uses the HTTP/1.1 Upgrade mechanism, which is not available in HTTP/2.
+/// If the upstream negotiates h2, the HTTP/1.1 parser will fail with "invalid HTTP
+/// version parsed". This function ensures the upstream connection stays on h1.
+fn h1_only_tls_config(base: Option<&ClientConfig>) -> Arc<ClientConfig> {
+    let mut config = match base {
+        Some(c) => c.clone(),
+        None => {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let native = rustls_native_certs::load_native_certs();
+            for error in &native.errors {
+                tracing::warn!(error = %error, "Error loading native root certificates");
+            }
+            for cert in native.certs {
+                let _ = root_store.add(cert);
+            }
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        }
+    };
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
 /// Forward a WebSocket upgrade request, then bidirectionally copy frames.
 ///
 /// WebSocket always uses HTTP/1.1 (upgrade mechanism), so this bypasses
@@ -662,8 +689,8 @@ async fn forward_websocket(
     sni_host: String,
     upstream_tls_config: Option<Arc<ClientConfig>>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
-    let tls_stream =
-        connect_upstream_tls(&connect_host, port, &sni_host, upstream_tls_config).await?;
+    let h1_config = h1_only_tls_config(upstream_tls_config.as_deref());
+    let tls_stream = connect_upstream_tls(&connect_host, port, &sni_host, Some(h1_config)).await?;
     let io = TokioIo::new(tls_stream);
 
     let method = req.method().clone();
