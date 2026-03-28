@@ -503,7 +503,8 @@ impl ProxyServer {
             self.config.logging.log_allowed_requests,
             self.config.logging.log_blocked_requests,
         )
-        .with_permissive(self.config.proxy.permissive);
+        .with_permissive(self.config.proxy.permissive)
+        .with_max_body_log_size(self.config.logging.max_body_log_size);
         if let Some(port) = self.upstream_port_override {
             handler = handler.with_upstream_port_override(port);
         }
