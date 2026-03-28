@@ -466,6 +466,7 @@ impl ProxyServer {
         let log_blocked = self.config.logging.log_blocked_requests;
         let audit_logger = self.audit_logger.clone();
         let permissive = self.config.proxy.permissive;
+        let max_body_log_size = self.config.logging.max_body_log_size;
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -475,7 +476,8 @@ impl ProxyServer {
                     .with_request_logging(log_allowed, log_blocked)
                     .with_auth(auth.clone())
                     .with_audit_logger(audit_logger.clone())
-                    .with_permissive(permissive);
+                    .with_permissive(permissive)
+                    .with_max_body_log_size(max_body_log_size);
                 async move { handler.handle(req).await }
             });
 

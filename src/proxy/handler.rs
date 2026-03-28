@@ -1,7 +1,7 @@
 //! HTTP request handler for the proxy
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -22,6 +22,7 @@ pub struct ProxyHandler {
     filter_engine: Arc<FilterEngine>,
     auth: Option<(String, String)>,
     logger: RequestLogger,
+    max_body_log_size: usize,
 }
 
 impl ProxyHandler {
@@ -31,6 +32,7 @@ impl ProxyHandler {
             filter_engine,
             auth: None,
             logger: RequestLogger::new(),
+            max_body_log_size: 1_048_576,
         }
     }
 
@@ -51,6 +53,11 @@ impl ProxyHandler {
 
     pub fn with_permissive(mut self, permissive: bool) -> Self {
         self.logger = self.logger.with_permissive(permissive);
+        self
+    }
+
+    pub fn with_max_body_log_size(mut self, size: usize) -> Self {
+        self.max_body_log_size = size;
         self
     }
 
@@ -210,13 +217,14 @@ impl ProxyHandler {
         let uri = req.uri();
         let method = req.method().to_string();
 
-        let scheme = uri.scheme_str().unwrap_or("http");
+        let scheme = uri.scheme_str().unwrap_or("http").to_string();
         let host = uri.host().unwrap_or("unknown").to_string();
         let port = uri.port_u16();
-        let path = uri.path();
-        let query = uri.query();
+        let path = uri.path().to_string();
+        let query = uri.query().map(|q| q.to_string());
 
-        let request_info = RequestInfo::http(&method, scheme, &host, port, path, query);
+        let request_info =
+            RequestInfo::http(&method, &scheme, &host, port, &path, query.as_deref());
         let full_url = request_info.full_url();
 
         // Check filter
@@ -224,7 +232,7 @@ impl ProxyHandler {
             method: &method,
             url: &full_url,
             host: &host,
-            scheme,
+            scheme: &scheme,
             protocol: "http",
             credential: None,
             label: " (HTTP)",
@@ -268,7 +276,64 @@ impl ProxyHandler {
                 });
                 return Ok(blocked_response(&method, &full_url));
             }
-            FilterResult::Allowed { .. } => {
+            FilterResult::Allowed { log_body } => {
+                if log_body {
+                    // Body logging: buffer request, forward, capture response
+                    let upstream_port = port.unwrap_or(80);
+                    let (parts, body) = req.into_parts();
+                    let req_body_bytes = body
+                        .collect()
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    let full_body = Full::new(req_body_bytes.clone())
+                        .map_err(|e| match e {})
+                        .boxed();
+                    let rebuilt_req = Request::from_parts(parts, full_body);
+                    let result =
+                        forward_http_request_boxed(&host, upstream_port, rebuilt_req).await;
+                    match result {
+                        Ok(resp) => {
+                            let (resp_parts, resp_body) = resp.into_parts();
+                            let resp_body_bytes = resp_body
+                                .collect()
+                                .await
+                                .map(|c| c.to_bytes())
+                                .unwrap_or_default();
+                            let max = self.max_body_log_size;
+                            let (req_str, req_enc, req_trunc) =
+                                crate::audit::encode_body(&req_body_bytes, max);
+                            let (resp_str, resp_enc, resp_trunc) =
+                                crate::audit::encode_body(&resp_body_bytes, max);
+                            let truncated = req_trunc || resp_trunc;
+                            self.logger.emit_audit(AuditEntry {
+                                timestamp: crate::audit::now_iso8601(),
+                                event: AuditEvent::RequestAllowed,
+                                method: method.clone(),
+                                url: full_url.clone(),
+                                host: host.clone(),
+                                scheme: scheme.to_string(),
+                                protocol: "http".to_string(),
+                                decision: crate::audit::AuditDecision::Allowed,
+                                reason: AuditReason::RuleMatched,
+                                credential: None,
+                                git: None,
+                                request_body: Some(req_str),
+                                request_body_encoding: req_enc,
+                                response_body: Some(resp_str),
+                                response_body_encoding: resp_enc,
+                                body_truncated: if truncated { Some(true) } else { None },
+                            });
+                            let new_body =
+                                Full::new(resp_body_bytes).map_err(|e| match e {}).boxed();
+                            return Ok(Response::from_parts(resp_parts, new_body));
+                        }
+                        Err(e) => {
+                            tracing::error!(host = %host, port = %upstream_port, error = %e, "HTTP forwarding error");
+                            return Ok(error_response(&e.to_string()));
+                        }
+                    }
+                }
                 self.logger.log_allowed(&ctx);
             }
         }
@@ -340,5 +405,49 @@ async fn forward_http_request(
     let resp = sender.send_request(upstream_req).await?;
 
     // Map the response body to BoxBody
+    Ok(resp.map(|b| b.boxed()))
+}
+
+/// Forward a plain HTTP request with a pre-buffered (BoxBody) body.
+async fn forward_http_request_boxed(
+    host: &str,
+    port: u16,
+    req: Request<BoxBody<Bytes, hyper::Error>>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    let addr = format!("{}:{}", host, port);
+    let tcp = TcpStream::connect(&addr).await?;
+    let io = TokioIo::new(tcp);
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            let err_str = e.to_string();
+            if !err_str.contains("connection closed") && !err_str.contains("early eof") {
+                tracing::error!(error = %e, "HTTP upstream connection error");
+            }
+        }
+    });
+
+    let (mut parts, body) = req.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let new_uri: hyper::Uri = path_and_query.parse()?;
+    super::strip_hop_by_hop_headers(&mut parts.headers);
+    let mut builder = Request::builder().method(parts.method).uri(new_uri);
+    for (name, value) in &parts.headers {
+        builder = builder.header(name, value);
+    }
+    if !parts.headers.contains_key(hyper::header::HOST) {
+        if port == 80 {
+            builder = builder.header(hyper::header::HOST, host);
+        } else {
+            builder = builder.header(hyper::header::HOST, format!("{}:{}", host, port));
+        }
+    }
+    let upstream_req = builder.body(body)?;
+    let resp = sender.send_request(upstream_req).await?;
     Ok(resp.map(|b| b.boxed()))
 }
