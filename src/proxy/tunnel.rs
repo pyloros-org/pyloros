@@ -207,7 +207,7 @@ impl TunnelHandler {
                     return Ok(resp);
                 }
             }
-            FilterResult::AllowedWithBranchCheck(ref filter) => {
+            FilterResult::AllowedWithBranchCheck { ref filter, .. } => {
                 if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
@@ -253,6 +253,11 @@ impl TunnelHandler {
                         git: Some(AuditGitInfo {
                             blocked_refs: blocked.clone(),
                         }),
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
                 }
@@ -275,7 +280,9 @@ impl TunnelHandler {
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
                     .await;
             }
-            FilterResult::AllowedWithLfsCheck(ref allowed_ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                ref allowed_ops, ..
+            } => {
                 if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
@@ -316,6 +323,11 @@ impl TunnelHandler {
                         reason: AuditReason::LfsOperationNotAllowed,
                         credential: None,
                         git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(blocked_response(&method, &full_url));
                 }
@@ -331,7 +343,7 @@ impl TunnelHandler {
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
                     .await;
             }
-            FilterResult::Allowed => {
+            FilterResult::Allowed { .. } => {
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx

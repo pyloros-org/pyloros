@@ -99,6 +99,8 @@ pub struct CompiledRule {
     branch_filter: Option<BranchFilter>,
     /// Allowed LFS operations (if Some, body inspection required for LFS batch endpoint)
     lfs_operations: Option<Vec<String>>,
+    /// Whether to log request/response bodies in the audit log
+    log_body: bool,
 }
 
 impl CompiledRule {
@@ -122,6 +124,7 @@ impl CompiledRule {
             websocket: rule.websocket,
             branch_filter: None,
             lfs_operations: None,
+            log_body: rule.log_body,
         })
     }
 
@@ -138,6 +141,8 @@ impl CompiledRule {
         let needs_fetch = git_op == "fetch" || git_op == "*";
         let needs_push = git_op == "push" || git_op == "*";
 
+        let log_body = rule.log_body;
+
         if needs_fetch {
             // GET <repo>/info/refs?service=git-upload-pack
             rules.push(Self::compile_git_endpoint(
@@ -146,6 +151,7 @@ impl CompiledRule {
                 Some("service=git-upload-pack"),
                 "GET",
                 None,
+                log_body,
             )?);
             // POST <repo>/git-upload-pack
             rules.push(Self::compile_git_endpoint(
@@ -154,6 +160,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                log_body,
             )?);
         }
 
@@ -165,6 +172,7 @@ impl CompiledRule {
                 Some("service=git-receive-pack"),
                 "GET",
                 None,
+                log_body,
             )?);
             // POST <repo>/git-receive-pack (with optional branch filter)
             let branch_filter = rule
@@ -189,6 +197,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 branch_filter,
+                log_body,
             )?);
         }
 
@@ -201,6 +210,7 @@ impl CompiledRule {
                 None,
                 "GET",
                 None,
+                log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
                 base_url,
@@ -208,6 +218,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
                 base_url,
@@ -215,6 +226,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
                 base_url,
@@ -222,6 +234,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                log_body,
             )?);
         } else if needs_fetch {
             // Fetch needs list + verify (informational, avoids client warning)
@@ -231,6 +244,7 @@ impl CompiledRule {
                 None,
                 "GET",
                 None,
+                log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
                 base_url,
@@ -238,6 +252,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                log_body,
             )?);
         }
 
@@ -250,7 +265,9 @@ impl CompiledRule {
             if needs_push {
                 lfs_ops.push("upload".to_string());
             }
-            rules.push(Self::compile_lfs_batch_endpoint(base_url, lfs_ops)?);
+            rules.push(Self::compile_lfs_batch_endpoint(
+                base_url, lfs_ops, log_body,
+            )?);
         }
 
         Ok(rules)
@@ -263,6 +280,7 @@ impl CompiledRule {
         query: Option<&str>,
         method: &str,
         branch_filter: Option<BranchFilter>,
+        log_body: bool,
     ) -> Result<Self> {
         // Build the full URL by appending the suffix to the base URL's path
         let full_url = match query {
@@ -279,11 +297,16 @@ impl CompiledRule {
             websocket: false,
             branch_filter,
             lfs_operations: None,
+            log_body,
         })
     }
 
     /// Compile the LFS batch endpoint rule for a git rule.
-    fn compile_lfs_batch_endpoint(base_url: &str, lfs_operations: Vec<String>) -> Result<Self> {
+    fn compile_lfs_batch_endpoint(
+        base_url: &str,
+        lfs_operations: Vec<String>,
+        log_body: bool,
+    ) -> Result<Self> {
         let full_url = format!("{}/info/lfs/objects/batch", base_url);
         let method_matcher = Some(PatternMatcher::new("POST")?);
         let url = UrlPattern::new(&full_url)?;
@@ -294,6 +317,7 @@ impl CompiledRule {
             websocket: false,
             branch_filter: None,
             lfs_operations: Some(lfs_operations),
+            log_body,
         })
     }
 
@@ -328,12 +352,18 @@ pub enum FilterResult {
     /// Request is blocked (no rule matched)
     Blocked,
     /// Request is allowed (a rule matched with no branch restriction)
-    Allowed,
+    Allowed { log_body: bool },
     /// Request is allowed but requires branch-level body inspection
-    AllowedWithBranchCheck(BranchFilter),
+    AllowedWithBranchCheck {
+        filter: BranchFilter,
+        log_body: bool,
+    },
     /// Request is allowed but requires LFS operation body inspection.
     /// Carries the merged list of allowed operations (e.g., ["download", "upload"]).
-    AllowedWithLfsCheck(Vec<String>),
+    AllowedWithLfsCheck {
+        allowed_ops: Vec<String>,
+        log_body: bool,
+    },
 }
 
 /// The filter engine that evaluates requests against rules
@@ -369,11 +399,15 @@ impl FilterEngine {
     /// don't block each other. For all other rule types, first-match wins.
     pub fn check(&self, request: &RequestInfo) -> FilterResult {
         let mut accumulated_lfs_ops: Vec<String> = Vec::new();
+        let mut lfs_log_body = false;
 
         for rule in &self.rules {
             if rule.matches(request) {
                 if let Some(ref filter) = rule.branch_filter {
-                    return FilterResult::AllowedWithBranchCheck(filter.clone());
+                    return FilterResult::AllowedWithBranchCheck {
+                        filter: filter.clone(),
+                        log_body: rule.log_body,
+                    };
                 }
                 if let Some(ref ops) = rule.lfs_operations {
                     // Accumulate LFS operations across matching rules (merged-scan)
@@ -382,14 +416,20 @@ impl FilterEngine {
                             accumulated_lfs_ops.push(op.clone());
                         }
                     }
+                    lfs_log_body = lfs_log_body || rule.log_body;
                     continue;
                 }
-                return FilterResult::Allowed;
+                return FilterResult::Allowed {
+                    log_body: rule.log_body,
+                };
             }
         }
 
         if !accumulated_lfs_ops.is_empty() {
-            return FilterResult::AllowedWithLfsCheck(accumulated_lfs_ops);
+            return FilterResult::AllowedWithLfsCheck {
+                allowed_ops: accumulated_lfs_ops,
+                log_body: lfs_log_body,
+            };
         }
 
         FilterResult::Blocked
@@ -428,6 +468,7 @@ mod tests {
             websocket: false,
             git: None,
             branches: None,
+            log_body: false,
         }
     }
 
@@ -438,6 +479,7 @@ mod tests {
             websocket: true,
             git: None,
             branches: None,
+            log_body: false,
         }
     }
 
@@ -699,6 +741,7 @@ mod tests {
             websocket: false,
             git: Some("push".to_string()),
             branches: Some(vec!["feature/*".to_string()]),
+            log_body: false,
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
 
@@ -714,7 +757,7 @@ mod tests {
         let result = engine.check(&req);
         t.assert_true(
             "returns AllowedWithBranchCheck (not Allowed or Blocked)",
-            matches!(result, FilterResult::AllowedWithBranchCheck(_)),
+            matches!(result, FilterResult::AllowedWithBranchCheck { .. }),
         );
 
         // GET discovery endpoint has no branch restriction → Allowed
@@ -729,7 +772,7 @@ mod tests {
         let result = engine.check(&discovery);
         t.assert_true(
             "discovery endpoint returns Allowed (no branch check)",
-            matches!(result, FilterResult::Allowed),
+            matches!(result, FilterResult::Allowed { .. }),
         );
     }
 
@@ -772,6 +815,7 @@ mod tests {
             websocket: false,
             git: Some(git_op.to_string()),
             branches: None,
+            log_body: false,
         }
     }
 
@@ -794,7 +838,9 @@ mod tests {
         );
         let result = engine.check(&lfs_req);
         match result {
-            FilterResult::AllowedWithLfsCheck(ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                allowed_ops: ops, ..
+            } => {
                 t.assert_eq("allowed ops", &ops, &vec!["download".to_string()]);
             }
             other => panic!("expected AllowedWithLfsCheck, got {:?}", other),
@@ -820,7 +866,9 @@ mod tests {
         );
         let result = engine.check(&lfs_req);
         match result {
-            FilterResult::AllowedWithLfsCheck(ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                allowed_ops: ops, ..
+            } => {
                 t.assert_eq("allowed ops", &ops, &vec!["upload".to_string()]);
             }
             other => panic!("expected AllowedWithLfsCheck, got {:?}", other),
@@ -846,7 +894,9 @@ mod tests {
         );
         let result = engine.check(&lfs_req);
         match result {
-            FilterResult::AllowedWithLfsCheck(ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                allowed_ops: ops, ..
+            } => {
                 t.assert_eq(
                     "allowed ops",
                     &ops,
@@ -876,7 +926,9 @@ mod tests {
         );
         let result = engine.check(&lfs_req);
         match result {
-            FilterResult::AllowedWithLfsCheck(ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                allowed_ops: ops, ..
+            } => {
                 t.assert_true(
                     "download in merged ops",
                     ops.contains(&"download".to_string()),
@@ -916,6 +968,7 @@ mod tests {
             websocket: false,
             git: Some("push".to_string()),
             branches: Some(vec!["feature/*".to_string()]),
+            log_body: false,
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
 
@@ -929,7 +982,9 @@ mod tests {
         );
         let result = engine.check(&lfs_req);
         match result {
-            FilterResult::AllowedWithLfsCheck(ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                allowed_ops: ops, ..
+            } => {
                 t.assert_eq("allowed ops", &ops, &vec!["upload".to_string()]);
             }
             other => panic!("expected AllowedWithLfsCheck, got {:?}", other),
@@ -952,7 +1007,7 @@ mod tests {
         );
         t.assert_true(
             "GET /info/lfs/locks allowed",
-            matches!(engine.check(&list), FilterResult::Allowed),
+            matches!(engine.check(&list), FilterResult::Allowed { .. }),
         );
 
         let verify = RequestInfo::http(
@@ -965,7 +1020,7 @@ mod tests {
         );
         t.assert_true(
             "POST /info/lfs/locks/verify allowed",
-            matches!(engine.check(&verify), FilterResult::Allowed),
+            matches!(engine.check(&verify), FilterResult::Allowed { .. }),
         );
     }
 
@@ -1018,7 +1073,7 @@ mod tests {
         );
         t.assert_true(
             "GET /info/lfs/locks allowed",
-            matches!(engine.check(&list), FilterResult::Allowed),
+            matches!(engine.check(&list), FilterResult::Allowed { .. }),
         );
 
         let create = RequestInfo::http(
@@ -1031,7 +1086,7 @@ mod tests {
         );
         t.assert_true(
             "POST /info/lfs/locks allowed (create)",
-            matches!(engine.check(&create), FilterResult::Allowed),
+            matches!(engine.check(&create), FilterResult::Allowed { .. }),
         );
 
         let verify = RequestInfo::http(
@@ -1044,7 +1099,7 @@ mod tests {
         );
         t.assert_true(
             "POST /info/lfs/locks/verify allowed",
-            matches!(engine.check(&verify), FilterResult::Allowed),
+            matches!(engine.check(&verify), FilterResult::Allowed { .. }),
         );
 
         let unlock = RequestInfo::http(
@@ -1057,7 +1112,7 @@ mod tests {
         );
         t.assert_true(
             "POST /info/lfs/locks/42/unlock allowed",
-            matches!(engine.check(&unlock), FilterResult::Allowed),
+            matches!(engine.check(&unlock), FilterResult::Allowed { .. }),
         );
     }
 
@@ -1077,7 +1132,7 @@ mod tests {
         );
         t.assert_true(
             "GET /info/lfs/locks allowed",
-            matches!(engine.check(&list), FilterResult::Allowed),
+            matches!(engine.check(&list), FilterResult::Allowed { .. }),
         );
 
         let create = RequestInfo::http(
@@ -1090,7 +1145,7 @@ mod tests {
         );
         t.assert_true(
             "POST /info/lfs/locks allowed (create)",
-            matches!(engine.check(&create), FilterResult::Allowed),
+            matches!(engine.check(&create), FilterResult::Allowed { .. }),
         );
 
         let verify = RequestInfo::http(
@@ -1103,7 +1158,7 @@ mod tests {
         );
         t.assert_true(
             "POST /info/lfs/locks/verify allowed",
-            matches!(engine.check(&verify), FilterResult::Allowed),
+            matches!(engine.check(&verify), FilterResult::Allowed { .. }),
         );
 
         let unlock = RequestInfo::http(
@@ -1116,7 +1171,7 @@ mod tests {
         );
         t.assert_true(
             "POST /info/lfs/locks/999/unlock allowed",
-            matches!(engine.check(&unlock), FilterResult::Allowed),
+            matches!(engine.check(&unlock), FilterResult::Allowed { .. }),
         );
     }
 
@@ -1138,7 +1193,7 @@ mod tests {
         let result = engine.check(&list);
         t.assert_true(
             "lock list returns Allowed (not AllowedWithLfsCheck)",
-            matches!(result, FilterResult::Allowed),
+            matches!(result, FilterResult::Allowed { .. }),
         );
 
         let verify = RequestInfo::http(
@@ -1152,7 +1207,7 @@ mod tests {
         let result = engine.check(&verify);
         t.assert_true(
             "lock verify returns Allowed (not AllowedWithLfsCheck)",
-            matches!(result, FilterResult::Allowed),
+            matches!(result, FilterResult::Allowed { .. }),
         );
     }
 }

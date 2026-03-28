@@ -745,6 +745,7 @@ pub fn rule(method: &str, url: &str) -> pyloros::config::Rule {
         websocket: false,
         git: None,
         branches: None,
+        log_body: false,
     }
 }
 
@@ -755,6 +756,7 @@ pub fn ws_rule(url: &str) -> pyloros::config::Rule {
         websocket: true,
         git: None,
         branches: None,
+        log_body: false,
     }
 }
 
@@ -765,6 +767,7 @@ pub fn git_rule(git_op: &str, url: &str) -> pyloros::config::Rule {
         websocket: false,
         git: Some(git_op.to_string()),
         branches: None,
+        log_body: false,
     }
 }
 
@@ -775,6 +778,7 @@ pub fn git_rule_with_branches(git_op: &str, url: &str, branches: &[&str]) -> pyl
         websocket: false,
         git: Some(git_op.to_string()),
         branches: Some(branches.iter().map(|b| b.to_string()).collect()),
+        log_body: false,
     }
 }
 
