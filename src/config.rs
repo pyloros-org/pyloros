@@ -25,6 +25,30 @@ pub struct Config {
     pub credentials: Vec<Credential>,
 }
 
+/// Local credential configuration for header-type credentials.
+#[derive(Debug, Clone, Serialize)]
+pub enum LocalHeaderConfig {
+    /// Local value from env var (resolved at startup)
+    Value(String),
+    /// Proxy generates a random value at startup
+    Generated { env_name: Option<String> },
+}
+
+/// Local credential configuration for AWS SigV4 credentials.
+#[derive(Debug, Clone, Serialize)]
+pub enum LocalSigV4Config {
+    /// Local credentials from env vars (resolved at startup)
+    Explicit {
+        access_key_id: String,
+        secret_access_key: String,
+    },
+    /// Proxy generates fake AWS credentials at startup
+    Generated {
+        access_key_id_env_name: Option<String>,
+        secret_access_key_env_name: Option<String>,
+    },
+}
+
 /// A credential to inject into matching outgoing requests.
 ///
 /// Two variants:
@@ -36,12 +60,14 @@ pub enum Credential {
         url: String,
         header: String,
         value: String,
+        local: LocalHeaderConfig,
     },
     AwsSigV4 {
         url: String,
         access_key_id: String,
         secret_access_key: String,
         session_token: Option<String>,
+        local: LocalSigV4Config,
     },
 }
 
@@ -69,6 +95,14 @@ struct CredentialRaw {
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
     session_token: Option<String>,
+    // local credential fields
+    local_value: Option<String>,
+    local_generated: Option<bool>,
+    local_env_name: Option<String>,
+    local_access_key_id: Option<String>,
+    local_secret_access_key: Option<String>,
+    local_access_key_id_env_name: Option<String>,
+    local_secret_access_key_env_name: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Credential {
@@ -86,10 +120,30 @@ impl<'de> Deserialize<'de> for Credential {
                 let value = raw.value.ok_or_else(|| {
                     serde::de::Error::custom("header credential requires `value` field")
                 })?;
+
+                // Parse local credential config
+                let local = match (raw.local_value, raw.local_generated) {
+                    (Some(_), Some(true)) => {
+                        return Err(serde::de::Error::custom(
+                            "local_value and local_generated are mutually exclusive",
+                        ));
+                    }
+                    (Some(v), _) => LocalHeaderConfig::Value(v),
+                    (None, Some(true)) => LocalHeaderConfig::Generated {
+                        env_name: raw.local_env_name,
+                    },
+                    (None, _) => {
+                        return Err(serde::de::Error::custom(
+                            "header credential requires local_value or local_generated",
+                        ));
+                    }
+                };
+
                 Ok(Credential::Header {
                     url: raw.url,
                     header,
                     value,
+                    local,
                 })
             }
             "aws-sigv4" => {
@@ -101,11 +155,49 @@ impl<'de> Deserialize<'de> for Credential {
                         "aws-sigv4 credential requires `secret_access_key` field",
                     )
                 })?;
+
+                // Parse local credential config
+                let has_local_explicit =
+                    raw.local_access_key_id.is_some() || raw.local_secret_access_key.is_some();
+                let local = match (has_local_explicit, raw.local_generated) {
+                    (true, Some(true)) => {
+                        return Err(serde::de::Error::custom(
+                            "local_access_key_id/local_secret_access_key and local_generated are mutually exclusive",
+                        ));
+                    }
+                    (true, _) => {
+                        let local_akid = raw.local_access_key_id.ok_or_else(|| {
+                            serde::de::Error::custom(
+                                "both local_access_key_id and local_secret_access_key must be set",
+                            )
+                        })?;
+                        let local_sak = raw.local_secret_access_key.ok_or_else(|| {
+                            serde::de::Error::custom(
+                                "both local_access_key_id and local_secret_access_key must be set",
+                            )
+                        })?;
+                        LocalSigV4Config::Explicit {
+                            access_key_id: local_akid,
+                            secret_access_key: local_sak,
+                        }
+                    }
+                    (false, Some(true)) => LocalSigV4Config::Generated {
+                        access_key_id_env_name: raw.local_access_key_id_env_name,
+                        secret_access_key_env_name: raw.local_secret_access_key_env_name,
+                    },
+                    (false, _) => {
+                        return Err(serde::de::Error::custom(
+                            "aws-sigv4 credential requires local credentials (local_access_key_id + local_secret_access_key, or local_generated = true)",
+                        ));
+                    }
+                };
+
                 Ok(Credential::AwsSigV4 {
                     url: raw.url,
                     access_key_id,
                     secret_access_key,
                     session_token: raw.session_token,
+                    local,
                 })
             }
             other => Err(serde::de::Error::custom(format!(
@@ -155,6 +247,10 @@ pub struct ProxyConfig {
     /// as "request_permitted" for traffic discovery. Default: false.
     #[serde(default)]
     pub permissive: bool,
+
+    /// Path to write generated local credentials as KEY=value env file
+    #[serde(default)]
+    pub generated_secrets_file: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -169,6 +265,7 @@ impl Default for ProxyConfig {
             upstream_tls_ca: None,
             direct_https_bind: None,
             permissive: false,
+            generated_secrets_file: None,
         }
     }
 }
@@ -311,6 +408,25 @@ impl Config {
         // Validate auth config
         config.validate_auth()?;
 
+        // Validate that generated local credentials have a secrets file path
+        let has_generated = config.credentials.iter().any(|c| {
+            matches!(
+                c,
+                Credential::Header {
+                    local: LocalHeaderConfig::Generated { .. },
+                    ..
+                } | Credential::AwsSigV4 {
+                    local: LocalSigV4Config::Generated { .. },
+                    ..
+                }
+            )
+        });
+        if has_generated && config.proxy.generated_secrets_file.is_none() {
+            return Err(Error::config(
+                "generated local credentials require `generated_secrets_file` in [proxy] section",
+            ));
+        }
+
         Ok(config)
     }
 
@@ -442,6 +558,7 @@ impl Config {
                 upstream_tls_ca: None,
                 direct_https_bind: None,
                 permissive: false,
+                generated_secrets_file: None,
             },
             logging: LoggingConfig::default(),
             rules: Vec::new(),
@@ -503,6 +620,19 @@ fn extract_host_from_url(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
+/// Extract the env var name from a simple `${VAR}` placeholder.
+/// Returns None if the string is not a simple `${VAR}` pattern.
+pub fn extract_env_var_name(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
+        let inner = &trimmed[2..trimmed.len() - 1];
+        if !inner.contains('$') && !inner.contains('{') && !inner.contains('}') {
+            return Some(inner);
+        }
+    }
+    None
+}
+
 /// Resolve `${ENV_VAR}` placeholders in a credential value string.
 ///
 /// Replaces all `${...}` patterns with the corresponding environment variable value.
@@ -533,6 +663,39 @@ pub fn resolve_credential_value(value: &str) -> Result<String> {
     result.push_str(rest);
 
     Ok(result)
+}
+
+/// Generate a random 32-byte hex string for local header credential values.
+pub fn generate_random_header_value() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes).expect("system RNG failed");
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Generate a fake AWS access key ID (AKIA + 16 alphanumeric chars).
+pub fn generate_fake_access_key_id() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 16];
+    rng.fill(&mut bytes).expect("system RNG failed");
+    let chars: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let suffix: String = bytes
+        .iter()
+        .map(|b| chars[(*b as usize) % chars.len()] as char)
+        .collect();
+    format!("AKIA{}", suffix)
+}
+
+/// Generate a fake AWS secret access key (40 chars, base64).
+pub fn generate_fake_secret_access_key() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 30];
+    rng.fill(&mut bytes).expect("system RNG failed");
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 #[cfg(test)]
@@ -925,6 +1088,7 @@ branches = ["!main"]
 url = "https://api.example.com/*"
 header = "x-api-key"
 value = "my-secret-key"
+local_value = "local-secret-key"
 "#;
         let config = Config::parse(toml).unwrap();
         t.assert_eq("credential count", &config.credentials.len(), &1usize);
@@ -944,12 +1108,13 @@ value = "my-secret-key"
 
     #[test]
     fn test_parse_credentials_backward_compat() {
-        let t = test_report!("Header credential without type field (backward compat)");
+        let t = test_report!("Header credential with local_value");
         let toml = r#"
 [[credentials]]
 url = "https://api.example.com/*"
 header = "x-api-key"
 value = "my-secret-key"
+local_value = "local-key"
 "#;
         let config = Config::parse(toml).unwrap();
         t.assert_true(
@@ -967,6 +1132,7 @@ type = "header"
 url = "https://api.example.com/*"
 header = "x-api-key"
 value = "my-secret-key"
+local_value = "local-key"
 "#;
         let config = Config::parse(toml).unwrap();
         t.assert_true(
@@ -985,6 +1151,8 @@ url = "https://*.amazonaws.com/*"
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 session_token = "FwoGZXIvYXdzEBYaD..."
+local_access_key_id = "AKIALOCAL"
+local_secret_access_key = "LOCALSECRET"
 "#;
         let config = Config::parse(toml).unwrap();
         t.assert_eq("credential count", &config.credentials.len(), &1usize);
@@ -994,6 +1162,7 @@ session_token = "FwoGZXIvYXdzEBYaD..."
                 access_key_id,
                 secret_access_key,
                 session_token,
+                ..
             } => {
                 t.assert_eq("url", &url.as_str(), &"https://*.amazonaws.com/*");
                 t.assert_eq("key", &access_key_id.as_str(), &"AKIAIOSFODNN7EXAMPLE");
@@ -1021,6 +1190,8 @@ type = "aws-sigv4"
 url = "https://*.amazonaws.com/*"
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+local_access_key_id = "AKIALOCAL"
+local_secret_access_key = "LOCALSECRET"
 "#;
         let config = Config::parse(toml).unwrap();
         match &config.credentials[0] {
@@ -1039,12 +1210,15 @@ secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 url = "https://api.example.com/*"
 header = "x-api-key"
 value = "my-secret"
+local_value = "local-secret"
 
 [[credentials]]
 type = "aws-sigv4"
 url = "https://*.amazonaws.com/*"
 access_key_id = "AKID"
 secret_access_key = "SECRET"
+local_access_key_id = "LOCALAKID"
+local_secret_access_key = "LOCALSECRET"
 "#;
         let config = Config::parse(toml).unwrap();
         t.assert_eq("credential count", &config.credentials.len(), &2usize);
@@ -1069,7 +1243,7 @@ secret_access_key = "SECRET"
     fn test_credential_reject_empty_header() {
         assert_config_rejects(
             "Reject credential with empty header name",
-            "[[credentials]]\nurl = \"https://api.example.com/*\"\nheader = \"\"\nvalue = \"secret\"",
+            "[[credentials]]\nurl = \"https://api.example.com/*\"\nheader = \"\"\nvalue = \"secret\"\nlocal_value = \"local\"",
             Some("header"),
         );
     }
@@ -1078,7 +1252,7 @@ secret_access_key = "SECRET"
     fn test_credential_reject_invalid_url_pattern() {
         assert_config_rejects(
             "Reject credential with invalid URL pattern",
-            "[[credentials]]\nurl = \"not-a-url\"\nheader = \"x-api-key\"\nvalue = \"secret\"",
+            "[[credentials]]\nurl = \"not-a-url\"\nheader = \"x-api-key\"\nvalue = \"secret\"\nlocal_value = \"local\"",
             Some("URL pattern"),
         );
     }
@@ -1096,7 +1270,7 @@ secret_access_key = "SECRET"
     fn test_credential_reject_aws_empty_access_key() {
         assert_config_rejects(
             "Reject aws-sigv4 credential with empty access_key_id",
-            "[[credentials]]\ntype = \"aws-sigv4\"\nurl = \"https://*.amazonaws.com/*\"\naccess_key_id = \"\"\nsecret_access_key = \"SECRET\"",
+            "[[credentials]]\ntype = \"aws-sigv4\"\nurl = \"https://*.amazonaws.com/*\"\naccess_key_id = \"\"\nsecret_access_key = \"SECRET\"\nlocal_access_key_id = \"LAKID\"\nlocal_secret_access_key = \"LSECRET\"",
             Some("access_key_id"),
         );
     }
@@ -1105,7 +1279,7 @@ secret_access_key = "SECRET"
     fn test_credential_reject_aws_missing_secret() {
         assert_config_rejects(
             "Reject aws-sigv4 credential missing secret_access_key",
-            "[[credentials]]\ntype = \"aws-sigv4\"\nurl = \"https://*.amazonaws.com/*\"\naccess_key_id = \"AKID\"",
+            "[[credentials]]\ntype = \"aws-sigv4\"\nurl = \"https://*.amazonaws.com/*\"\naccess_key_id = \"AKID\"\nlocal_access_key_id = \"LAKID\"\nlocal_secret_access_key = \"LSECRET\"",
             None,
         );
     }
@@ -1257,5 +1431,193 @@ auth_password = "${TEST_PROXY_AUTH_PW_123}"
         let config = Config::parse("").unwrap();
         let auth = config.resolved_auth().unwrap();
         t.assert_eq("no auth", &auth, &None);
+    }
+
+    // --- Local credential config tests ---
+
+    #[test]
+    fn test_parse_header_credential_with_local_value() {
+        let t = test_report!("Parse header credential with local_value");
+        let toml = r#"
+[[credentials]]
+url = "https://api.example.com/*"
+header = "x-api-key"
+value = "real-secret"
+local_value = "local-secret"
+"#;
+        let config = Config::parse(toml).unwrap();
+        match &config.credentials[0] {
+            Credential::Header { local, .. } => {
+                t.assert_true(
+                    "local is Value",
+                    matches!(local, LocalHeaderConfig::Value(v) if v == "local-secret"),
+                );
+            }
+            other => panic!("expected Header, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_header_credential_with_local_generated() {
+        let t = test_report!("Parse header credential with local_generated = true");
+        let toml = r#"
+[proxy]
+generated_secrets_file = "/tmp/secrets.env"
+
+[[credentials]]
+url = "https://api.example.com/*"
+header = "x-api-key"
+value = "real-secret"
+local_generated = true
+local_env_name = "LOCAL_API_KEY"
+"#;
+        let config = Config::parse(toml).unwrap();
+        match &config.credentials[0] {
+            Credential::Header { local, .. } => {
+                t.assert_true(
+                    "local is Generated",
+                    matches!(local, LocalHeaderConfig::Generated { env_name } if env_name.as_deref() == Some("LOCAL_API_KEY")),
+                );
+            }
+            other => panic!("expected Header, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_sigv4_credential_with_local_explicit() {
+        let t = test_report!("Parse SigV4 with local_access_key_id + local_secret_access_key");
+        let toml = r#"
+[[credentials]]
+type = "aws-sigv4"
+url = "https://*.amazonaws.com/*"
+access_key_id = "AKIAREAL"
+secret_access_key = "REALSECRET"
+local_access_key_id = "AKIALOCAL"
+local_secret_access_key = "LOCALSECRET"
+"#;
+        let config = Config::parse(toml).unwrap();
+        match &config.credentials[0] {
+            Credential::AwsSigV4 { local, .. } => {
+                t.assert_true(
+                    "local is Explicit",
+                    matches!(local, LocalSigV4Config::Explicit { access_key_id, secret_access_key }
+                        if access_key_id == "AKIALOCAL" && secret_access_key == "LOCALSECRET"),
+                );
+            }
+            other => panic!("expected AwsSigV4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_sigv4_credential_with_local_generated() {
+        let t = test_report!("Parse SigV4 with local_generated = true + generated_secrets_file");
+        let toml = r#"
+[proxy]
+generated_secrets_file = "/tmp/secrets.env"
+
+[[credentials]]
+type = "aws-sigv4"
+url = "https://*.amazonaws.com/*"
+access_key_id = "AKIAREAL"
+secret_access_key = "REALSECRET"
+local_generated = true
+"#;
+        let config = Config::parse(toml).unwrap();
+        match &config.credentials[0] {
+            Credential::AwsSigV4 { local, .. } => {
+                t.assert_true(
+                    "local is Generated",
+                    matches!(local, LocalSigV4Config::Generated { .. }),
+                );
+            }
+            other => panic!("expected AwsSigV4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reject_local_value_and_local_generated_together() {
+        assert_config_rejects(
+            "Reject local_value and local_generated together",
+            "[[credentials]]\nurl = \"https://api.example.com/*\"\nheader = \"x-api-key\"\nvalue = \"secret\"\nlocal_value = \"local\"\nlocal_generated = true",
+            Some("mutually exclusive"),
+        );
+    }
+
+    #[test]
+    fn test_reject_credential_without_local_config() {
+        assert_config_rejects(
+            "Reject header credential without any local config",
+            "[[credentials]]\nurl = \"https://api.example.com/*\"\nheader = \"x-api-key\"\nvalue = \"secret\"",
+            Some("local_value or local_generated"),
+        );
+    }
+
+    #[test]
+    fn test_reject_sigv4_without_local_config() {
+        assert_config_rejects(
+            "Reject aws-sigv4 credential without local config",
+            "[[credentials]]\ntype = \"aws-sigv4\"\nurl = \"https://*.amazonaws.com/*\"\naccess_key_id = \"AKID\"\nsecret_access_key = \"SECRET\"",
+            Some("local credentials"),
+        );
+    }
+
+    #[test]
+    fn test_reject_local_generated_without_secrets_file() {
+        assert_config_rejects(
+            "Reject local_generated without generated_secrets_file",
+            "[[credentials]]\nurl = \"https://api.example.com/*\"\nheader = \"x-api-key\"\nvalue = \"secret\"\nlocal_generated = true",
+            Some("generated_secrets_file"),
+        );
+    }
+
+    #[test]
+    fn test_extract_env_var_name() {
+        let t = test_report!("extract_env_var_name extracts simple ${VAR} patterns");
+        t.assert_eq(
+            "simple var",
+            &extract_env_var_name("${MY_VAR}"),
+            &Some("MY_VAR"),
+        );
+        t.assert_eq(
+            "with spaces",
+            &extract_env_var_name("  ${MY_VAR}  "),
+            &Some("MY_VAR"),
+        );
+        t.assert_eq(
+            "not a var pattern",
+            &extract_env_var_name("Bearer ${TOKEN}"),
+            &None,
+        );
+        t.assert_eq("empty", &extract_env_var_name("${}"), &None);
+        t.assert_eq("nested braces", &extract_env_var_name("${A{B}}"), &None);
+        t.assert_eq("plain string", &extract_env_var_name("just-a-value"), &None);
+    }
+
+    // --- Random generation tests ---
+
+    #[test]
+    fn test_generate_random_header_value() {
+        let t = test_report!("generate_random_header_value returns 64-char hex string");
+        let value = generate_random_header_value();
+        t.assert_eq("length", &value.len(), &64usize);
+        t.assert_true(
+            "all hex chars",
+            value.chars().all(|c| c.is_ascii_hexdigit()),
+        );
+    }
+
+    #[test]
+    fn test_generate_fake_access_key_id() {
+        let t = test_report!("generate_fake_access_key_id starts with AKIA and is 20 chars");
+        let key = generate_fake_access_key_id();
+        t.assert_eq("length", &key.len(), &20usize);
+        t.assert_true("starts with AKIA", key.starts_with("AKIA"));
+    }
+
+    #[test]
+    fn test_generate_fake_secret_access_key() {
+        let t = test_report!("generate_fake_secret_access_key is 40 chars");
+        let key = generate_fake_secret_access_key();
+        t.assert_eq("length", &key.len(), &40usize);
     }
 }
