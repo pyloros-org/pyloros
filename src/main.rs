@@ -354,7 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Validate and display credentials
             println!("  Credentials: {}", cfg.credentials.len());
             if !cfg.credentials.is_empty() {
-                let cred_engine = pyloros::CredentialEngine::new(cfg.credentials)?;
+                let (cred_engine, _) = pyloros::CredentialEngine::new(cfg.credentials)?;
                 println!();
                 println!("Credentials:");
                 for (i, desc) in cred_engine.credential_descriptions().iter().enumerate() {

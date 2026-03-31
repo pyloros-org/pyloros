@@ -257,6 +257,29 @@ impl TunnelHandler {
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
                 }
 
+                // Verify local credentials (body already buffered)
+                if let Err(mismatch) = self.credential_engine.verify_local_with_body(
+                    &request_info,
+                    &parts.headers,
+                    &body_bytes,
+                ) {
+                    tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local credential mismatch");
+                    self.logger.emit_audit(AuditEntry {
+                        timestamp: crate::audit::now_iso8601(),
+                        event: AuditEvent::RequestBlocked,
+                        method: method.clone(),
+                        url: full_url.clone(),
+                        host: host.to_string(),
+                        scheme: "https".to_string(),
+                        protocol: "https".to_string(),
+                        decision: AuditDecision::Blocked,
+                        reason: AuditReason::LocalCredentialMismatch,
+                        credential: None,
+                        git: None,
+                    });
+                    return Ok(blocked_response(&method, &full_url));
+                }
+
                 // Allowed after branch check
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
@@ -320,6 +343,29 @@ impl TunnelHandler {
                     return Ok(blocked_response(&method, &full_url));
                 }
 
+                // Verify local credentials
+                if let Err(mismatch) = self.credential_engine.verify_local_with_body(
+                    &request_info,
+                    &parts.headers,
+                    &body_bytes,
+                ) {
+                    tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local credential mismatch");
+                    self.logger.emit_audit(AuditEntry {
+                        timestamp: crate::audit::now_iso8601(),
+                        event: AuditEvent::RequestBlocked,
+                        method: method.clone(),
+                        url: full_url.clone(),
+                        host: host.to_string(),
+                        scheme: "https".to_string(),
+                        protocol: "https".to_string(),
+                        decision: AuditDecision::Blocked,
+                        reason: AuditReason::LocalCredentialMismatch,
+                        credential: None,
+                        git: None,
+                    });
+                    return Ok(blocked_response(&method, &full_url));
+                }
+
                 // Allowed after LFS check
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
@@ -338,6 +384,28 @@ impl TunnelHandler {
                 };
                 self.logger.log_allowed(&allowed_ctx);
             }
+        }
+
+        // Verify local credentials (header-only check, before body is consumed)
+        if let Err(mismatch) = self
+            .credential_engine
+            .verify_local(&request_info, req.headers())
+        {
+            tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local credential mismatch");
+            self.logger.emit_audit(AuditEntry {
+                timestamp: crate::audit::now_iso8601(),
+                event: AuditEvent::RequestBlocked,
+                method: method.clone(),
+                url: full_url.clone(),
+                host: host.to_string(),
+                scheme: "https".to_string(),
+                protocol: "https".to_string(),
+                decision: AuditDecision::Blocked,
+                reason: AuditReason::LocalCredentialMismatch,
+                credential: None,
+                git: None,
+            });
+            return Ok(blocked_response(&method, &full_url));
         }
 
         // Forward the request to the actual server
@@ -383,6 +451,30 @@ impl TunnelHandler {
                     e
                 })?
                 .to_bytes();
+
+            // Verify local SigV4 credentials with body
+            if let Err(mismatch) = self.credential_engine.verify_local_with_body(
+                &request_info,
+                &parts.headers,
+                &body_bytes,
+            ) {
+                tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local SigV4 credential mismatch");
+                self.logger.emit_audit(AuditEntry {
+                    timestamp: crate::audit::now_iso8601(),
+                    event: AuditEvent::RequestBlocked,
+                    method: method.clone(),
+                    url: full_url.clone(),
+                    host: host.to_string(),
+                    scheme: "https".to_string(),
+                    protocol: "https".to_string(),
+                    decision: AuditDecision::Blocked,
+                    reason: AuditReason::LocalCredentialMismatch,
+                    credential: None,
+                    git: None,
+                });
+                return Ok(blocked_response(&method, &full_url));
+            }
+
             self.credential_engine
                 .inject_with_body(&request_info, &mut parts.headers, &body_bytes);
             let full_body = Full::new(body_bytes).map_err(|e| match e {}).boxed();
