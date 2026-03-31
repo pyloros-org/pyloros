@@ -192,11 +192,13 @@ url = "https://api.example.com/*"
 url = "https://api.example.com/*"
 header = "x-api-key"
 value = "secret"
+local_value = "local"
 
 [[credentials]]
 url = "https://other-api.example.com/*"
 header = "authorization"
 value = "Bearer token"
+local_value = "local"
 "#,
     )
     .unwrap();

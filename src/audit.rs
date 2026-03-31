@@ -32,6 +32,7 @@ pub enum AuditReason {
     LfsOperationNotAllowed,
     NonHttpsConnect,
     AuthFailed,
+    LocalCredentialMismatch,
 }
 
 /// Credential info attached to an audit entry.
@@ -255,6 +256,10 @@ mod tests {
             ),
             (AuditReason::NonHttpsConnect, "\"non_https_connect\""),
             (AuditReason::AuthFailed, "\"auth_failed\""),
+            (
+                AuditReason::LocalCredentialMismatch,
+                "\"local_credential_mismatch\"",
+            ),
         ];
         for (reason, expected) in reasons {
             let json = serde_json::to_string(&reason).unwrap();

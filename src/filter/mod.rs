@@ -7,6 +7,9 @@ pub mod pktline;
 mod rules;
 pub mod sigv4;
 
-pub use credentials::CredentialEngine;
+pub use credentials::{
+    CredentialEngine, GeneratedSecret, LocalCredentialMismatch, ResolvedLocalHeader,
+    ResolvedLocalSigV4,
+};
 pub use matcher::PatternMatcher;
 pub use rules::{BranchFilter, CompiledRule, FilterEngine, FilterResult, RequestInfo};

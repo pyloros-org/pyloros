@@ -306,6 +306,36 @@ Re-signs requests with real AWS credentials using AWS Signature Version 4. This 
 - The request body is fully buffered for signing (required by SigV4 which hashes the body)
 - If the original request has no parseable `Authorization` header (no region/service), the credential is skipped
 
+#### Local credential verification
+
+Every credential entry must have a corresponding **local credential** — a substitute credential known to the sandboxed agent but different from the real one. The proxy verifies the local credential before injecting the real one. This prevents credential exfiltration by unauthorized parties who may have network access to the proxy.
+
+- Every `[[credentials]]` entry must specify a local credential; config validation rejects entries without one
+- On mismatch (wrong or missing local credential), the proxy returns **403 Forbidden** and logs an audit entry with reason `local_credential_mismatch`
+- Verification happens after the filter allows the request but before injection/forwarding
+
+**Two sources for local credentials:**
+
+1. **Environment variable** — the local credential value comes from an env var, like the real credential:
+   - Header type: `local_value = "${INSIDE_KEY}"`
+   - SigV4 type: `local_access_key_id = "${INSIDE_AWS_KEY}"` + `local_secret_access_key = "${INSIDE_AWS_SECRET}"`
+
+2. **Generated** — the proxy generates a random local credential at startup and writes it to a secrets env file:
+   - `local_generated = true` on any credential type
+   - The proxy writes all generated values to `generated_secrets_file` (configured in `[proxy]`) in `KEY=value` format
+   - Default env var names are inferred from the `${VAR}` references in the real credential fields (e.g., `value = "${ANTHROPIC_API_KEY}"` → env name `ANTHROPIC_API_KEY`)
+   - Override with `local_env_name` (header) or `local_access_key_id_env_name`/`local_secret_access_key_env_name` (SigV4)
+   - The secrets file is written once at startup with 0600 permissions; generated values are stable across config reloads
+
+**Verification rules:**
+- Header credentials: the request must carry the local value in the same header that will be replaced with the real value
+- SigV4 credentials: the proxy performs full SigV4 signature verification using the local `access_key_id` and `secret_access_key`, ensuring the agent actually possesses the local secret key (not just the key ID)
+
+**Generated value formats:**
+- Header: 32-byte random hex string (64 characters)
+- SigV4 access_key_id: `AKIA` + 16 alphanumeric characters
+- SigV4 secret_access_key: 40-character base64 string
+
 ## Technical Decisions
 
 - Explicit HTTP proxy (no iptables)
@@ -342,6 +372,9 @@ ca_key = "/path/to/ca.key"
 # upstream_override_port = 9443
 # Optional: PEM CA cert to trust for upstream TLS (testing only)
 # upstream_tls_ca = "/path/to/upstream-ca.crt"
+# Optional: path to write generated local credentials as KEY=value env file
+# Required if any credential uses local_generated = true
+# generated_secrets_file = "/run/pyloros/secrets.env"
 
 [logging]
 level = "info"
@@ -383,25 +416,33 @@ url = "https://github.com/myorg/shared-repo"
 branches = ["*", "!main", "!release/*"]
 
 # Credential injection — inject API keys/tokens into matching requests
+# Every credential requires a local credential (local_value or local_generated)
 
-# Header credential (type defaults to "header" when omitted)
+# Header credential with local from env var
 [[credentials]]
 url = "https://api.anthropic.com/*"
 header = "x-api-key"
 value = "${ANTHROPIC_API_KEY}"
+local_value = "${LOCAL_ANTHROPIC_KEY}"
 
+# Header credential with generated local
 [[credentials]]
 url = "https://api.openai.com/*"
 header = "authorization"
 value = "Bearer ${OPENAI_API_KEY}"
+local_generated = true
+# local_env_name = "OPENAI_API_KEY"  # optional, defaults to env var from value
 
-# AWS SigV4 credential — re-signs requests with real AWS credentials
+# AWS SigV4 credential with generated local
 [[credentials]]
 type = "aws-sigv4"
 url = "https://*.amazonaws.com/*"
 access_key_id = "${AWS_ACCESS_KEY_ID}"
 secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # session_token = "${AWS_SESSION_TOKEN}"
+local_generated = true
+# local_access_key_id_env_name = "AWS_ACCESS_KEY_ID"  # optional
+# local_secret_access_key_env_name = "AWS_SECRET_ACCESS_KEY"  # optional
 ```
 
 ## Testing
