@@ -354,10 +354,10 @@ impl CredentialEngine {
                     header,
                     ..
                 } => {
-                    format!("header={} url={}", header, url_display)
+                    format!("header={} url={} (local: configured)", header, url_display)
                 }
                 ResolvedCredential::AwsSigV4 { url_display, .. } => {
-                    format!("aws-sigv4 url={}", url_display)
+                    format!("aws-sigv4 url={} (local: configured)", url_display)
                 }
             })
             .collect()
