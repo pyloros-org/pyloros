@@ -12,7 +12,7 @@ use common::{
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use pyloros::config::Credential;
+use pyloros::config::{Credential, LocalHeaderConfig, LocalSigV4Config};
 use ring::digest;
 use std::sync::Arc;
 
@@ -22,6 +22,7 @@ fn header_cred(url: &str, header: &str, value: &str) -> Credential {
         url: url.to_string(),
         header: header.to_string(),
         value: value.to_string(),
+        local: LocalHeaderConfig::Value("test-local".to_string()),
     }
 }
 
@@ -32,6 +33,10 @@ fn aws_cred(url: &str, key_id: &str, secret: &str, token: Option<&str>) -> Crede
         access_key_id: key_id.to_string(),
         secret_access_key: secret.to_string(),
         session_token: token.map(|s| s.to_string()),
+        local: LocalSigV4Config::Explicit {
+            access_key_id: "LOCALAKID".to_string(),
+            secret_access_key: "LOCALSECRET".to_string(),
+        },
     }
 }
 

@@ -244,6 +244,7 @@ async fn test_audit_log_credential_info() {
         url: "https://localhost/*".to_string(),
         header: "x-api-key".to_string(),
         value: "test-secret".to_string(),
+        local: pyloros::config::LocalHeaderConfig::Value("test-local".to_string()),
     };
 
     let proxy = TestProxy::builder(

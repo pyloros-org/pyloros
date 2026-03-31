@@ -3,7 +3,7 @@
 mod common;
 
 use common::{echo_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream};
-use pyloros::config::Credential;
+use pyloros::config::{Credential, LocalHeaderConfig};
 use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
 
 fn cred(url: &str, header: &str, value: &str) -> Credential {
@@ -11,6 +11,7 @@ fn cred(url: &str, header: &str, value: &str) -> Credential {
         url: url.to_string(),
         header: header.to_string(),
         value: value.to_string(),
+        local: LocalHeaderConfig::Value("test-local".to_string()),
     }
 }
 

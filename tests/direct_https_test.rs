@@ -177,6 +177,7 @@ async fn test_direct_https_credential_injection() {
         url: "https://api.example.com/*".to_string(),
         header: "x-api-key".to_string(),
         value: "test-secret-key".to_string(),
+        local: pyloros::config::LocalHeaderConfig::Value("test-local".to_string()),
     }];
 
     // Need to build the proxy manually to add credentials
