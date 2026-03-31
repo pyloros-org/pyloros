@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    ok_handler, read_audit_entries, rule, ReportingClient, TestCa, TestProxy, TestUpstream,
+    ok_handler, read_audit_entries, rule, test_client, ReportingClient, TestCa, TestProxy,
+    TestUpstream,
 };
 
 #[tokio::test]
@@ -258,8 +259,14 @@ async fn test_audit_log_credential_info() {
     .start()
     .await;
 
-    let client = ReportingClient::new(&t, proxy.addr(), &ca);
-    let resp = client.get("https://localhost/api").await;
+    let client = test_client(proxy.addr(), &ca);
+    t.action("GET `https://localhost/api` with x-api-key: test-local");
+    let resp = client
+        .get("https://localhost/api")
+        .header("x-api-key", "test-local")
+        .send()
+        .await
+        .unwrap();
     t.assert_eq("status", &resp.status().as_u16(), &200u16);
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

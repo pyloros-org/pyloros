@@ -228,6 +228,7 @@ async fn test_direct_https_credential_injection() {
             "https://api.example.com:{}/data",
             direct_addr.port()
         ))
+        .header("x-api-key", "test-local")
         .send()
         .await
         .unwrap();

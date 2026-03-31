@@ -78,6 +78,24 @@ pub fn auth_required_response() -> Response<BoxBody<Bytes, hyper::Error>> {
         .unwrap()
 }
 
+/// Create an HTTP 403 Forbidden response for local credential mismatch
+pub fn local_credential_mismatch_response(
+    method: &str,
+    url: &str,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = format!(
+        "Local credential verification failed\n\nMethod: {}\nURL: {}\n",
+        method, url
+    );
+
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("Content-Type", "text/plain")
+        .header("X-Blocked-By", "pyloros")
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .unwrap()
+}
+
 /// Create an HTTP 502 Bad Gateway error response
 pub fn error_response(message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = format!("Proxy error: {}\n", message);

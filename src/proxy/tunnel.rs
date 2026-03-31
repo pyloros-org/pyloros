@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use super::response::{blocked_response, error_response, git_blocked_push_response};
+use super::response::{
+    blocked_response, error_response, git_blocked_push_response, local_credential_mismatch_response,
+};
 use super::{RequestContext, RequestLogger};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
@@ -277,7 +279,7 @@ impl TunnelHandler {
                         credential: None,
                         git: None,
                     });
-                    return Ok(blocked_response(&method, &full_url));
+                    return Ok(local_credential_mismatch_response(&method, &full_url));
                 }
 
                 // Allowed after branch check
@@ -363,7 +365,7 @@ impl TunnelHandler {
                         credential: None,
                         git: None,
                     });
-                    return Ok(blocked_response(&method, &full_url));
+                    return Ok(local_credential_mismatch_response(&method, &full_url));
                 }
 
                 // Allowed after LFS check
@@ -405,7 +407,7 @@ impl TunnelHandler {
                 credential: None,
                 git: None,
             });
-            return Ok(blocked_response(&method, &full_url));
+            return Ok(local_credential_mismatch_response(&method, &full_url));
         }
 
         // Forward the request to the actual server
@@ -431,18 +433,7 @@ impl TunnelHandler {
             .await
         } else if self.credential_engine.needs_body(&request_info) {
             // SigV4 credentials need the full body for signing.
-            // Set the upstream Host header BEFORE signing so the signature covers
-            // the final host value that the upstream server will see.
             let (mut parts, body) = req.into_parts();
-            super::strip_hop_by_hop_headers(&mut parts.headers);
-            let upstream_host_value = if connect_port == 443 {
-                host.to_string()
-            } else {
-                format!("{}:{}", host, connect_port)
-            };
-            if let Ok(hv) = hyper::header::HeaderValue::from_str(&upstream_host_value) {
-                parts.headers.insert(hyper::header::HOST, hv);
-            }
             let body_bytes = body
                 .collect()
                 .await
@@ -452,7 +443,9 @@ impl TunnelHandler {
                 })?
                 .to_bytes();
 
-            // Verify local SigV4 credentials with body
+            // Verify local SigV4 credentials BEFORE modifying headers.
+            // The signature was computed by the agent with the original headers,
+            // so we must verify before strip_hop_by_hop or host override.
             if let Err(mismatch) = self.credential_engine.verify_local_with_body(
                 &request_info,
                 &parts.headers,
@@ -472,7 +465,20 @@ impl TunnelHandler {
                     credential: None,
                     git: None,
                 });
-                return Ok(blocked_response(&method, &full_url));
+                return Ok(local_credential_mismatch_response(&method, &full_url));
+            }
+
+            // Now modify headers for upstream forwarding.
+            // Set the upstream Host header BEFORE signing so the signature covers
+            // the final host value that the upstream server will see.
+            super::strip_hop_by_hop_headers(&mut parts.headers);
+            let upstream_host_value = if connect_port == 443 {
+                host.to_string()
+            } else {
+                format!("{}:{}", host, connect_port)
+            };
+            if let Ok(hv) = hyper::header::HeaderValue::from_str(&upstream_host_value) {
+                parts.headers.insert(hyper::header::HOST, hv);
             }
 
             self.credential_engine

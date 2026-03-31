@@ -428,7 +428,10 @@ impl CredentialEngine {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
 
-                    // Collect all headers for verification
+                    // Collect all headers for verification.
+                    // In HTTP/1.1 through hyper, the Host header may not be present
+                    // as an explicit header (it's extracted from the URI). We add it
+                    // from request_info if missing, since SigV4 typically signs it.
                     let mut all_headers: Vec<(String, String)> = headers
                         .iter()
                         .filter(|(name, _)| name.as_str() != "authorization")
@@ -439,6 +442,9 @@ impl CredentialEngine {
                             )
                         })
                         .collect();
+                    if !all_headers.iter().any(|(k, _)| k == "host") {
+                        all_headers.push(("host".to_string(), request_info.host.to_string()));
+                    }
                     all_headers.sort_by(|a, b| a.0.cmp(&b.0));
 
                     if !super::sigv4::verify_request_signature(
