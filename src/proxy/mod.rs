@@ -126,6 +126,11 @@ impl RequestLogger {
             reason: AuditReason::NoMatchingRule,
             credential: ctx.credential.clone(),
             git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         });
         if self.permissive {
             None
@@ -151,6 +156,11 @@ impl RequestLogger {
             reason: AuditReason::RuleMatched,
             credential: ctx.credential.clone(),
             git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         });
     }
 }
