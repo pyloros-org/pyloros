@@ -169,7 +169,7 @@ impl CompiledRule {
         let log_body = rule.log_body;
 
         if needs_fetch {
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/refs",
                 Some("service=git-upload-pack"),
@@ -178,7 +178,7 @@ impl CompiledRule {
                 redirects.clone(),
                 log_body,
             )?);
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/git-upload-pack",
                 None,
@@ -190,7 +190,7 @@ impl CompiledRule {
         }
 
         if needs_push {
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/refs",
                 Some("service=git-receive-pack"),
@@ -215,7 +215,7 @@ impl CompiledRule {
                     Ok::<BranchFilter, crate::error::Error>(BranchFilter { allow, deny })
                 })
                 .transpose()?;
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/git-receive-pack",
                 None,
@@ -227,7 +227,7 @@ impl CompiledRule {
         }
 
         if needs_push {
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks",
                 None,
@@ -236,7 +236,7 @@ impl CompiledRule {
                 redirects.clone(),
                 log_body,
             )?);
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks",
                 None,
@@ -245,7 +245,7 @@ impl CompiledRule {
                 redirects.clone(),
                 log_body,
             )?);
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks/verify",
                 None,
@@ -254,7 +254,7 @@ impl CompiledRule {
                 redirects.clone(),
                 log_body,
             )?);
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks/*/unlock",
                 None,
@@ -264,7 +264,7 @@ impl CompiledRule {
                 log_body,
             )?);
         } else if needs_fetch {
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks",
                 None,
@@ -273,7 +273,7 @@ impl CompiledRule {
                 redirects.clone(),
                 log_body,
             )?);
-            rules.push(Self::compile_git_endpoint(
+            rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks/verify",
                 None,
@@ -292,7 +292,7 @@ impl CompiledRule {
             if needs_push {
                 lfs_ops.push("upload".to_string());
             }
-            rules.push(Self::compile_lfs_batch_endpoint(
+            rules.extend(Self::compile_lfs_batch_endpoint(
                 base_url,
                 lfs_ops,
                 redirects.clone(),
@@ -304,6 +304,10 @@ impl CompiledRule {
     }
 
     /// Compile a single git smart HTTP endpoint rule.
+    ///
+    /// The trailing `.git` in `base_url` is optional. Two compiled rules are
+    /// returned — one matching the `repo` form and one matching the `repo.git`
+    /// form — so a rule written either way matches requests written either way.
     fn compile_git_endpoint(
         base_url: &str,
         path_suffix: &str,
@@ -312,46 +316,62 @@ impl CompiledRule {
         branch_filter: Option<BranchFilter>,
         allow_redirects: Arc<Vec<UrlPattern>>,
         log_body: bool,
-    ) -> Result<Self> {
-        let full_url = match query {
-            Some(q) => format!("{}{}?{}", base_url, path_suffix, q),
-            None => format!("{}{}", base_url, path_suffix),
-        };
+    ) -> Result<Vec<Self>> {
+        let stripped = base_url.strip_suffix(".git").unwrap_or(base_url);
+        let with_git = format!("{}.git", stripped);
 
-        let method_matcher = Some(PatternMatcher::new(&method.to_uppercase())?);
-        let url = UrlPattern::new(&full_url)?;
+        let mut out = Vec::with_capacity(2);
+        for base in [stripped, with_git.as_str()] {
+            let full_url = match query {
+                Some(q) => format!("{}{}?{}", base, path_suffix, q),
+                None => format!("{}{}", base, path_suffix),
+            };
 
-        Ok(Self {
-            method: method_matcher,
-            url,
-            websocket: false,
-            branch_filter,
-            lfs_operations: None,
-            allow_redirects,
-            log_body,
-        })
+            let method_matcher = Some(PatternMatcher::new(&method.to_uppercase())?);
+            let url = UrlPattern::new(&full_url)?;
+
+            out.push(Self {
+                method: method_matcher,
+                url,
+                websocket: false,
+                branch_filter: branch_filter.clone(),
+                lfs_operations: None,
+                allow_redirects: allow_redirects.clone(),
+                log_body,
+            });
+        }
+        Ok(out)
     }
 
     /// Compile the LFS batch endpoint rule for a git rule.
+    ///
+    /// Emits both `repo` and `repo.git` variants (see `compile_git_endpoint`).
     fn compile_lfs_batch_endpoint(
         base_url: &str,
         lfs_operations: Vec<String>,
         allow_redirects: Arc<Vec<UrlPattern>>,
         log_body: bool,
-    ) -> Result<Self> {
-        let full_url = format!("{}/info/lfs/objects/batch", base_url);
-        let method_matcher = Some(PatternMatcher::new("POST")?);
-        let url = UrlPattern::new(&full_url)?;
+    ) -> Result<Vec<Self>> {
+        let stripped = base_url.strip_suffix(".git").unwrap_or(base_url);
+        let with_git = format!("{}.git", stripped);
 
-        Ok(Self {
-            method: method_matcher,
-            url,
-            websocket: false,
-            branch_filter: None,
-            lfs_operations: Some(lfs_operations),
-            allow_redirects,
-            log_body,
-        })
+        let mut out = Vec::with_capacity(2);
+        for base in [stripped, with_git.as_str()] {
+            let full_url = format!("{}/info/lfs/objects/batch", base);
+            let method_matcher = Some(PatternMatcher::new("POST")?);
+            let url = UrlPattern::new(&full_url)?;
+
+            out.push(Self {
+                method: method_matcher,
+                url,
+                websocket: false,
+                branch_filter: None,
+                lfs_operations: Some(lfs_operations.clone()),
+                allow_redirects: allow_redirects.clone(),
+                log_body,
+            });
+        }
+        Ok(out)
     }
 
     /// Check if this rule matches the given request
@@ -898,8 +918,9 @@ mod tests {
         let engine =
             FilterEngine::new(vec![make_git_rule("fetch", "https://github.com/org/repo")]).unwrap();
 
-        // fetch = 2 smart HTTP + 2 lock (GET list, POST verify) + 1 LFS batch = 5
-        t.assert_eq("rule count", &engine.rule_count(), &5usize);
+        // fetch = 2 smart HTTP + 2 lock (GET list, POST verify) + 1 LFS batch = 5;
+        // each endpoint is compiled twice (with and without .git suffix) = 10.
+        t.assert_eq("rule count", &engine.rule_count(), &10usize);
 
         let lfs_req = RequestInfo::http(
             "POST",
@@ -926,8 +947,9 @@ mod tests {
         let engine =
             FilterEngine::new(vec![make_git_rule("push", "https://github.com/org/repo")]).unwrap();
 
-        // push = 2 smart HTTP + 4 lock (GET list, POST create, POST verify, POST unlock) + 1 LFS batch = 7
-        t.assert_eq("rule count", &engine.rule_count(), &7usize);
+        // push = 2 smart HTTP + 4 lock (GET list, POST create, POST verify, POST unlock) + 1 LFS batch = 7;
+        // each endpoint is compiled twice (with and without .git suffix) = 14.
+        t.assert_eq("rule count", &engine.rule_count(), &14usize);
 
         let lfs_req = RequestInfo::http(
             "POST",
@@ -954,8 +976,9 @@ mod tests {
         let engine =
             FilterEngine::new(vec![make_git_rule("*", "https://github.com/org/repo")]).unwrap();
 
-        // star = 4 smart HTTP + 4 lock + 1 LFS batch = 9
-        t.assert_eq("rule count", &engine.rule_count(), &9usize);
+        // star = 4 smart HTTP + 4 lock + 1 LFS batch = 9;
+        // each endpoint is compiled twice (with and without .git suffix) = 18.
+        t.assert_eq("rule count", &engine.rule_count(), &18usize);
 
         let lfs_req = RequestInfo::http(
             "POST",
@@ -1009,6 +1032,135 @@ mod tests {
                 t.assert_true("upload in merged ops", ops.contains(&"upload".to_string()));
             }
             other => panic!("expected AllowedWithLfsCheck, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_git_rule_dotgit_normalization() {
+        let t =
+            test_report!("Git rules normalize .git suffix: rule and request may use either form");
+
+        // Rule without .git — requests with and without .git both match.
+        let engine_no_suffix =
+            FilterEngine::new(vec![make_git_rule("fetch", "https://github.com/org/repo")]).unwrap();
+        let req_plain = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/repo/info/refs",
+            Some("service=git-upload-pack"),
+        );
+        let req_dotgit = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/repo.git/info/refs",
+            Some("service=git-upload-pack"),
+        );
+        t.assert_true(
+            "rule 'repo' matches request 'repo'",
+            engine_no_suffix.is_allowed(&req_plain),
+        );
+        t.assert_true(
+            "rule 'repo' matches request 'repo.git'",
+            engine_no_suffix.is_allowed(&req_dotgit),
+        );
+
+        // Rule with .git — requests with and without .git both match.
+        let engine_with_suffix = FilterEngine::new(vec![make_git_rule(
+            "fetch",
+            "https://github.com/org/repo.git",
+        )])
+        .unwrap();
+        t.assert_true(
+            "rule 'repo.git' matches request 'repo'",
+            engine_with_suffix.is_allowed(&req_plain),
+        );
+        t.assert_true(
+            "rule 'repo.git' matches request 'repo.git'",
+            engine_with_suffix.is_allowed(&req_dotgit),
+        );
+
+        // Sibling repo (different repo name) is NOT matched — normalization
+        // doesn't accidentally over-match.
+        let req_sibling = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/other/info/refs",
+            Some("service=git-upload-pack"),
+        );
+        let req_sibling_dotgit = RequestInfo::http(
+            "GET",
+            "https",
+            "github.com",
+            None,
+            "/org/other.git/info/refs",
+            Some("service=git-upload-pack"),
+        );
+        t.assert_true(
+            "sibling 'other' blocked",
+            !engine_no_suffix.is_allowed(&req_sibling),
+        );
+        t.assert_true(
+            "sibling 'other.git' blocked",
+            !engine_no_suffix.is_allowed(&req_sibling_dotgit),
+        );
+    }
+
+    #[test]
+    fn test_git_rule_dotgit_normalization_lfs_batch() {
+        let t = test_report!(".git normalization applies to LFS batch endpoint too");
+
+        let engine =
+            FilterEngine::new(vec![make_git_rule("*", "https://github.com/org/repo.git")]).unwrap();
+
+        for path in [
+            "/org/repo/info/lfs/objects/batch",
+            "/org/repo.git/info/lfs/objects/batch",
+        ] {
+            let req = RequestInfo::http("POST", "https", "github.com", None, path, None);
+            match engine.check(&req) {
+                FilterResult::AllowedWithLfsCheck { .. } => {
+                    t.assert_true(&format!("{} → AllowedWithLfsCheck", path), true);
+                }
+                other => panic!("expected AllowedWithLfsCheck for {}, got {:?}", path, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_git_rule_dotgit_normalization_branch_filter() {
+        let t = test_report!("Branch filter applies under both .git and non-.git request forms");
+
+        let rule = Rule {
+            method: None,
+            url: "https://github.com/org/repo".to_string(),
+            websocket: false,
+            git: Some("push".to_string()),
+            branches: Some(vec!["feature/*".to_string()]),
+            allow_redirects: Vec::new(),
+            log_body: false,
+        };
+        let engine = FilterEngine::new(vec![rule]).unwrap();
+
+        for path in [
+            "/org/repo/git-receive-pack",
+            "/org/repo.git/git-receive-pack",
+        ] {
+            let req = RequestInfo::http("POST", "https", "github.com", None, path, None);
+            match engine.check(&req) {
+                FilterResult::AllowedWithBranchCheck { .. } => {
+                    t.assert_true(&format!("{} → AllowedWithBranchCheck", path), true);
+                }
+                other => panic!(
+                    "expected AllowedWithBranchCheck for {}, got {:?}",
+                    path, other
+                ),
+            }
         }
     }
 

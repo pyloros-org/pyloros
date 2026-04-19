@@ -113,7 +113,7 @@ url = "https://github.com/*"
 | `push`  | push                |
 | `*`     | all                 |
 
-The `url` is the repo base URL (what you'd pass to `git clone`).
+The `url` is the repo base URL (what you'd pass to `git clone`). The trailing `.git` suffix is optional: rules match both `repo` and `repo.git` request forms regardless of which form was written in the rule, so `url = "https://github.com/org/repo"` and `url = "https://github.com/org/repo.git"` are equivalent.
 
 #### Branch restriction
 
