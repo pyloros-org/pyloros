@@ -8,7 +8,12 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{rule, rule_with_redirects, ReportingClient, TestCa, TestProxy};
+use bytes::Bytes;
+use common::{rule, rule_with_redirects, ReportingClient, TestCa, TestProxy, TestUpstream};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use hyper::body::Incoming;
+use hyper::{Request, Response, StatusCode};
+use std::sync::Arc;
 use std::time::Duration;
 use wiremock::{
     matchers::{method, path as wm_path},
@@ -479,5 +484,119 @@ async fn test_audit_log_records_redirect_whitelisted_reason() {
         "\"reason\":\"redirect_whitelisted\"",
     );
 
+    proxy.shutdown();
+}
+
+/// HTTPS (MITM CONNECT tunnel) end-to-end: the tunnel handler intercepts a 3xx
+/// response, resolves the `Location` (relative in this test, since the test
+/// upstream serves a cert for a single hostname), whitelists the target, and
+/// lets the follow-up request through despite no rule matching it directly.
+///
+/// Uses a relative `Location` to keep the upstream cert scope to one hostname.
+/// The cross-host HTTPS case would require a multi-SAN test cert, but the
+/// shared `maybe_whitelist_redirect` helper is already exercised by the plain
+/// HTTP cross-host tests above, so this test's job is to prove the MITM tunnel
+/// path plumbs the helper correctly.
+#[tokio::test]
+async fn test_https_mitm_redirect_whitelisted() {
+    let t = test_report!("HTTPS MITM: 3xx whitelist + follow-up allowed");
+
+    let ca = TestCa::generate();
+
+    // Single upstream serving two paths: /origin returns 302 → /cdn/file,
+    // /cdn/file returns 200.
+    let handler: common::UpstreamHandler = Arc::new(|req: Request<Incoming>| {
+        Box::pin(async move {
+            let resp = match req.uri().path() {
+                "/origin" => Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("Location", "/cdn/file")
+                    .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())
+                    .unwrap(),
+                "/cdn/file" => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(
+                        Full::new(Bytes::from_static(b"https-payload"))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+                _ => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())
+                    .unwrap(),
+            };
+            Ok::<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error>(resp)
+        })
+    });
+
+    let upstream = TestUpstream::builder(&ca, handler)
+        .report(&t, "serves /origin (302) and /cdn/file (200)")
+        .start()
+        .await;
+
+    // Rule allows /origin and permits redirects to /cdn/* on the same host.
+    // /cdn/file itself is NOT directly matched by any rule — only reachable
+    // through the whitelist.
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![rule_with_redirects(
+            "GET",
+            "https://localhost/origin",
+            &["https://localhost/cdn/*"],
+        )],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    // reqwest with redirect=none so the follow-up goes through the proxy explicitly.
+    let ca_cert = reqwest::tls::Certificate::from_pem(ca.cert_pem.as_bytes()).unwrap();
+    let proxy_url = format!("http://{}", proxy.addr());
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
+        .add_root_certificate(ca_cert)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // Sanity: without triggering the origin first, /cdn/file is blocked (no matching rule).
+    t.action("GET https://localhost/cdn/file directly (expect 451)".to_string());
+    let pre = client
+        .get("https://localhost/cdn/file")
+        .send()
+        .await
+        .unwrap();
+    t.assert_eq("pre-redirect cdn blocked", &pre.status().as_u16(), &451u16);
+
+    // Trigger the origin (rule-matched) to insert whitelist entry.
+    t.action("GET https://localhost/origin (rule-matched, returns 302)".to_string());
+    let r1 = client.get("https://localhost/origin").send().await.unwrap();
+    t.assert_eq("origin 302", &r1.status().as_u16(), &302u16);
+    t.assert_eq(
+        "Location header",
+        &r1.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        &"/cdn/file",
+    );
+
+    // Follow-up to /cdn/file should now be allowed via the whitelist.
+    t.action("GET https://localhost/cdn/file (post-redirect, expect 200)".to_string());
+    let r2 = client
+        .get("https://localhost/cdn/file")
+        .send()
+        .await
+        .unwrap();
+    t.assert_eq("cdn follow-up allowed", &r2.status().as_u16(), &200u16);
+    t.assert_eq(
+        "cdn body",
+        &r2.text().await.unwrap().as_str(),
+        &"https-payload",
+    );
+
+    upstream.shutdown();
     proxy.shutdown();
 }
