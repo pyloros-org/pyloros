@@ -83,6 +83,12 @@ services:
     networks:
       internal:
         ipv4_address: ${PYLOROS_DNS_IP:-172.30.0.253}
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "1", "127.0.0.1", "53"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
 
   sandbox:
     image: ${SANDBOX_IMAGE:-alpine:latest}
@@ -91,7 +97,7 @@ services:
       proxy:
         condition: service_healthy
       dns:
-        condition: service_started
+        condition: service_healthy
     dns:
       - ${PYLOROS_DNS_IP:-172.30.0.253}
     environment:
