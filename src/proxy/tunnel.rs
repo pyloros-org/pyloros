@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use super::response::{blocked_response, error_response, git_blocked_push_response};
+use super::response::{
+    blocked_response, error_response, git_blocked_push_response, git_force_push_blocked_response,
+};
 use super::{RequestContext, RequestLogger};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
@@ -21,6 +23,7 @@ use crate::audit::{
 use crate::error::{Error, Result};
 use crate::filter::lfs;
 use crate::filter::matcher::UrlPattern;
+use crate::filter::pack::{self, AncestryResult};
 use crate::filter::pktline;
 use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{CredentialEngine, FilterEngine, FilterResult, RequestInfo};
@@ -392,6 +395,45 @@ impl TunnelHandler {
                         body_truncated: None,
                     });
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
+                }
+
+                // Protected-branch (force-push / delete / non-FF) check
+                if !filter.protected.is_empty() {
+                    let protected_blocked = protected_branch_violations(&body_bytes, filter);
+                    if !protected_blocked.is_empty() {
+                        if self.logger.log_blocked_requests {
+                            tracing::warn!(
+                                method = %method,
+                                url = %full_url,
+                                blocked_refs = ?protected_blocked,
+                                "BLOCKED (protected branch: force-push/delete/non-FF)"
+                            );
+                        }
+                        self.logger.emit_audit(AuditEntry {
+                            timestamp: crate::audit::now_iso8601(),
+                            event: AuditEvent::RequestBlocked,
+                            method: method.clone(),
+                            url: full_url.clone(),
+                            host: host.to_string(),
+                            scheme: "https".to_string(),
+                            protocol: "https".to_string(),
+                            decision: AuditDecision::Blocked,
+                            reason: AuditReason::ForcePushProtected,
+                            credential: None,
+                            git: Some(AuditGitInfo {
+                                blocked_refs: protected_blocked.clone(),
+                            }),
+                            request_body: None,
+                            request_body_encoding: None,
+                            response_body: None,
+                            response_body_encoding: None,
+                            body_truncated: None,
+                        });
+                        return Ok(git_force_push_blocked_response(
+                            &body_bytes,
+                            &protected_blocked,
+                        ));
+                    }
                 }
 
                 // Allowed after branch check
@@ -1072,4 +1114,51 @@ async fn forward_websocket(
     });
 
     Ok(client_response)
+}
+
+/// Check a receive-pack body for protected-branch violations.
+///
+/// For each ref update whose ref name matches any `filter.protected` pattern,
+/// we require either a new-ref creation or a fast-forward update (verified by
+/// walking the pushed packfile's commit graph). Deletions of protected refs
+/// and non-fast-forward updates are reported as blocked.
+fn protected_branch_violations(
+    body_bytes: &[u8],
+    filter: &crate::filter::BranchFilter,
+) -> Vec<String> {
+    let updates = pktline::extract_push_updates(body_bytes);
+    let pack_bytes = pktline::pack_bytes_in_body(body_bytes);
+    let mut blocked = Vec::new();
+
+    for u in updates {
+        if !filter.is_protected(&u.name) {
+            continue;
+        }
+        // Deletion of a protected ref is always blocked.
+        if u.is_delete() {
+            blocked.push(u.name);
+            continue;
+        }
+        // Creating a new protected ref is always allowed.
+        if u.is_create() {
+            continue;
+        }
+        // Existing ref update: must be a fast-forward.
+        let pack_bytes = match pack_bytes {
+            Some(p) => p,
+            // No pack data — any non-trivial update cannot be verified.
+            None => {
+                blocked.push(u.name);
+                continue;
+            }
+        };
+        match pack::pack_contains_ancestry(pack_bytes, &u.old, &u.new) {
+            AncestryResult::IsAncestor => {}
+            AncestryResult::NotAncestor | AncestryResult::Indeterminate => {
+                blocked.push(u.name);
+            }
+        }
+    }
+
+    blocked
 }
