@@ -3,6 +3,7 @@
 mod credentials;
 pub mod lfs;
 pub mod matcher;
+pub mod pack;
 pub mod pktline;
 mod rules;
 pub mod sigv4;
