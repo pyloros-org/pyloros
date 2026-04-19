@@ -281,7 +281,8 @@ impl TunnelHandler {
                     return Ok(resp);
                 }
             }
-            FilterResult::AllowedWithBranchCheck(_) | FilterResult::AllowedWithLfsCheck(_) => {
+            FilterResult::AllowedWithBranchCheck { .. }
+            | FilterResult::AllowedWithLfsCheck { .. } => {
                 // Body-inspection rules require HTTPS (see handler::handle_http).
                 if self.logger.log_blocked_requests {
                     tracing::warn!(
@@ -302,10 +303,15 @@ impl TunnelHandler {
                     reason: AuditReason::BodyInspectionRequiresHttps,
                     credential: None,
                     git: None,
+                    request_body: None,
+                    request_body_encoding: None,
+                    response_body: None,
+                    response_body_encoding: None,
+                    body_truncated: None,
                 });
                 return Ok(blocked_response(&method, &full_url));
             }
-            FilterResult::Allowed => {
+            FilterResult::Allowed { .. } => {
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
