@@ -428,6 +428,7 @@ mod tests {
             websocket: false,
             git: None,
             branches: None,
+            allow_redirects: Vec::new(),
         }
     }
 
@@ -438,6 +439,7 @@ mod tests {
             websocket: true,
             git: None,
             branches: None,
+            allow_redirects: Vec::new(),
         }
     }
 
@@ -699,6 +701,7 @@ mod tests {
             websocket: false,
             git: Some("push".to_string()),
             branches: Some(vec!["feature/*".to_string()]),
+            allow_redirects: Vec::new(),
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
 
@@ -772,6 +775,7 @@ mod tests {
             websocket: false,
             git: Some(git_op.to_string()),
             branches: None,
+            allow_redirects: Vec::new(),
         }
     }
 
@@ -916,6 +920,7 @@ mod tests {
             websocket: false,
             git: Some("push".to_string()),
             branches: Some(vec!["feature/*".to_string()]),
+            allow_redirects: Vec::new(),
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
 

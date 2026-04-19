@@ -155,6 +155,10 @@ pub struct ProxyConfig {
     /// as "request_permitted" for traffic discovery. Default: false.
     #[serde(default)]
     pub permissive: bool,
+
+    /// TTL (seconds) for redirect-whitelist entries. See `allow_redirects` on rules.
+    #[serde(default = "default_redirect_whitelist_ttl_secs")]
+    pub redirect_whitelist_ttl_secs: u64,
 }
 
 impl Default for ProxyConfig {
@@ -169,12 +173,17 @@ impl Default for ProxyConfig {
             upstream_tls_ca: None,
             direct_https_bind: None,
             permissive: false,
+            redirect_whitelist_ttl_secs: default_redirect_whitelist_ttl_secs(),
         }
     }
 }
 
 fn default_bind_address() -> String {
     "127.0.0.1:8080".to_string()
+}
+
+fn default_redirect_whitelist_ttl_secs() -> u64 {
+    60
 }
 
 /// Logging configuration
@@ -277,6 +286,12 @@ pub struct Rule {
     /// Branch patterns for git push restriction. Only valid with git = "push" or git = "*".
     #[serde(default)]
     pub branches: Option<Vec<String>>,
+
+    /// URL patterns for redirect targets that should be temporarily whitelisted
+    /// when a rule-matched request returns a 3xx response with a matching `Location`.
+    /// Use `["*"]` to accept any redirect target. Empty/omitted = redirects not followed.
+    #[serde(default)]
+    pub allow_redirects: Vec<String>,
 }
 
 impl Config {
@@ -354,6 +369,25 @@ impl Config {
 
         if rule.branches.is_some() && rule.git.is_none() {
             return Err(ctx("`branches` is only valid on git rules"));
+        }
+
+        // Validate redirect URL patterns. Bare "*" is a shorthand for "any URL"
+        // and does not need to parse as a UrlPattern.
+        {
+            use crate::filter::matcher::UrlPattern;
+            for (j, pattern) in rule.allow_redirects.iter().enumerate() {
+                if pattern == "*" {
+                    continue;
+                }
+                UrlPattern::new(pattern).map_err(|e| {
+                    ctx(&format!(
+                        "allow_redirects pattern #{} ({:?}) invalid: {}",
+                        j + 1,
+                        pattern,
+                        e
+                    ))
+                })?;
+            }
         }
 
         // Validate branch patterns: bare "!" (empty after prefix strip) is an error
@@ -442,6 +476,7 @@ impl Config {
                 upstream_tls_ca: None,
                 direct_https_bind: None,
                 permissive: false,
+                redirect_whitelist_ttl_secs: default_redirect_whitelist_ttl_secs(),
             },
             logging: LoggingConfig::default(),
             rules: Vec::new(),
@@ -1257,5 +1292,87 @@ auth_password = "${TEST_PROXY_AUTH_PW_123}"
         let config = Config::parse("").unwrap();
         let auth = config.resolved_auth().unwrap();
         t.assert_eq("no auth", &auth, &None);
+    }
+
+    #[test]
+    fn test_allow_redirects_defaults_empty() {
+        let t = test_report!("Rule allow_redirects defaults to empty vec");
+        let toml = r#"
+[[rules]]
+method = "GET"
+url = "https://example.com/*"
+"#;
+        let config = Config::parse(toml).unwrap();
+        t.assert_true(
+            "allow_redirects empty",
+            config.rules[0].allow_redirects.is_empty(),
+        );
+    }
+
+    #[test]
+    fn test_allow_redirects_parses_list() {
+        let t = test_report!("Rule allow_redirects parses a list of URL patterns");
+        let toml = r#"
+[[rules]]
+method = "GET"
+url = "https://github.com/*/releases/download/*"
+allow_redirects = ["https://release-assets.githubusercontent.com/*", "*"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        t.assert_eq(
+            "allow_redirects length",
+            &config.rules[0].allow_redirects.len(),
+            &2usize,
+        );
+        t.assert_eq(
+            "first pattern",
+            &config.rules[0].allow_redirects[0].as_str(),
+            &"https://release-assets.githubusercontent.com/*",
+        );
+        t.assert_eq(
+            "second pattern",
+            &config.rules[0].allow_redirects[1].as_str(),
+            &"*",
+        );
+    }
+
+    #[test]
+    fn test_allow_redirects_rejects_invalid_pattern() {
+        assert_config_rejects(
+            "Invalid allow_redirects pattern rejected",
+            r#"
+[[rules]]
+method = "GET"
+url = "https://example.com/*"
+allow_redirects = ["not a url"]
+"#,
+            Some("allow_redirects pattern"),
+        );
+    }
+
+    #[test]
+    fn test_redirect_whitelist_ttl_default() {
+        let t = test_report!("redirect_whitelist_ttl_secs defaults to 60");
+        let config = Config::parse("").unwrap();
+        t.assert_eq(
+            "ttl default",
+            &config.proxy.redirect_whitelist_ttl_secs,
+            &60u64,
+        );
+    }
+
+    #[test]
+    fn test_redirect_whitelist_ttl_override() {
+        let t = test_report!("redirect_whitelist_ttl_secs can be overridden in config");
+        let toml = r#"
+[proxy]
+redirect_whitelist_ttl_secs = 120
+"#;
+        let config = Config::parse(toml).unwrap();
+        t.assert_eq(
+            "ttl override",
+            &config.proxy.redirect_whitelist_ttl_secs,
+            &120u64,
+        );
     }
 }
