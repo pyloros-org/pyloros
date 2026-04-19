@@ -40,6 +40,10 @@ enum Commands {
         #[arg(long)]
         direct_https_bind: Option<String>,
 
+        /// Direct HTTP listener bind address (optional, enables Host-header-based direct plain-HTTP mode)
+        #[arg(long)]
+        direct_http_bind: Option<String>,
+
         /// Auto-generate CA certificate at configured paths if files don't exist
         #[arg(long)]
         auto_generate_ca: bool,
@@ -96,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca_key,
             bind,
             direct_https_bind,
+            direct_http_bind,
             auto_generate_ca,
             log_level,
         } => {
@@ -130,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(addr) = direct_https_bind {
                 cfg.proxy.direct_https_bind = Some(addr);
+            }
+            if let Some(addr) = direct_http_bind {
+                cfg.proxy.direct_http_bind = Some(addr);
             }
 
             // Validate CA cert/key paths are specified
