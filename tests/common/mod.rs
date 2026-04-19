@@ -471,6 +471,9 @@ impl TestProxy {
         }
         config.logging.log_allowed_requests = false;
         config.logging.log_blocked_requests = false;
+        if let Some(size) = builder.max_body_log_size {
+            config.logging.max_body_log_size = size;
+        }
 
         let client_tls = builder.ca.client_tls_config();
 
@@ -520,6 +523,7 @@ impl TestProxy {
             audit_log: None,
             permissive: false,
             redirect_whitelist_ttl_secs: None,
+            max_body_log_size: None,
             report: None,
         }
     }
@@ -535,6 +539,7 @@ pub struct TestProxyBuilder<'a> {
     audit_log: Option<String>,
     permissive: bool,
     redirect_whitelist_ttl_secs: Option<u64>,
+    max_body_log_size: Option<usize>,
     report: Option<&'a TestReport>,
 }
 
@@ -566,6 +571,11 @@ impl<'a> TestProxyBuilder<'a> {
 
     pub fn redirect_whitelist_ttl_secs(mut self, secs: u64) -> Self {
         self.redirect_whitelist_ttl_secs = Some(secs);
+        self
+    }
+
+    pub fn max_body_log_size(mut self, size: usize) -> Self {
+        self.max_body_log_size = Some(size);
         self
     }
 
@@ -770,6 +780,7 @@ pub fn rule(method: &str, url: &str) -> pyloros::config::Rule {
         git: None,
         branches: None,
         allow_redirects: Vec::new(),
+        log_body: false,
     }
 }
 
@@ -781,6 +792,19 @@ pub fn rule_with_redirects(method: &str, url: &str, redirects: &[&str]) -> pylor
         git: None,
         branches: None,
         allow_redirects: redirects.iter().map(|s| s.to_string()).collect(),
+        log_body: false,
+    }
+}
+
+pub fn rule_with_body_log(method: &str, url: &str) -> pyloros::config::Rule {
+    pyloros::config::Rule {
+        method: Some(method.to_string()),
+        url: url.to_string(),
+        websocket: false,
+        git: None,
+        branches: None,
+        allow_redirects: Vec::new(),
+        log_body: true,
     }
 }
 
@@ -792,6 +816,7 @@ pub fn ws_rule(url: &str) -> pyloros::config::Rule {
         git: None,
         branches: None,
         allow_redirects: Vec::new(),
+        log_body: false,
     }
 }
 
@@ -803,6 +828,7 @@ pub fn git_rule(git_op: &str, url: &str) -> pyloros::config::Rule {
         git: Some(git_op.to_string()),
         branches: None,
         allow_redirects: Vec::new(),
+        log_body: false,
     }
 }
 
@@ -814,6 +840,7 @@ pub fn git_rule_with_branches(git_op: &str, url: &str, branches: &[&str]) -> pyl
         git: Some(git_op.to_string()),
         branches: Some(branches.iter().map(|b| b.to_string()).collect()),
         allow_redirects: Vec::new(),
+        log_body: false,
     }
 }
 

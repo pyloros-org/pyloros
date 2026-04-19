@@ -67,6 +67,36 @@ pub struct AuditEntry {
     pub credential: Option<AuditCredential>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<AuditGitInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body_encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body_encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_truncated: Option<bool>,
+}
+
+/// Encode a body for inclusion in an audit entry.
+///
+/// Returns `(encoded_body, encoding, truncated)` where encoding is `None`
+/// for valid UTF-8 or `Some("base64")` for binary data.
+pub fn encode_body(bytes: &[u8], max_size: usize) -> (String, Option<String>, bool) {
+    let truncated = bytes.len() > max_size;
+    let slice = if truncated { &bytes[..max_size] } else { bytes };
+    match std::str::from_utf8(slice) {
+        Ok(s) => (s.to_string(), None, truncated),
+        Err(_) => {
+            use base64::Engine;
+            (
+                base64::engine::general_purpose::STANDARD.encode(slice),
+                Some("base64".to_string()),
+                truncated,
+            )
+        }
+    }
 }
 
 /// Returns the current UTC time as an ISO 8601 / RFC 3339 string.
@@ -144,6 +174,11 @@ mod tests {
             reason: AuditReason::RuleMatched,
             credential: None,
             git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_contains("has event", &json, "\"event\":\"request_allowed\"");
@@ -169,6 +204,11 @@ mod tests {
             reason: AuditReason::NoMatchingRule,
             credential: None,
             git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_true("no credential field", !json.contains("\"credential\""));
@@ -195,6 +235,11 @@ mod tests {
             git: Some(AuditGitInfo {
                 blocked_refs: vec!["refs/heads/main".to_string()],
             }),
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -284,6 +329,11 @@ mod tests {
             reason: AuditReason::RuleMatched,
             credential: None,
             git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         };
         logger.log(&entry);
 

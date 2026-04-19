@@ -200,6 +200,9 @@ pub struct LoggingConfig {
 
     /// Optional path to structured JSONL audit log file
     pub audit_log: Option<String>,
+
+    /// Maximum bytes to capture per body for log_body rules (default 1 MB)
+    pub max_body_log_size: usize,
 }
 
 impl Default for LoggingConfig {
@@ -209,6 +212,7 @@ impl Default for LoggingConfig {
             log_allowed_requests: true,
             log_blocked_requests: true,
             audit_log: None,
+            max_body_log_size: 1_048_576,
         }
     }
 }
@@ -239,6 +243,12 @@ struct LoggingConfigRaw {
     log_requests: Option<LogRequestsValue>,
     #[serde(default)]
     audit_log: Option<String>,
+    #[serde(default = "default_max_body_log_size")]
+    max_body_log_size: usize,
+}
+
+fn default_max_body_log_size() -> usize {
+    1_048_576
 }
 
 fn default_log_level() -> String {
@@ -261,6 +271,7 @@ impl<'de> Deserialize<'de> for LoggingConfig {
             log_allowed_requests: log_allowed,
             log_blocked_requests: log_blocked,
             audit_log: raw.audit_log,
+            max_body_log_size: raw.max_body_log_size,
         })
     }
 }
@@ -292,6 +303,10 @@ pub struct Rule {
     /// Use `["*"]` to accept any redirect target. Empty/omitted = redirects not followed.
     #[serde(default)]
     pub allow_redirects: Vec<String>,
+
+    /// Log request and response bodies in the audit log when this rule matches.
+    #[serde(default)]
+    pub log_body: bool,
 }
 
 impl Config {

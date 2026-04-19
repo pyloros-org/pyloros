@@ -219,16 +219,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("  export HTTPS_PROXY=http://{}", server.bind_address());
             }
 
-            // Handle SIGINT (Ctrl+C) and SIGTERM
+            // Handle SIGINT (Ctrl+C) and SIGTERM.
+            // Use tokio::signal::unix::signal() for both — it installs the handler
+            // eagerly at construction time, avoiding a race where the default handler
+            // fires before the async select loop is polled.
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            #[cfg(unix)]
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("failed to install SIGINT handler");
+            #[cfg(unix)]
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
             tokio::spawn(async move {
                 #[cfg(unix)]
                 {
-                    let mut sigterm =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .expect("failed to install SIGTERM handler");
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {},
+                        _ = sigint.recv() => {},
                         _ = sigterm.recv() => {},
                     }
                 }

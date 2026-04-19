@@ -36,6 +36,7 @@ pub struct TunnelHandler {
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
     logger: RequestLogger,
+    max_body_log_size: usize,
 }
 
 impl TunnelHandler {
@@ -54,6 +55,7 @@ impl TunnelHandler {
             upstream_host_override: None,
             upstream_tls_config: None,
             logger: RequestLogger::new(),
+            max_body_log_size: 1_048_576,
         }
     }
 
@@ -91,6 +93,12 @@ impl TunnelHandler {
     /// Enable permissive mode (allow unmatched requests through with logging).
     pub fn with_permissive(mut self, permissive: bool) -> Self {
         self.logger = self.logger.with_permissive(permissive);
+        self
+    }
+
+    /// Set the maximum body size for body logging.
+    pub fn with_max_body_log_size(mut self, size: usize) -> Self {
+        self.max_body_log_size = size;
         self
     }
 
@@ -249,7 +257,10 @@ impl TunnelHandler {
                 }
                 None
             }
-            FilterResult::AllowedWithBranchCheck(ref filter) => {
+            FilterResult::AllowedWithBranchCheck {
+                ref filter,
+                log_body,
+            } => {
                 if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
@@ -295,6 +306,11 @@ impl TunnelHandler {
                         git: Some(AuditGitInfo {
                             blocked_refs: blocked.clone(),
                         }),
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
                 }
@@ -304,7 +320,6 @@ impl TunnelHandler {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
-                self.logger.log_allowed(&allowed_ctx);
 
                 // Inject credentials (body already buffered)
                 self.credential_engine.inject_with_body(
@@ -314,11 +329,30 @@ impl TunnelHandler {
                 );
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
+                if log_body {
+                    return self
+                        .forward_buffered_with_body_log(
+                            parts,
+                            body_bytes,
+                            host,
+                            port,
+                            &method,
+                            &full_url,
+                            &allowed_ctx,
+                            rp,
+                        )
+                        .await;
+                }
+
+                self.logger.log_allowed(&allowed_ctx);
                 return self
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
             }
-            FilterResult::AllowedWithLfsCheck(ref allowed_ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                ref allowed_ops,
+                log_body,
+            } => {
                 if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
@@ -359,6 +393,11 @@ impl TunnelHandler {
                         reason: AuditReason::LfsOperationNotAllowed,
                         credential: None,
                         git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(blocked_response(&method, &full_url));
                 }
@@ -368,20 +407,68 @@ impl TunnelHandler {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
-                self.logger.log_allowed(&allowed_ctx);
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
+                if log_body {
+                    return self
+                        .forward_buffered_with_body_log(
+                            parts,
+                            body_bytes,
+                            host,
+                            port,
+                            &method,
+                            &full_url,
+                            &allowed_ctx,
+                            rp,
+                        )
+                        .await;
+                }
+
+                self.logger.log_allowed(&allowed_ctx);
                 return self
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
             }
-            FilterResult::Allowed => {
+            FilterResult::Allowed { log_body } => {
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
+                let rp = self.filter_engine.redirect_policy_for(&request_info);
+
+                if log_body && !is_websocket {
+                    // Body logging: buffer request, forward, capture response
+                    let (mut parts, body) = req.into_parts();
+                    let body_bytes = body
+                        .collect()
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "Failed to buffer request body for body logging");
+                            e
+                        })?
+                        .to_bytes();
+                    super::strip_hop_by_hop_headers(&mut parts.headers);
+                    self.credential_engine.inject_with_body(
+                        &request_info,
+                        &mut parts.headers,
+                        &body_bytes,
+                    );
+                    return self
+                        .forward_buffered_with_body_log(
+                            parts,
+                            body_bytes,
+                            host,
+                            port,
+                            &method,
+                            &full_url,
+                            &allowed_ctx,
+                            rp,
+                        )
+                        .await;
+                }
+
                 self.logger.log_allowed(&allowed_ctx);
-                self.filter_engine.redirect_policy_for(&request_info)
+                rp
             }
             FilterResult::AllowedByRedirect { origin_patterns } => {
                 let allowed_ctx = RequestContext {
@@ -487,6 +574,72 @@ impl TunnelHandler {
                 Ok(error_response(&e.to_string()))
             }
         }
+    }
+
+    /// Emit a body-logging audit entry with captured request and response bodies.
+    fn emit_body_audit(&self, ctx: &RequestContext<'_>, req_body: &[u8], resp_body: &[u8]) {
+        let max = self.max_body_log_size;
+        let (req_str, req_enc, req_trunc) = crate::audit::encode_body(req_body, max);
+        let (resp_str, resp_enc, resp_trunc) = crate::audit::encode_body(resp_body, max);
+        let truncated = req_trunc || resp_trunc;
+        self.logger.emit_audit(AuditEntry {
+            timestamp: crate::audit::now_iso8601(),
+            event: AuditEvent::RequestAllowed,
+            method: ctx.method.to_string(),
+            url: ctx.url.to_string(),
+            host: ctx.host.to_string(),
+            scheme: ctx.scheme.to_string(),
+            protocol: ctx.protocol.to_string(),
+            decision: AuditDecision::Allowed,
+            reason: AuditReason::RuleMatched,
+            credential: ctx.credential.clone(),
+            git: None,
+            request_body: Some(req_str),
+            request_body_encoding: req_enc,
+            response_body: Some(resp_str),
+            response_body_encoding: resp_enc,
+            body_truncated: if truncated { Some(true) } else { None },
+        });
+    }
+
+    /// Forward a buffered request and capture the response body for body logging.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_buffered_with_body_log(
+        &self,
+        parts: hyper::http::request::Parts,
+        body_bytes: Bytes,
+        host: &str,
+        port: u16,
+        method: &str,
+        full_url: &str,
+        ctx: &RequestContext<'_>,
+        redirect_patterns: Option<Arc<Vec<UrlPattern>>>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        let req_body_snapshot = body_bytes.clone();
+        let resp = self
+            .forward_buffered(
+                parts,
+                body_bytes,
+                host,
+                port,
+                method,
+                full_url,
+                redirect_patterns,
+            )
+            .await?;
+
+        // Collect the response body for logging, then reconstruct the response
+        let (resp_parts, resp_body) = resp.into_parts();
+        let resp_body_bytes = resp_body
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+
+        self.emit_body_audit(ctx, &req_body_snapshot, &resp_body_bytes);
+
+        let new_body = Full::new(resp_body_bytes).map_err(|e| match e {}).boxed();
+        Ok(Response::from_parts(resp_parts, new_body))
     }
 
     /// Rebuild a buffered request for upstream and forward it.

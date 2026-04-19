@@ -4,11 +4,17 @@
 # Architecture:
 #
 #   external network (bridge) ─── proxy ─── Internet
-#                                   │
-#   internal network (--internal) ── sandbox
+#                                   │ :8080 (HTTP CONNECT proxy)
+#                                   │ :443  (direct HTTPS / SNI interception)
+#   internal network (--internal) ──┤
+#                                   ├── dns (dnsmasq: * → proxy IP)
+#                                   └── sandbox (HTTP_PROXY + DNS → proxy)
 #
-# The sandbox container has NO direct internet access; all traffic must go
-# through the proxy's allowlist rules.
+# The sandbox has NO direct internet access. Two interception modes coexist:
+#   - Explicit proxy:  HTTP_PROXY / HTTPS_PROXY env vars point at proxy:8080.
+#   - Direct HTTPS:    the dns service resolves every hostname to the proxy's
+#                      IP, so clients that don't honor HTTP_PROXY (or that
+#                      are run with --noproxy '*') still hit the proxy on :443.
 #
 # Prerequisites:
 #   1. Generate a CA:  pyloros generate-ca --out ./certs/
@@ -30,6 +36,13 @@
 #
 #   # Tear down
 #   docker compose -f examples/docker-compose/compose.yaml down
+#
+# Running multiple instances on one host:
+#   Docker refuses overlapping subnets, so override the defaults per-instance:
+#     export PYLOROS_SUBNET=172.31.0.0/24
+#     export PYLOROS_PROXY_IP=172.31.0.254
+#     export PYLOROS_DNS_IP=172.31.0.253
+#   All three must be consistent (IPs inside the subnet).
 
 services:
   proxy:
@@ -48,9 +61,12 @@ services:
       - /etc/pyloros/ca.key
       - --bind
       - "0.0.0.0:8080"
+      - --direct-https-bind
+      - "0.0.0.0:443"
     networks:
-      - external
-      - internal
+      external:
+      internal:
+        ipv4_address: ${PYLOROS_PROXY_IP:-172.30.0.254}
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "8080"]
       interval: 2s
@@ -58,12 +74,32 @@ services:
       retries: 15
       start_period: 5s
 
+  dns:
+    # Tiny wildcard DNS: every hostname resolves to the proxy's internal IP.
+    # Built from dns/Dockerfile (dnsmasq baked in) so the running container
+    # does not need internet access — only the build does.
+    build: ./dns
+    command: ["--address=/#/${PYLOROS_PROXY_IP:-172.30.0.254}"]
+    networks:
+      internal:
+        ipv4_address: ${PYLOROS_DNS_IP:-172.30.0.253}
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "1", "127.0.0.1", "53"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
   sandbox:
     image: ${SANDBOX_IMAGE:-alpine:latest}
     command: sleep infinity
     depends_on:
       proxy:
         condition: service_healthy
+      dns:
+        condition: service_healthy
+    dns:
+      - ${PYLOROS_DNS_IP:-172.30.0.253}
     environment:
       - HTTP_PROXY=http://proxy:8080
       - HTTPS_PROXY=http://proxy:8080
@@ -85,3 +121,6 @@ networks:
     driver: bridge
   internal:
     internal: true
+    ipam:
+      config:
+        - subnet: ${PYLOROS_SUBNET:-172.30.0.0/24}
