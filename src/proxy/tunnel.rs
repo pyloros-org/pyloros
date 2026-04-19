@@ -302,6 +302,11 @@ impl TunnelHandler {
                             git: Some(AuditGitInfo {
                                 blocked_refs: protected_blocked.clone(),
                             }),
+                            request_body: None,
+                            request_body_encoding: None,
+                            response_body: None,
+                            response_body_encoding: None,
+                            body_truncated: None,
                         });
                         return Ok(git_force_push_blocked_response(
                             &body_bytes,

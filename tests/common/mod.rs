@@ -825,6 +825,7 @@ pub fn git_rule_with_protected(
             Some(branches.iter().map(|b| b.to_string()).collect())
         },
         protected_branches: Some(protected.iter().map(|p| p.to_string()).collect()),
+        log_body: false,
     }
 }
 
