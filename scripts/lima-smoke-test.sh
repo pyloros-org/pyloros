@@ -122,23 +122,10 @@ probe "blocked-by-pyloros example.org" '^451$' \
   'curl -sS -o /dev/null -w "%{http_code}" https://example.org/'
 
 # Bypass attempt: connect directly to 1.1.1.1 with proxy env unset.
-# This probe is CURRENTLY EXPECTED TO FAIL — see the "Known limitation"
-# section in examples/lima/README.md. When the egress-hardening follow-up
-# lands, this should start passing and the x-fail wrapper can be removed.
-xfail_probe() {
-  local name="$1" expected_re="$2"; shift 2
-  local out rc=0
-  out=$(limactl shell sandbox -- bash -c "$*" 2>&1 | grep -v "^bash: line 1: cd: ") || rc=$?
-  if [[ "$out" =~ $expected_re ]]; then
-    printf '  ok    %-34s :: (no longer x-failing — drop the wrapper)\n' "$name"
-    pass=$((pass+1))
-  else
-    printf '  xfail %-34s :: %s\n' "$name" "known leak; see README"
-    # do NOT increment fail — this is expected until the netns-or-uid fix lands
-  fi
-}
-xfail_probe "bypass-attempt 1.1.1.1 direct" \
-  '(Failed to connect|timed out|Connection refused|No route to host|Network is unreachable)' \
+# Should fail: host iptables REJECTs outbound from the nat uid to anything
+# that isn't pyloros, so the usernet daemon's net.Dial to 1.1.1.1 errors.
+probe "bypass-attempt 1.1.1.1 direct" \
+  '(Failed to connect|timed out|Connection refused|No route to host|Network is unreachable|recv failure)' \
   'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl --noproxy "*" --max-time 4 -v https://1.1.1.1/ 2>&1'
 
 echo

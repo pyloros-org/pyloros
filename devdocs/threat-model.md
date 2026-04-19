@@ -63,28 +63,21 @@ isolation.
 ### 3. VM sandbox (`examples/lima/`)
 
 Sandbox VM whose network is a user-v2 network hosted by a Lima usernet
-daemon. The *intended* isolation is that the daemon runs in a netns with
-only a veth to pyloros on the host; the VM's root cannot affect host
-routing, so it cannot reach the internet except via pyloros.
-
-**Current state (as of initial commit): the architecture is scaffolded
-but the netns boundary has a known gap.** Putting the usernet daemon in
-a netns breaks Lima's SSH port forwarding, so the committed example runs
-the daemon in the host netns for now. That reopens the bypass vector.
-See the "Known limitation" section in `examples/lima/README.md` for the
-two candidate fixes (uid-match iptables on the host, or keep the netns
-plus a manual SSH forwarder). Until that's resolved, layer 3 gives you
-what layer 2 gives you plus defense-in-depth against container-escape
-CVEs — *not* full topology-level egress enforcement.
+daemon. The daemon runs as a dedicated uid (`pyloros-nat`), and a host
+iptables `OUTPUT ... -m owner --uid-owner pyloros-nat ! -d 10.99.0.1
+! -o lo -j REJECT` rule caps the daemon's egress at the kernel level.
+The VM's root cannot affect that rule — it lives in the host netns,
+which the VM has no access to. See `examples/lima/README.md` for the
+working setup.
 
   - Holds against: everything the container layer does, plus
-    container-escape CVEs.
-  - Does *not* yet hold against: a VM process that ignores
-    `HTTP_PROXY` and connects to a hardcoded external IP. The host
-    kernel will happily forward those packets until the uid-match /
-    netns fix lands.
+    container-escape CVEs (the VM boundary absorbs those), plus an
+    in-VM process that ignores `HTTP_PROXY` and tries to reach a
+    hardcoded external IP — the daemon's `dial()` returns
+    `ECONNREFUSED` from the host iptables reject.
   - Does *not* hold against a VM escape (CVE-class bugs in qemu/KVM)
-    or anyone with shell on the host.
+    or anyone with shell on the host: that person can edit iptables,
+    run as a different uid, or steal the pyloros CA key.
 
 ## Vectors that pyloros *does* block
 

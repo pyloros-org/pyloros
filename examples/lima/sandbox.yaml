@@ -42,11 +42,8 @@ images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
     arch: "x86_64"
 
-# Uses Lima's default user-mode network. The committed example does NOT
-# enforce egress isolation — see the "Known limitation" section in
-# examples/lima/README.md. A future version will either switch to a
-# custom user-v2 network hosted in a netns, or use host-side iptables
-# uid-matching to constrain the Lima usernet daemon.
+networks:
+  - lima: pyloros-internal
 
 # Disable Lima's hostResolver so our provision-script resolv.conf wins.
 hostResolver:

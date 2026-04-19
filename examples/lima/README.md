@@ -38,49 +38,41 @@ learn* about another IP, and even if it tried one, the netns has no route.
 
 ## Status
 
-**Work in progress.** Verified on Linux (Lima v2.1.1, qemu driver, Ubuntu
-24.04 guest, nested KVM): allowlist and blocklist behaviour both work.
-The bypass-resistance guarantee — a key part of the design — has a known
-gap described below; fixing it is tracked as follow-up work.
+Verified on Linux (Lima v2.1.1, qemu driver, Ubuntu 24.04 guest, nested
+KVM). All three smoke-test probes pass:
 
-macOS / vz would use `socket_vmnet` in `mode: host` instead of the netns
-machinery, and is not implemented here.
+- `curl https://api.github.com/zen` (rule-allowed) → 200
+- `curl https://example.org/` (not allowlisted) → 451 from pyloros
+- `curl --noproxy '*' https://1.1.1.1/` with proxy env unset → `Connection refused`
 
-## Known limitation — topology isolation is not yet complete
+The bypass probe is the load-bearing one: it proves that a process inside
+the VM can't escape to the internet by hardcoding an IP and skipping
+`HTTP_PROXY`. Enforcement is kernel-level and uses no iptables inside
+the sandbox.
 
-The intent of this example is that packets from the sandbox VM cannot
-reach the internet except via pyloros, enforced by the host kernel rather
-than anything the VM can tamper with. In practice:
+macOS / vz would use `socket_vmnet` in `mode: host` instead of the
+uid-match machinery below, and is not implemented here yet.
 
-- Putting Lima's `usernet` daemon in a netns (as `run-host.sh` does)
-  breaks Lima's port-forwarding: `limactl shell sandbox` reaches the
-  guest by connecting to `127.0.0.1:<ssh-port>` on the host netns, where
-  the daemon's listener isn't visible.
-- Running the daemon in the host netns (the obvious alternative) restores
-  `limactl shell` but removes the netns boundary — packets from the VM
-  then traverse the host's normal routing, so the bypass probe
-  (`curl --noproxy '*' https://1.1.1.1/` with proxy env unset)
-  **succeeds** and reaches the real internet.
+## How enforcement works (Path A — uid-match iptables)
 
-Either mechanism alone isn't enough. Two candidate fixes that both keep
-kernel-level enforcement:
+The Lima usernet daemon is what translates the sandbox VM's virtual NIC
+traffic into host-kernel `net.Dial()` calls. We run that daemon as a
+dedicated system user (`pyloros-nat`) and add a host iptables rule:
 
-1. **uid-match iptables on the host.** Run the daemon as a dedicated uid
-   and add an `iptables OUTPUT -m owner --uid-owner <daemon-uid> ! -d
-   10.99.0.1 -j REJECT` rule. Daemon lives in host netns so SSH port
-   forward works; kernel still refuses non-proxy egress. This is our
-   preferred follow-up — iptables-on-host is not something VM root can
-   revert, unlike iptables-in-sandbox.
+```
+iptables -I OUTPUT -m owner --uid-owner pyloros-nat \
+  ! -d 10.99.0.1 ! -o lo -j REJECT
+```
 
-2. **Daemon in netns + manual SSH forwarder.** Keep the netns boundary
-   and also run a small `socat` bridge from `host:127.0.0.1:<ssh-port>`
-   into the netns. More moving parts but preserves the "daemon has no
-   host netns access at all" property.
+Anything that uid tries to send outbound that *isn't* a packet to
+`10.99.0.1` (pyloros/dnsmasq) or via loopback (for Lima's own SSH
+port-forward) gets rejected by the kernel before leaving the box. The VM
+has no way to change that rule — it lives in the host netns, which the
+VM's root has no access to.
 
-For the moment the example demonstrates the *architecture* (one pyloros
-on the host, dnsmasq wildcard, one sandbox VM, CA trust, no in-guest
-firewall), and the allowed/blocked paths work as intended. The bypass
-hardening is a TODO captured here and in `devdocs/threat-model.md`.
+The daemon still runs in the host netns so Lima's `limactl shell` SSH
+port-forward keeps working (it needs to listen on `127.0.0.1:<port>` in
+the host netns, reachable from the Lima hostagent).
 
 ## Prereqs
 
@@ -90,8 +82,20 @@ hardening is a TODO captured here and in `devdocs/threat-model.md`.
 - `dnsmasq`
 - A pyloros release build (`cargo build --release`)
 - A CA pair (`./target/release/pyloros generate-ca --out ./certs/`)
-- Passwordless `sudo` for `ip netns`, `ip link`, and `dnsmasq`
-  (or accept entering a password when `run-host.sh` starts)
+- A system user `pyloros-nat` that runs the Lima usernet daemon:
+  ```bash
+  sudo useradd --system --shell /usr/sbin/nologin pyloros-nat
+  sudo usermod -aG zyla pyloros-nat    # traversal into ~/.lima
+  ```
+- `limactl` reachable on a path `pyloros-nat` can execute (typically
+  `/usr/local/bin/limactl`; copy from your user install if needed):
+  ```bash
+  sudo install -m 755 "$(command -v limactl)" /usr/local/bin/limactl
+  sudo cp -r "$(dirname $(command -v limactl))/../share/lima" /usr/local/share/
+  ```
+- Passwordless `sudo` for `ip`, `iptables`, `dnsmasq`, `chmod`, `usermod`,
+  `setcap`, and `sudo -u pyloros-nat` (or accept the password prompt at
+  `run-host.sh` startup)
 
 Register the lima network once:
 
