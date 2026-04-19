@@ -200,6 +200,85 @@ impl TunnelHandler {
         }
     }
 
+    /// Serve plain-HTTP requests on a direct-HTTP listener.
+    ///
+    /// Clients send origin-form requests (`GET /path HTTP/1.1` + `Host:` header).
+    /// Reuses `ProxyHandler::handle_http` by rewriting the request URI from
+    /// origin-form to absolute-form (`http://host:port/path`) — after that, the
+    /// request is indistinguishable from one sent to the explicit-proxy listener,
+    /// so filter / audit / body-inspection-blocking / redirect-whitelisting are
+    /// all shared.
+    pub async fn serve_direct_http<S>(self: &Arc<Self>, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let self_arc = Arc::clone(self);
+
+        let service = service_fn(move |mut req: Request<Incoming>| {
+            let self_arc = Arc::clone(&self_arc);
+            async move {
+                // Rewrite origin-form URI to absolute-form using the Host header.
+                let host_header = req
+                    .headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let authority = match host_header {
+                    Some(h) => h,
+                    None => {
+                        tracing::warn!("Direct HTTP: missing or invalid Host header");
+                        return Ok(error_response("missing Host header"));
+                    }
+                };
+                let path_and_query = req
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/");
+                let new_uri =
+                    match format!("http://{}{}", authority, path_and_query).parse::<hyper::Uri>() {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Direct HTTP: invalid request URI");
+                            return Ok(error_response("invalid request URI"));
+                        }
+                    };
+                *req.uri_mut() = new_uri;
+
+                // Reuse the plain-HTTP handler used by the explicit proxy listener.
+                // Auth is intentionally None: direct-HTTP clients connect to what they
+                // think is the origin server, so Proxy-Authorization is not expected.
+                let handler = super::handler::ProxyHandler::new(
+                    Arc::clone(&self_arc),
+                    self_arc.filter_engine.clone(),
+                    self_arc.redirect_whitelist.clone(),
+                )
+                .with_request_logging(
+                    self_arc.logger.log_allowed_requests,
+                    self_arc.logger.log_blocked_requests,
+                )
+                .with_audit_logger(self_arc.logger.audit_logger.clone())
+                .with_permissive(self_arc.logger.permissive)
+                .with_max_body_log_size(self_arc.max_body_log_size);
+                handler.handle(req).await
+            }
+        });
+
+        let io = TokioIo::new(stream);
+        if let Err(e) = hyper::server::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(io, service)
+            .with_upgrades()
+            .await
+        {
+            let err_str = e.to_string();
+            if !err_str.contains("connection closed") && !err_str.contains("early eof") {
+                tracing::debug!("Direct HTTP service error: {}", e);
+            }
+        }
+    }
+
     /// Handle a request that came through the MITM tunnel or direct HTTPS listener.
     pub async fn handle_tunneled_request(
         &self,

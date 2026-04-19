@@ -6,15 +6,18 @@
 #   external network (bridge) ─── proxy ─── Internet
 #                                   │ :8080 (HTTP CONNECT proxy)
 #                                   │ :443  (direct HTTPS / SNI interception)
+#                                   │ :80   (direct HTTP / Host-header interception)
 #   internal network (--internal) ──┤
 #                                   ├── dns (dnsmasq: * → proxy IP)
 #                                   └── sandbox (HTTP_PROXY + DNS → proxy)
 #
-# The sandbox has NO direct internet access. Two interception modes coexist:
+# The sandbox has NO direct internet access. Three interception modes coexist:
 #   - Explicit proxy:  HTTP_PROXY / HTTPS_PROXY env vars point at proxy:8080.
 #   - Direct HTTPS:    the dns service resolves every hostname to the proxy's
 #                      IP, so clients that don't honor HTTP_PROXY (or that
 #                      are run with --noproxy '*') still hit the proxy on :443.
+#   - Direct HTTP:     the same wildcard DNS lands plain-http requests (e.g.
+#                      apt/dnf to http:// mirrors) on the proxy on :80.
 #
 # Prerequisites:
 #   1. Generate a CA:  pyloros generate-ca --out ./certs/
@@ -63,6 +66,8 @@ services:
       - "0.0.0.0:8080"
       - --direct-https-bind
       - "0.0.0.0:443"
+      - --direct-http-bind
+      - "0.0.0.0:80"
     networks:
       external:
       internal:

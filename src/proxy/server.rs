@@ -74,6 +74,8 @@ pub struct ProxyServer {
     listener: Option<BoundListener>,
     /// Optional direct HTTPS listener (accepts raw TLS, uses SNI for routing).
     direct_https_listener: Option<BoundListener>,
+    /// Optional direct HTTP listener (accepts plain HTTP, uses Host header for routing).
+    direct_http_listener: Option<BoundListener>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -136,6 +138,7 @@ impl ProxyServer {
             audit_logger: None,
             listener: None,
             direct_https_listener: None,
+            direct_http_listener: None,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -167,6 +170,7 @@ impl ProxyServer {
             audit_logger: None,
             listener: None,
             direct_https_listener: None,
+            direct_http_listener: None,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -239,6 +243,12 @@ impl ProxyServer {
             tracing::info!(address = %direct_addr, "Direct HTTPS listener active");
         }
 
+        // Bind direct HTTP listener if configured
+        if let Some(ref addr) = self.config.proxy.direct_http_bind.clone() {
+            let direct_addr = self.bind_direct_http(addr).await?;
+            tracing::info!(address = %direct_addr, "Direct HTTP listener active");
+        }
+
         self.serve(shutdown).await
     }
 
@@ -258,6 +268,14 @@ impl ProxyServer {
     pub async fn bind_direct_https(&mut self, bind_address: &str) -> Result<ListenAddress> {
         let (listener, addr) = bind_listener(bind_address).await?;
         self.direct_https_listener = Some(listener);
+        Ok(addr)
+    }
+
+    /// Bind the direct HTTP listener to the given address.
+    /// The address can be a TCP socket address or a Unix socket path (containing '/').
+    pub async fn bind_direct_http(&mut self, bind_address: &str) -> Result<ListenAddress> {
+        let (listener, addr) = bind_listener(bind_address).await?;
+        self.direct_http_listener = Some(listener);
         Ok(addr)
     }
 
@@ -284,6 +302,11 @@ impl ProxyServer {
                 tls_acceptor,
                 tunnel_handler_rx.clone(),
             );
+        }
+
+        // Spawn direct HTTP listener if bound (shares the watch receiver)
+        if let Some(direct_listener) = self.direct_http_listener.take() {
+            spawn_direct_http_accept_loop(direct_listener, tunnel_handler_rx.clone());
         }
 
         // Set up reload channel. We always create one so the select! branch blocks.
@@ -391,6 +414,9 @@ impl ProxyServer {
         }
         if new_config.proxy.direct_https_bind != self.config.proxy.direct_https_bind {
             tracing::warn!("direct_https_bind changed but requires restart to take effect");
+        }
+        if new_config.proxy.direct_http_bind != self.config.proxy.direct_http_bind {
+            tracing::warn!("direct_http_bind changed but requires restart to take effect");
         }
 
         // Compile new filter engine
@@ -663,6 +689,45 @@ impl DirectAccept for UnixListener {
     async fn accept_conn(&self) -> std::io::Result<(Self::Stream, String)> {
         let (stream, _addr) = self.accept().await?;
         Ok((stream, "unix".to_string()))
+    }
+}
+
+/// Spawn the direct HTTP accept loop as a background task.
+fn spawn_direct_http_accept_loop(
+    listener: BoundListener,
+    tunnel_handler_rx: tokio::sync::watch::Receiver<Arc<TunnelHandler>>,
+) {
+    match listener {
+        BoundListener::Tcp(tcp_listener) => {
+            tokio::spawn(accept_loop_direct_http(tcp_listener, tunnel_handler_rx));
+        }
+        #[cfg(unix)]
+        BoundListener::Unix(unix_listener) => {
+            tokio::spawn(accept_loop_direct_http(unix_listener, tunnel_handler_rx));
+        }
+    }
+}
+
+/// Generic accept loop for the direct HTTP listener (works for both TCP and Unix).
+async fn accept_loop_direct_http<L>(
+    listener: L,
+    tunnel_handler_rx: tokio::sync::watch::Receiver<Arc<TunnelHandler>>,
+) where
+    L: DirectAccept,
+{
+    loop {
+        let (stream, client_addr) = match listener.accept_conn().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = %e, "Direct HTTP: failed to accept connection");
+                continue;
+            }
+        };
+        tracing::debug!(client = %client_addr, "Direct HTTP: new connection");
+        let handler = tunnel_handler_rx.borrow().clone();
+        tokio::spawn(async move {
+            handler.serve_direct_http(stream).await;
+        });
     }
 }
 
