@@ -5,16 +5,18 @@ mod common;
 use common::*;
 use pyloros::config::Rule;
 use pyloros::{Config, ProxyServer};
-use std::net::SocketAddr;
 use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
 
-/// Start a proxy with both the regular proxy listener and a direct-HTTP listener,
-/// forwarding all upstream connections to `upstream_port` on 127.0.0.1.
+/// Start a proxy with both the regular proxy listener and a direct-HTTP listener
+/// bound on 127.0.0.1. Returns the direct-HTTP address and a shutdown handle.
+///
+/// Direct-HTTP forwards to whatever the Host header says, so tests use `localhost`
+/// as the target hostname — it resolves to 127.0.0.1 on any system and lets a
+/// real wiremock server act as the upstream without any host-override plumbing.
 async fn start_proxy_with_direct_http(
     ca: &TestCa,
     rules: Vec<Rule>,
-    upstream_port: u16,
-) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let mut config = Config::minimal(
         "127.0.0.1:0".to_string(),
         ca.cert_path.clone(),
@@ -25,10 +27,6 @@ async fn start_proxy_with_direct_http(
     config.logging.log_blocked_requests = false;
 
     let mut server = ProxyServer::new(config).unwrap();
-    server = server
-        .with_upstream_port_override(upstream_port)
-        .with_upstream_host_override("127.0.0.1".to_string());
-
     let _proxy_addr = server.bind().await.unwrap().tcp_addr();
     let direct_addr = server
         .bind_direct_http("127.0.0.1:0")
@@ -44,6 +42,35 @@ async fn start_proxy_with_direct_http(
     (direct_addr, shutdown_tx)
 }
 
+/// Send a raw HTTP/1.1 request to the direct-HTTP listener. Using a raw TCP
+/// client is simpler than configuring reqwest to bypass proxy + DNS, and mirrors
+/// how `apt` or `wget` behave when wildcard DNS lands their plain-HTTP connection
+/// on the proxy.
+async fn raw_get(
+    direct_addr: std::net::SocketAddr,
+    host_header: &str,
+    path: &str,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(direct_addr).await.unwrap();
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, host_header
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status_line = text.lines().next().unwrap_or("");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
 #[tokio::test]
 async fn test_direct_http_allowed_request() {
     let t = test_report!("Direct HTTP: allowed request is proxied to upstream");
@@ -54,42 +81,27 @@ async fn test_direct_http_allowed_request() {
         .respond_with(ResponseTemplate::new(200).set_body_string("direct-http-ok"))
         .mount(&upstream)
         .await;
-    t.setup(format!(
-        "wiremock upstream on port {}",
-        upstream.address().port()
-    ));
+    let upstream_port = upstream.address().port();
+    t.setup(format!("wiremock upstream on localhost:{}", upstream_port));
 
-    let rules = vec![rule("*", "http://allowed.example.com/*")];
+    let rules = vec![rule("*", &format!("http://localhost:{}/*", upstream_port))];
 
-    let (direct_addr, shutdown_tx) =
-        start_proxy_with_direct_http(&ca, rules, upstream.address().port()).await;
+    let (direct_addr, shutdown_tx) = start_proxy_with_direct_http(&ca, rules).await;
 
     t.action(format!(
-        "Send plain HTTP GET directly to listener at {} with Host: allowed.example.com",
-        direct_addr
+        "Send raw plain HTTP GET to direct listener at {} with Host: localhost:{}",
+        direct_addr, upstream_port
     ));
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .resolve(
-            "allowed.example.com",
-            SocketAddr::new("127.0.0.1".parse().unwrap(), direct_addr.port()),
-        )
-        .build()
-        .unwrap();
+    let (status, body) = raw_get(
+        direct_addr,
+        &format!("localhost:{}", upstream_port),
+        "/hello",
+    )
+    .await;
 
-    let resp = client
-        .get(format!(
-            "http://allowed.example.com:{}/hello",
-            direct_addr.port()
-        ))
-        .send()
-        .await
-        .unwrap();
-
-    t.assert_eq("status", &resp.status().as_u16(), &200u16);
-    let body = resp.text().await.unwrap();
-    t.assert_eq("body", &body.as_str(), &"direct-http-ok");
+    t.assert_eq("status", &status, &200u16);
+    t.assert_contains("body", &body, "direct-http-ok");
 
     let _ = shutdown_tx.send(());
 }
@@ -104,36 +116,24 @@ async fn test_direct_http_blocked_request() {
         .respond_with(ResponseTemplate::new(200).set_body_string("should-not-reach"))
         .mount(&upstream)
         .await;
+    let upstream_port = upstream.address().port();
 
-    // Rule allows a different host
+    // Rule allows a different port/host pair
     let rules = vec![rule("*", "http://other.example.com/*")];
 
-    let (direct_addr, shutdown_tx) =
-        start_proxy_with_direct_http(&ca, rules, upstream.address().port()).await;
+    let (direct_addr, shutdown_tx) = start_proxy_with_direct_http(&ca, rules).await;
 
-    t.action("Send plain HTTP GET with Host: blocked.example.com (no matching rule)");
+    t.action("Send raw plain HTTP GET with unmatched Host header");
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .resolve(
-            "blocked.example.com",
-            SocketAddr::new("127.0.0.1".parse().unwrap(), direct_addr.port()),
-        )
-        .build()
-        .unwrap();
+    let (status, _body) = raw_get(
+        direct_addr,
+        &format!("localhost:{}", upstream_port),
+        "/secret",
+    )
+    .await;
 
-    let resp = client
-        .get(format!(
-            "http://blocked.example.com:{}/secret",
-            direct_addr.port()
-        ))
-        .send()
-        .await
-        .unwrap();
+    t.assert_eq("status 451", &status, &451u16);
 
-    t.assert_eq("status", &resp.status().as_u16(), &451u16);
-
-    // Upstream must not have received the request
     let received = upstream.received_requests().await.unwrap();
     t.assert_eq("upstream got 0 requests", &received.len(), &0usize);
 
@@ -152,41 +152,41 @@ async fn test_direct_http_branch_rule_blocks_plain_http() {
         .respond_with(ResponseTemplate::new(200).set_body_string("should-not-reach"))
         .mount(&upstream)
         .await;
+    let upstream_port = upstream.address().port();
 
     // A git rule with branch restriction would force body inspection;
-    // this must block over plain HTTP.
+    // over plain HTTP this must be blocked (body inspection needs HTTPS).
     let rules = vec![git_rule_with_branches(
         "push",
-        "http://git.example.com/repo.git",
+        &format!("http://localhost:{}/repo.git", upstream_port),
         &["main"],
     )];
 
-    let (direct_addr, shutdown_tx) =
-        start_proxy_with_direct_http(&ca, rules, upstream.address().port()).await;
+    let (direct_addr, shutdown_tx) = start_proxy_with_direct_http(&ca, rules).await;
 
-    t.action("Push-style request over direct HTTP must be blocked");
+    t.action("Push-style request over direct HTTP must be blocked with 451");
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .resolve(
-            "git.example.com",
-            SocketAddr::new("127.0.0.1".parse().unwrap(), direct_addr.port()),
-        )
-        .build()
-        .unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(direct_addr).await.unwrap();
+    let body = "dummy";
+    let req = format!(
+        "POST /repo.git/git-receive-pack HTTP/1.1\r\nHost: localhost:{}\r\nContent-Type: application/x-git-receive-pack-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        upstream_port,
+        body.len(),
+        body,
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
 
-    let resp = client
-        .post(format!(
-            "http://git.example.com:{}/repo.git/git-receive-pack",
-            direct_addr.port()
-        ))
-        .header("content-type", "application/x-git-receive-pack-request")
-        .body("dummy")
-        .send()
-        .await
-        .unwrap();
-
-    t.assert_eq("status 451", &resp.status().as_u16(), &451u16);
+    t.assert_eq("status 451", &status, &451u16);
     let received = upstream.received_requests().await.unwrap();
     t.assert_eq("upstream got 0 requests", &received.len(), &0usize);
 
