@@ -253,6 +253,32 @@ Each audit entry contains:
 
 Optional fields are omitted when not applicable.
 
+#### Body Logging
+
+Rules can opt in to capturing request and response bodies in the audit log. This is useful for traffic inspection — e.g. logging GraphQL queries to develop tighter filter rules.
+
+- Enabled per-rule via `log_body = true` (default false). Valid on both HTTP and git rules.
+- When a rule with `log_body = true` matches and the request is **allowed**, both request and response bodies are captured and included in the audit entry.
+- Blocked requests do not log bodies (there is no response body, and the request body may not have been received).
+- Global size limit: `max_body_log_size` in `[logging]` (default 1 MB / 1,048,576 bytes). Bodies exceeding this limit are truncated.
+- Body encoding: UTF-8 if valid; otherwise base64-encoded.
+- Audit entries with body logging are emitted **after** the response is received (deferred from the normal pre-forward emission point).
+
+Additional audit entry fields when body logging is active:
+- `request_body` — captured request body (string)
+- `request_body_encoding` (optional) — `"base64"` if the body is not valid UTF-8; absent means UTF-8
+- `response_body` — captured response body (string)
+- `response_body_encoding` (optional) — same encoding convention
+- `body_truncated` (optional) — `true` if either body was truncated to `max_body_log_size`
+
+Example rule:
+```toml
+[[rules]]
+method = "*"
+url = "https://api.example.com/graphql"
+log_body = true
+```
+
 ### Proxy Authentication
 
 The proxy can require clients to authenticate before processing any requests. This prevents unauthorized network entities from using the proxy's credential injection and URL allowlisting capabilities — critical when the proxy is reachable over a network (e.g. Docker internal networks where other containers could connect).
@@ -352,6 +378,8 @@ level = "info"
 log_requests = { allowed = true, blocked = true }
 # Optional: structured JSONL audit log for compliance/SIEM
 # audit_log = "/var/log/pyloros/audit.jsonl"
+# Optional: max bytes to capture per body for log_body rules (default 1048576)
+# max_body_log_size = 1048576
 
 [[rules]]
 method = "GET"
