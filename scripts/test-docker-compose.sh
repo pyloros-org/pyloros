@@ -120,6 +120,13 @@ sandbox_exec() {
     dc exec -T sandbox "$@"
 }
 
+# Helper: run a command in the sandbox with all proxy env vars unset.
+# Exercises direct-HTTPS mode: clients resolve hostnames via our dnsmasq
+# (wildcard → proxy IP) and connect straight to the proxy on :443.
+sandbox_exec_direct() {
+    dc exec -T sandbox env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy "$@"
+}
+
 # Test 1: Allowed HTTPS through proxy
 echo ""
 echo "Test 1: Allowed HTTPS request through proxy"
@@ -184,6 +191,78 @@ if [[ $EXIT_CODE -eq 0 ]]; then
     fi
 else
     fail "Git clone failed (exit=$EXIT_CODE)"
+    echo "    Output (last 10 lines):"
+    echo "$OUTPUT" | tail -10 | sed 's/^/    /'
+fi
+
+# --- Direct HTTPS mode tests ---
+# These skip HTTP_PROXY entirely; the sandbox relies on the dns service
+# resolving every hostname to the proxy's IP, then connects to :443.
+
+# Expected proxy IP (matches default in compose.yaml).
+EXPECTED_PROXY_IP="${PYLOROS_PROXY_IP:-172.30.0.254}"
+
+# Test 5: DNS wildcard: every hostname resolves to the proxy IP.
+echo ""
+echo "Test 5: DNS wildcard resolves arbitrary hostname to proxy IP"
+set +e
+GETENT_OUT=$(sandbox_exec getent hosts some-random-host.example 2>&1)
+EXIT_CODE=$?
+set -e
+
+if [[ $EXIT_CODE -eq 0 ]] && echo "$GETENT_OUT" | awk '{print $1}' | grep -qx "$EXPECTED_PROXY_IP"; then
+    pass "DNS wildcard returns $EXPECTED_PROXY_IP for arbitrary hostname"
+else
+    fail "DNS wildcard check (exit=$EXIT_CODE), got: $GETENT_OUT"
+fi
+
+# Test 6: Direct HTTPS allowed request (no HTTP_PROXY, DNS → proxy:443)
+echo "Test 6: Direct HTTPS allowed request (no proxy env)"
+set +e
+OUTPUT=$(sandbox_exec_direct curl -sf https://httpbin.org/robots.txt 2>&1)
+EXIT_CODE=$?
+set -e
+
+if [[ $EXIT_CODE -eq 0 ]] && echo "$OUTPUT" | grep -q "Disallow"; then
+    pass "Direct HTTPS allowed request succeeds without HTTP_PROXY"
+else
+    fail "Direct HTTPS allowed request (exit=$EXIT_CODE)"
+    echo "    Output (last 10 lines):"
+    echo "$OUTPUT" | tail -10 | sed 's/^/    /'
+fi
+
+# Test 7: Direct HTTPS blocked URL still returns 451 (proxy enforces, not DNS)
+echo "Test 7: Direct HTTPS blocked URL returns HTTP 451"
+set +e
+HTTP_CODE=$(sandbox_exec_direct curl -so /dev/null -w '%{http_code}' https://httpbin.org/get 2>&1)
+EXIT_CODE=$?
+set -e
+
+if [[ "$HTTP_CODE" == "451" ]]; then
+    pass "Direct HTTPS blocked URL returns HTTP 451"
+else
+    fail "Expected HTTP 451 via direct HTTPS, got '$HTTP_CODE' (exit=$EXIT_CODE)"
+fi
+
+# Test 8: Direct HTTPS git clone
+echo "Test 8: Direct HTTPS git clone"
+set +e
+OUTPUT=$(sandbox_exec_direct git clone https://github.com/octocat/Hello-World /tmp/hello-direct 2>&1)
+EXIT_CODE=$?
+set -e
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+    set +e
+    sandbox_exec test -f /tmp/hello-direct/README 2>/dev/null
+    FILE_CHECK=$?
+    set -e
+    if [[ $FILE_CHECK -eq 0 ]]; then
+        pass "Direct HTTPS git clone succeeds and README exists"
+    else
+        fail "Direct HTTPS git clone succeeded but README not found"
+    fi
+else
+    fail "Direct HTTPS git clone failed (exit=$EXIT_CODE)"
     echo "    Output (last 10 lines):"
     echo "$OUTPUT" | tail -10 | sed 's/^/    /'
 fi
