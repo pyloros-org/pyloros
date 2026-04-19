@@ -597,6 +597,22 @@ async fn test_https_mitm_redirect_whitelisted() {
         &"https-payload",
     );
 
+    // A sibling URL that matches the rule's allow_redirects *pattern*
+    // (https://localhost/cdn/*) but was NOT the Location of any observed 3xx
+    // must still be blocked. This proves only the exact Location URL was
+    // whitelisted, not the whole pattern.
+    t.action("GET https://localhost/cdn/other-file (not in whitelist, expect 451)".to_string());
+    let r3 = client
+        .get("https://localhost/cdn/other-file")
+        .send()
+        .await
+        .unwrap();
+    t.assert_eq(
+        "sibling cdn URL still blocked",
+        &r3.status().as_u16(),
+        &451u16,
+    );
+
     upstream.shutdown();
     proxy.shutdown();
 }
