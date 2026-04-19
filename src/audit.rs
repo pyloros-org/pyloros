@@ -29,6 +29,7 @@ pub enum AuditReason {
     NoMatchingRule,
     BodyInspectionRequiresHttps,
     BranchRestriction,
+    ForcePushProtected,
     LfsOperationNotAllowed,
     NonHttpsConnect,
     AuthFailed,
@@ -294,6 +295,7 @@ mod tests {
                 "\"body_inspection_requires_https\"",
             ),
             (AuditReason::BranchRestriction, "\"branch_restriction\""),
+            (AuditReason::ForcePushProtected, "\"force_push_protected\""),
             (
                 AuditReason::LfsOperationNotAllowed,
                 "\"lfs_operation_not_allowed\"",

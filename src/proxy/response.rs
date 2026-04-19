@@ -64,6 +64,50 @@ pub fn git_blocked_push_response(
         .unwrap()
 }
 
+/// Create a git receive-pack error response for a force-push / delete /
+/// non-fast-forward update to a protected branch.
+///
+/// Same transport as `git_blocked_push_response` (HTTP 200 with
+/// `application/x-git-receive-pack-result`), but the stderr sideband message
+/// identifies the cause specifically as protected-branch policy.
+pub fn git_force_push_blocked_response(
+    body_bytes: &[u8],
+    blocked: &[String],
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    use crate::filter::pktline;
+
+    let capabilities = pktline::extract_capabilities(body_bytes);
+
+    let branch_names: Vec<&str> = blocked
+        .iter()
+        .map(|r| r.strip_prefix("refs/heads/").unwrap_or(r))
+        .collect();
+    let message = if branch_names.len() == 1 {
+        format!(
+            "force-push/delete to protected branch '{}' denied by proxy policy",
+            branch_names[0]
+        )
+    } else {
+        format!(
+            "force-push/delete to protected branches [{}] denied by proxy policy",
+            branch_names.join(", ")
+        )
+    };
+
+    let response_body = pktline::build_receive_pack_error(blocked, &message, &capabilities);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-git-receive-pack-result")
+        .header("X-Blocked-By", "pyloros")
+        .body(
+            Full::new(Bytes::from(response_body))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 /// Create an HTTP 407 Proxy Authentication Required response
 pub fn auth_required_response() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
