@@ -76,15 +76,11 @@ services:
 
   dns:
     # Tiny wildcard DNS: every hostname resolves to the proxy's internal IP.
-    # Needs `external` network at startup so `apk add dnsmasq` can reach the
-    # Alpine mirrors; once running it only serves queries on `internal`.
-    image: alpine:latest
-    command:
-      - sh
-      - -c
-      - "apk add --no-cache dnsmasq >/dev/null && exec dnsmasq -k --no-resolv --address=/#/${PYLOROS_PROXY_IP:-172.30.0.10}"
+    # Built from dns/Dockerfile (dnsmasq baked in) so the running container
+    # does not need internet access — only the build does.
+    build: ./dns
+    command: ["--address=/#/${PYLOROS_PROXY_IP:-172.30.0.10}"]
     networks:
-      external:
       internal:
         ipv4_address: ${PYLOROS_DNS_IP:-172.30.0.20}
 
