@@ -102,6 +102,20 @@ impl<'a> ReportingClient<'a> {
         }
     }
 
+    pub fn new_plain_no_follow(report: &'a TestReport, proxy_addr: SocketAddr) -> Self {
+        let proxy_url = format!("http://{}", proxy_addr);
+        let proxy = reqwest::Proxy::all(&proxy_url).unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        Self {
+            inner: client,
+            report,
+        }
+    }
+
     pub fn new_plain_with_proxy_auth(
         report: &'a TestReport,
         proxy_addr: SocketAddr,
@@ -448,6 +462,9 @@ impl TestProxy {
         config.rules = builder.rules.clone();
         config.credentials = builder.credentials.clone();
         config.proxy.permissive = builder.permissive;
+        if let Some(ttl) = builder.redirect_whitelist_ttl_secs {
+            config.proxy.redirect_whitelist_ttl_secs = ttl;
+        }
         if let Some((ref username, ref password)) = builder.auth {
             config.proxy.auth_username = Some(username.clone());
             config.proxy.auth_password = Some(password.clone());
@@ -502,6 +519,7 @@ impl TestProxy {
             auth: None,
             audit_log: None,
             permissive: false,
+            redirect_whitelist_ttl_secs: None,
             report: None,
         }
     }
@@ -516,6 +534,7 @@ pub struct TestProxyBuilder<'a> {
     auth: Option<(String, String)>,
     audit_log: Option<String>,
     permissive: bool,
+    redirect_whitelist_ttl_secs: Option<u64>,
     report: Option<&'a TestReport>,
 }
 
@@ -542,6 +561,11 @@ impl<'a> TestProxyBuilder<'a> {
 
     pub fn permissive(mut self, enabled: bool) -> Self {
         self.permissive = enabled;
+        self
+    }
+
+    pub fn redirect_whitelist_ttl_secs(mut self, secs: u64) -> Self {
+        self.redirect_whitelist_ttl_secs = Some(secs);
         self
     }
 
@@ -746,6 +770,17 @@ pub fn rule(method: &str, url: &str) -> pyloros::config::Rule {
         git: None,
         branches: None,
         allow_redirects: Vec::new(),
+    }
+}
+
+pub fn rule_with_redirects(method: &str, url: &str, redirects: &[&str]) -> pyloros::config::Rule {
+    pyloros::config::Rule {
+        method: Some(method.to_string()),
+        url: url.to_string(),
+        websocket: false,
+        git: None,
+        branches: None,
+        allow_redirects: redirects.iter().map(|s| s.to_string()).collect(),
     }
 }
 
