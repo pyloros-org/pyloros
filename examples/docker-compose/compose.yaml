@@ -40,8 +40,8 @@
 # Running multiple instances on one host:
 #   Docker refuses overlapping subnets, so override the defaults per-instance:
 #     export PYLOROS_SUBNET=172.31.0.0/24
-#     export PYLOROS_PROXY_IP=172.31.0.10
-#     export PYLOROS_DNS_IP=172.31.0.20
+#     export PYLOROS_PROXY_IP=172.31.0.254
+#     export PYLOROS_DNS_IP=172.31.0.253
 #   All three must be consistent (IPs inside the subnet).
 
 services:
@@ -66,7 +66,7 @@ services:
     networks:
       external:
       internal:
-        ipv4_address: ${PYLOROS_PROXY_IP:-172.30.0.10}
+        ipv4_address: ${PYLOROS_PROXY_IP:-172.30.0.254}
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "8080"]
       interval: 2s
@@ -79,10 +79,10 @@ services:
     # Built from dns/Dockerfile (dnsmasq baked in) so the running container
     # does not need internet access — only the build does.
     build: ./dns
-    command: ["--address=/#/${PYLOROS_PROXY_IP:-172.30.0.10}"]
+    command: ["--address=/#/${PYLOROS_PROXY_IP:-172.30.0.254}"]
     networks:
       internal:
-        ipv4_address: ${PYLOROS_DNS_IP:-172.30.0.20}
+        ipv4_address: ${PYLOROS_DNS_IP:-172.30.0.253}
 
   sandbox:
     image: ${SANDBOX_IMAGE:-alpine:latest}
@@ -93,7 +93,7 @@ services:
       dns:
         condition: service_started
     dns:
-      - ${PYLOROS_DNS_IP:-172.30.0.20}
+      - ${PYLOROS_DNS_IP:-172.30.0.253}
     environment:
       - HTTP_PROXY=http://proxy:8080
       - HTTPS_PROXY=http://proxy:8080

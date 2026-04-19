@@ -200,7 +200,7 @@ fi
 # resolving every hostname to the proxy's IP, then connects to :443.
 
 # Expected proxy IP (matches default in compose.yaml).
-EXPECTED_PROXY_IP="${PYLOROS_PROXY_IP:-172.30.0.10}"
+EXPECTED_PROXY_IP="${PYLOROS_PROXY_IP:-172.30.0.254}"
 
 # Test 5: DNS wildcard: every hostname resolves to the proxy IP.
 echo ""
