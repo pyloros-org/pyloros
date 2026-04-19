@@ -53,6 +53,7 @@ fn build_rules() -> Vec<Rule> {
             websocket: false,
             git: None,
             branches: None,
+            log_body: false,
         });
     }
 
@@ -78,6 +79,7 @@ fn build_rules() -> Vec<Rule> {
             websocket: false,
             git: None,
             branches: None,
+            log_body: false,
         });
     }
 
@@ -121,6 +123,7 @@ fn build_rules() -> Vec<Rule> {
             websocket: false,
             git: None,
             branches: None,
+            log_body: false,
         });
     }
 
@@ -142,6 +145,7 @@ fn build_rules() -> Vec<Rule> {
             websocket: false,
             git: None,
             branches: None,
+            log_body: false,
         });
     }
 
@@ -160,6 +164,7 @@ fn build_rules() -> Vec<Rule> {
             websocket: false,
             git: Some("fetch".into()),
             branches: None,
+            log_body: false,
         });
     }
     // Push with branch restrictions
@@ -174,6 +179,7 @@ fn build_rules() -> Vec<Rule> {
                 "release/*".into(),
                 "!release/frozen".into(),
             ]),
+            log_body: false,
         });
     }
 
@@ -191,6 +197,7 @@ fn build_rules() -> Vec<Rule> {
             websocket: true,
             git: None,
             branches: None,
+            log_body: false,
         });
     }
 
@@ -214,6 +221,7 @@ fn build_rules() -> Vec<Rule> {
             websocket: false,
             git: None,
             branches: None,
+            log_body: false,
         });
     }
 

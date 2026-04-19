@@ -174,6 +174,28 @@ traffic is routed to the proxy for filtering and forwarding.
 The `generate-hosts` CLI subcommand extracts literal hostnames from config rules and outputs them in
 `/etc/hosts` format for this purpose.
 
+### Direct HTTP Mode
+
+A plain-HTTP counterpart to direct-HTTPS, used when a sandboxed program must fetch plain `http://`
+URLs (e.g. `apt` pulling `.deb` packages from a mirror) and does not honour `HTTP_PROXY`.
+
+**How it works:**
+1. The proxy listens on an additional address (e.g. `0.0.0.0:80`) for plain-HTTP connections.
+2. When a request arrives, the target hostname is read from the `Host` header (no SNI since no TLS).
+3. The path and query come from the request URI, which is origin-form (`GET /path HTTP/1.1`).
+4. Filtering, audit logging, and credential injection mirror the plain-HTTP path used by the
+   regular proxy listener. Rules that require body inspection (branch restrictions, LFS operation
+   checks) still block — plain HTTP is not trusted for body-gated rules.
+
+**Configuration:**
+```toml
+[proxy]
+direct_http_bind = "0.0.0.0:80"  # optional, enables direct HTTP mode
+```
+
+The same `/etc/hosts` / wildcard-DNS setup used for direct-HTTPS works for direct-HTTP: a single
+IP can carry both ports simultaneously.
+
 ### CLI
 
 subcommands:
