@@ -151,6 +151,12 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub direct_https_bind: Option<String>,
 
+    /// Address to bind the direct HTTP listener (optional).
+    /// When set, the proxy accepts plain HTTP connections (not proxy protocol)
+    /// and uses the `Host` header to determine the target hostname.
+    #[serde(default)]
+    pub direct_http_bind: Option<String>,
+
     /// Permissive mode: allow unmatched requests through while logging them
     /// as "request_permitted" for traffic discovery. Default: false.
     #[serde(default)]
@@ -168,6 +174,7 @@ impl Default for ProxyConfig {
             upstream_override_port: None,
             upstream_tls_ca: None,
             direct_https_bind: None,
+            direct_http_bind: None,
             permissive: false,
         }
     }
@@ -456,6 +463,7 @@ impl Config {
                 upstream_override_port: None,
                 upstream_tls_ca: None,
                 direct_https_bind: None,
+                direct_http_bind: None,
                 permissive: false,
             },
             logging: LoggingConfig::default(),

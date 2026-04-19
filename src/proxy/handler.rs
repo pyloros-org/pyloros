@@ -350,7 +350,7 @@ impl ProxyHandler {
 }
 
 /// Forward a plain HTTP request to the upstream server.
-async fn forward_http_request(
+pub(super) async fn forward_http_request(
     host: &str,
     port: u16,
     req: Request<Incoming>,

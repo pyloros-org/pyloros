@@ -164,6 +164,149 @@ impl TunnelHandler {
         }
     }
 
+    /// Serve plain-HTTP requests on a direct-HTTP listener.
+    ///
+    /// Clients send origin-form requests (`GET /path HTTP/1.1` + `Host:` header).
+    /// The target host/port is taken from the `Host` header. Filtering, audit
+    /// logging, and body-inspection blocking mirror the plain-HTTP handling in
+    /// `ProxyHandler::handle_http`.
+    pub async fn serve_direct_http<S>(self: &Arc<Self>, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let handler = Arc::clone(self);
+
+        let service = service_fn(move |req: Request<Incoming>| {
+            let handler = Arc::clone(&handler);
+            async move { handler.handle_direct_http_request(req).await }
+        });
+
+        let io = TokioIo::new(stream);
+        if let Err(e) = hyper::server::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(io, service)
+            .with_upgrades()
+            .await
+        {
+            let err_str = e.to_string();
+            if !err_str.contains("connection closed") && !err_str.contains("early eof") {
+                tracing::debug!("Direct HTTP service error: {}", e);
+            }
+        }
+    }
+
+    /// Handle a single request from the direct-HTTP listener.
+    async fn handle_direct_http_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        // Extract target host/port from the Host header.
+        let host_header = match req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(s) => s.to_string(),
+            None => {
+                tracing::warn!("Direct HTTP: missing or invalid Host header");
+                return Ok(error_response("missing Host header"));
+            }
+        };
+        let (host, port) = match host_header.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port) => (h.to_string(), port),
+                Err(_) => (host_header.clone(), 80),
+            },
+            None => (host_header.clone(), 80),
+        };
+
+        let method = req.method().to_string();
+        let path = req.uri().path().to_string();
+        let query = req.uri().query().map(|s| s.to_string());
+
+        let request_info =
+            RequestInfo::http(&method, "http", &host, Some(port), &path, query.as_deref());
+        let full_url = request_info.full_url();
+
+        let ctx = RequestContext {
+            method: &method,
+            url: &full_url,
+            host: &host,
+            scheme: "http",
+            protocol: "http",
+            credential: None,
+            label: " (direct HTTP)",
+        };
+
+        match self.filter_engine.check(&request_info) {
+            FilterResult::Blocked => {
+                if let Some(resp) = self.logger.log_blocked(&ctx) {
+                    return Ok(resp);
+                }
+            }
+            FilterResult::AllowedWithBranchCheck(_) | FilterResult::AllowedWithLfsCheck(_) => {
+                // Body-inspection rules require HTTPS (see handler::handle_http).
+                if self.logger.log_blocked_requests {
+                    tracing::warn!(
+                        method = %method,
+                        url = %full_url,
+                        "BLOCKED (direct HTTP: body inspection requires HTTPS)"
+                    );
+                }
+                self.logger.emit_audit(AuditEntry {
+                    timestamp: crate::audit::now_iso8601(),
+                    event: AuditEvent::RequestBlocked,
+                    method: method.clone(),
+                    url: full_url.clone(),
+                    host: host.clone(),
+                    scheme: "http".to_string(),
+                    protocol: "http".to_string(),
+                    decision: AuditDecision::Blocked,
+                    reason: AuditReason::BodyInspectionRequiresHttps,
+                    credential: None,
+                    git: None,
+                });
+                return Ok(blocked_response(&method, &full_url));
+            }
+            FilterResult::Allowed => {
+                let allowed_ctx = RequestContext {
+                    credential: self.audit_credential(&request_info),
+                    ..ctx
+                };
+                self.logger.log_allowed(&allowed_ctx);
+            }
+        }
+
+        // Inject credentials (non-body-signing variants only; plain HTTP has no
+        // SigV4-safe transport, but simple header/basic-auth injection is fine).
+        let (mut parts, body) = req.into_parts();
+        super::strip_hop_by_hop_headers(&mut parts.headers);
+        self.credential_engine
+            .inject(&request_info, &mut parts.headers);
+        let req = Request::from_parts(parts, body);
+
+        let connect_host = self
+            .upstream_host_override
+            .as_deref()
+            .unwrap_or(&host)
+            .to_string();
+        let connect_port = self.upstream_port_override.unwrap_or(port);
+
+        match super::handler::forward_http_request(&connect_host, connect_port, req).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                tracing::error!(
+                    host = %host,
+                    port = %connect_port,
+                    error = %e,
+                    "Direct HTTP forwarding error"
+                );
+                Ok(error_response(&e.to_string()))
+            }
+        }
+    }
+
     /// Handle a request that came through the MITM tunnel or direct HTTPS listener.
     pub async fn handle_tunneled_request(
         &self,
