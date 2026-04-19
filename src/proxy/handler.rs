@@ -252,7 +252,7 @@ impl ProxyHandler {
                 });
                 return Ok(blocked_response(&method, &full_url));
             }
-            FilterResult::Allowed => {
+            FilterResult::Allowed | FilterResult::AllowedByRedirect { .. } => {
                 self.logger.log_allowed(&ctx);
             }
         }

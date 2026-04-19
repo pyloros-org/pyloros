@@ -331,7 +331,7 @@ impl TunnelHandler {
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
                     .await;
             }
-            FilterResult::Allowed => {
+            FilterResult::Allowed | FilterResult::AllowedByRedirect { .. } => {
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
