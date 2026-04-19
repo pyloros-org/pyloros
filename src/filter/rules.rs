@@ -1,8 +1,10 @@
 //! Rule compilation and filter engine
 
 use super::matcher::{PatternMatcher, UrlPattern};
+use super::redirect_whitelist::RedirectWhitelist;
 use crate::config::Rule;
 use crate::error::Result;
+use std::sync::Arc;
 
 /// Information about a request to be filtered
 #[derive(Debug, Clone)]
@@ -99,8 +101,28 @@ pub struct CompiledRule {
     branch_filter: Option<BranchFilter>,
     /// Allowed LFS operations (if Some, body inspection required for LFS batch endpoint)
     lfs_operations: Option<Vec<String>>,
+    /// Compiled redirect URL patterns; empty means "do not follow redirects".
+    /// Shared across all endpoints compiled from the same git rule.
+    allow_redirects: Arc<Vec<UrlPattern>>,
     /// Whether to log request/response bodies in the audit log
     log_body: bool,
+}
+
+/// Compile the `allow_redirects` patterns of a config `Rule`. Accepts bare `"*"` as
+/// a shorthand for "match any URL" (otherwise `UrlPattern` requires a scheme).
+fn compile_redirect_patterns(rule: &Rule) -> Result<Arc<Vec<UrlPattern>>> {
+    let patterns: Result<Vec<UrlPattern>> = rule
+        .allow_redirects
+        .iter()
+        .map(|p| {
+            if p == "*" {
+                UrlPattern::new("*://*/*")
+            } else {
+                UrlPattern::new(p)
+            }
+        })
+        .collect();
+    Ok(Arc::new(patterns?))
 }
 
 impl CompiledRule {
@@ -117,6 +139,7 @@ impl CompiledRule {
         };
 
         let url = UrlPattern::new(&rule.url)?;
+        let allow_redirects = compile_redirect_patterns(rule)?;
 
         Ok(Self {
             method,
@@ -124,6 +147,7 @@ impl CompiledRule {
             websocket: rule.websocket,
             branch_filter: None,
             lfs_operations: None,
+            allow_redirects,
             log_body: rule.log_body,
         })
     }
@@ -135,6 +159,7 @@ impl CompiledRule {
             .as_deref()
             .expect("compile_git_rules called on non-git rule");
         let base_url = &rule.url;
+        let redirects = compile_redirect_patterns(rule)?;
 
         let mut rules = Vec::new();
 
@@ -144,37 +169,36 @@ impl CompiledRule {
         let log_body = rule.log_body;
 
         if needs_fetch {
-            // GET <repo>/info/refs?service=git-upload-pack
             rules.push(Self::compile_git_endpoint(
                 base_url,
                 "/info/refs",
                 Some("service=git-upload-pack"),
                 "GET",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
-            // POST <repo>/git-upload-pack
             rules.push(Self::compile_git_endpoint(
                 base_url,
                 "/git-upload-pack",
                 None,
                 "POST",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
         }
 
         if needs_push {
-            // GET <repo>/info/refs?service=git-receive-pack
             rules.push(Self::compile_git_endpoint(
                 base_url,
                 "/info/refs",
                 Some("service=git-receive-pack"),
                 "GET",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
-            // POST <repo>/git-receive-pack (with optional branch filter)
             let branch_filter = rule
                 .branches
                 .as_ref()
@@ -197,19 +221,19 @@ impl CompiledRule {
                 None,
                 "POST",
                 branch_filter,
+                redirects.clone(),
                 log_body,
             )?);
         }
 
-        // LFS lock endpoints (plain Allowed rules, no body inspection)
         if needs_push {
-            // Push needs all lock endpoints
             rules.push(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks",
                 None,
                 "GET",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
@@ -218,6 +242,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
@@ -226,6 +251,7 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
@@ -234,16 +260,17 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
         } else if needs_fetch {
-            // Fetch needs list + verify (informational, avoids client warning)
             rules.push(Self::compile_git_endpoint(
                 base_url,
                 "/info/lfs/locks",
                 None,
                 "GET",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
             rules.push(Self::compile_git_endpoint(
@@ -252,11 +279,11 @@ impl CompiledRule {
                 None,
                 "POST",
                 None,
+                redirects.clone(),
                 log_body,
             )?);
         }
 
-        // LFS batch endpoint: POST <repo>/info/lfs/objects/batch
         {
             let mut lfs_ops = Vec::new();
             if needs_fetch {
@@ -266,7 +293,10 @@ impl CompiledRule {
                 lfs_ops.push("upload".to_string());
             }
             rules.push(Self::compile_lfs_batch_endpoint(
-                base_url, lfs_ops, log_body,
+                base_url,
+                lfs_ops,
+                redirects.clone(),
+                log_body,
             )?);
         }
 
@@ -280,9 +310,9 @@ impl CompiledRule {
         query: Option<&str>,
         method: &str,
         branch_filter: Option<BranchFilter>,
+        allow_redirects: Arc<Vec<UrlPattern>>,
         log_body: bool,
     ) -> Result<Self> {
-        // Build the full URL by appending the suffix to the base URL's path
         let full_url = match query {
             Some(q) => format!("{}{}?{}", base_url, path_suffix, q),
             None => format!("{}{}", base_url, path_suffix),
@@ -297,6 +327,7 @@ impl CompiledRule {
             websocket: false,
             branch_filter,
             lfs_operations: None,
+            allow_redirects,
             log_body,
         })
     }
@@ -305,6 +336,7 @@ impl CompiledRule {
     fn compile_lfs_batch_endpoint(
         base_url: &str,
         lfs_operations: Vec<String>,
+        allow_redirects: Arc<Vec<UrlPattern>>,
         log_body: bool,
     ) -> Result<Self> {
         let full_url = format!("{}/info/lfs/objects/batch", base_url);
@@ -317,6 +349,7 @@ impl CompiledRule {
             websocket: false,
             branch_filter: None,
             lfs_operations: Some(lfs_operations),
+            allow_redirects,
             log_body,
         })
     }
@@ -363,6 +396,12 @@ pub enum FilterResult {
     AllowedWithLfsCheck {
         allowed_ops: Vec<String>,
         log_body: bool,
+    },
+    /// Request is allowed because its URL is present in the redirect whitelist.
+    /// Carries the origin rule's redirect patterns so a chained redirect from
+    /// this response can be validated against the same policy.
+    AllowedByRedirect {
+        origin_patterns: Arc<Vec<UrlPattern>>,
     },
 }
 
@@ -444,6 +483,36 @@ impl FilterEngine {
         !matches!(self.check(request), FilterResult::Blocked)
     }
 
+    /// Return the redirect patterns of the first matching rule, if any.
+    /// Used after a request is allowed to determine whether a 3xx response
+    /// should extend the whitelist.
+    pub fn redirect_policy_for(&self, request: &RequestInfo) -> Option<Arc<Vec<UrlPattern>>> {
+        for rule in &self.rules {
+            if rule.matches(request) {
+                if rule.allow_redirects.is_empty() {
+                    return None;
+                }
+                return Some(rule.allow_redirects.clone());
+            }
+        }
+        None
+    }
+
+    /// Like `check()` but consults the redirect whitelist first. If the request's
+    /// full URL is whitelisted (and unexpired), returns `AllowedByRedirect` carrying
+    /// the origin rule's redirect patterns.
+    pub fn check_with_redirect_whitelist(
+        &self,
+        request: &RequestInfo,
+        whitelist: &RedirectWhitelist,
+    ) -> FilterResult {
+        let full_url = request.full_url();
+        if let Some(origin_patterns) = whitelist.get(&full_url) {
+            return FilterResult::AllowedByRedirect { origin_patterns };
+        }
+        self.check(request)
+    }
+
     /// Get the number of rules
     pub fn rule_count(&self) -> usize {
         self.rules.len()
@@ -468,6 +537,7 @@ mod tests {
             websocket: false,
             git: None,
             branches: None,
+            allow_redirects: Vec::new(),
             log_body: false,
         }
     }
@@ -479,6 +549,7 @@ mod tests {
             websocket: true,
             git: None,
             branches: None,
+            allow_redirects: Vec::new(),
             log_body: false,
         }
     }
@@ -741,6 +812,7 @@ mod tests {
             websocket: false,
             git: Some("push".to_string()),
             branches: Some(vec!["feature/*".to_string()]),
+            allow_redirects: Vec::new(),
             log_body: false,
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
@@ -815,6 +887,7 @@ mod tests {
             websocket: false,
             git: Some(git_op.to_string()),
             branches: None,
+            allow_redirects: Vec::new(),
             log_body: false,
         }
     }
@@ -968,6 +1041,7 @@ mod tests {
             websocket: false,
             git: Some("push".to_string()),
             branches: Some(vec!["feature/*".to_string()]),
+            allow_redirects: Vec::new(),
             log_body: false,
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
@@ -1209,5 +1283,108 @@ mod tests {
             "lock verify returns Allowed (not AllowedWithLfsCheck)",
             matches!(result, FilterResult::Allowed { .. }),
         );
+    }
+
+    fn rule_with_redirects(method: &str, url: &str, redirects: &[&str]) -> Rule {
+        Rule {
+            method: Some(method.to_string()),
+            url: url.to_string(),
+            websocket: false,
+            git: None,
+            branches: None,
+            allow_redirects: redirects.iter().map(|s| s.to_string()).collect(),
+            log_body: false,
+        }
+    }
+
+    #[test]
+    fn test_redirect_policy_for_rule_without_redirects() {
+        let t = test_report!("redirect_policy_for returns None for rule without allow_redirects");
+        let engine = FilterEngine::new(vec![make_rule("GET", "https://a.example.com/*")]).unwrap();
+        let req = RequestInfo::http("GET", "https", "a.example.com", None, "/x", None);
+        t.assert_true("no policy", engine.redirect_policy_for(&req).is_none());
+    }
+
+    #[test]
+    fn test_redirect_policy_for_rule_with_redirects() {
+        let t = test_report!(
+            "redirect_policy_for returns compiled patterns for matching rule with allow_redirects"
+        );
+        let engine = FilterEngine::new(vec![rule_with_redirects(
+            "GET",
+            "https://a.example.com/*",
+            &["https://cdn.example.com/*"],
+        )])
+        .unwrap();
+        let req = RequestInfo::http("GET", "https", "a.example.com", None, "/x", None);
+        let policy = engine.redirect_policy_for(&req);
+        t.assert_true("policy present", policy.is_some());
+        t.assert_eq("one pattern", &policy.unwrap().len(), &1usize);
+    }
+
+    #[test]
+    fn test_redirect_policy_for_star_shorthand() {
+        let t = test_report!(
+            "redirect_policy_for accepts bare \"*\" shorthand and returns a catch-all pattern"
+        );
+        let engine = FilterEngine::new(vec![rule_with_redirects(
+            "GET",
+            "https://a.example.com/*",
+            &["*"],
+        )])
+        .unwrap();
+        let req = RequestInfo::http("GET", "https", "a.example.com", None, "/x", None);
+        let policy = engine.redirect_policy_for(&req).unwrap();
+        // The catch-all pattern should match an unrelated URL
+        t.assert_true(
+            "star matches any URL",
+            policy[0].matches(
+                "https",
+                "release-assets.githubusercontent.com",
+                None,
+                "/anything",
+                None,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_check_with_redirect_whitelist_hit() {
+        let t = test_report!(
+            "check_with_redirect_whitelist returns AllowedByRedirect on whitelist hit"
+        );
+        let engine = FilterEngine::empty();
+        let wl = RedirectWhitelist::new(std::time::Duration::from_secs(60), 10);
+        let patterns = Arc::new(vec![UrlPattern::new("*://*/*").unwrap()]);
+        wl.insert("https://cdn.example.com/file".to_string(), patterns);
+
+        let req = RequestInfo::http("GET", "https", "cdn.example.com", None, "/file", None);
+        let result = engine.check_with_redirect_whitelist(&req, &wl);
+        t.assert_true(
+            "AllowedByRedirect",
+            matches!(result, FilterResult::AllowedByRedirect { .. }),
+        );
+    }
+
+    #[test]
+    fn test_check_with_redirect_whitelist_miss_falls_through() {
+        let t = test_report!(
+            "check_with_redirect_whitelist falls through to check() on whitelist miss"
+        );
+        let engine = FilterEngine::new(vec![make_rule("GET", "https://a.example.com/*")]).unwrap();
+        let wl = RedirectWhitelist::new(std::time::Duration::from_secs(60), 10);
+
+        // Matching normal rule
+        let req = RequestInfo::http("GET", "https", "a.example.com", None, "/x", None);
+        let result = engine.check_with_redirect_whitelist(&req, &wl);
+        t.assert_true(
+            "Allowed (via rule)",
+            matches!(result, FilterResult::Allowed { .. }),
+        );
+
+        // Not matching any rule and not in whitelist
+        let req2 = RequestInfo::http("GET", "https", "other.example.com", None, "/x", None);
+        let result2 = engine.check_with_redirect_whitelist(&req2, &wl);
+        t.assert_true("Blocked", matches!(result2, FilterResult::Blocked));
     }
 }

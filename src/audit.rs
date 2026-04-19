@@ -32,6 +32,9 @@ pub enum AuditReason {
     LfsOperationNotAllowed,
     NonHttpsConnect,
     AuthFailed,
+    /// Request was allowed because its URL is in the short-lived redirect whitelist
+    /// (i.e., an earlier rule-matched request returned a 3xx Location pointing here).
+    RedirectWhitelisted,
 }
 
 /// Credential info attached to an audit entry.

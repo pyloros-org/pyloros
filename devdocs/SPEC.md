@@ -28,6 +28,59 @@ The intended deployment is one proxy per VM/container running an AI agent. All o
 - Method `*` matches any HTTP method
 - Example: `https://*.github.com/api/*` matches `https://foo.github.com/api/v1/repos`
 
+### Redirect Following
+
+Many allowed destinations (GitHub release assets, CDNs, package mirrors) respond with a 3xx redirect to a freshly-signed, short-lived URL on a different host that cannot realistically be listed in config. A rule may opt in to following redirects:
+
+```toml
+[[rules]]
+method = "GET"
+url = "https://github.com/neovim/neovim/releases/download/*"
+allow_redirects = ["https://release-assets.githubusercontent.com/*"]
+
+# Accept any redirect target
+[[rules]]
+method = "GET"
+url = "https://example.com/download/*"
+allow_redirects = ["*"]
+```
+
+Semantics:
+- `allow_redirects` is a list of URL patterns (same wildcard syntax as `url`). The bare string `"*"` is a shorthand for "match any URL" (accepted here but not in other pattern fields, which require a scheme). Omitted or empty = redirects are not followed (follow-up request will be blocked as usual).
+- When a rule-matched request produces a response with a 3xx status and a `Location` header, the Location URL is resolved against the request URL (absolute or relative) and checked against the rule's `allow_redirects` patterns. On match, the exact resolved URL is added to a time-limited global whitelist. Any subsequent request matching that URL exactly is allowed regardless of other rules.
+- Chains are followed recursively. If a whitelisted-by-redirect request itself returns a 3xx, the new Location is checked against the **original** rule's patterns (which travel with the whitelist entry).
+- The whitelist TTL is controlled by `redirect_whitelist_ttl_secs` under `[proxy]` (default **60**). The whitelist is global — keying per client is not feasible when `direct_https_bind` is used.
+- Applies to both plain HTTP and MITM'd HTTPS (all HTTPS in pyloros is MITM'd).
+
+Logging:
+- Normal logs distinguish redirect-whitelisted allowances from direct rule matches.
+- Audit log: follow-up requests allowed via the whitelist record `reason = "redirect_whitelisted"` (as opposed to `"rule_matched"`).
+
+#### Known limitation: client-cached redirects can outlive the whitelist
+
+3xx responses are cacheable per RFC 9111. A client may cache the original
+redirect (serving future requests to the origin URL from its own cache
+without re-hitting the proxy) and then attempt the cached target URL later,
+after our whitelist entry has expired. The proxy will block that follow-up.
+
+- 301 and 308 are **heuristically cacheable** — a cache may store them
+  effectively indefinitely when no `Cache-Control`/`Expires` is present.
+  Browsers commonly do (hours to days).
+- 302/303/307 are heuristically cacheable too, but most caches only store
+  them when explicit freshness headers are provided.
+
+The signed-URL case the feature is designed for is less exposed in practice:
+redirect responses in that flow typically carry `Cache-Control: no-store`
+and the signed target URL itself expires in minutes. But the race is real
+for rule authors relying on vanilla 301/308.
+
+A principled fix (future work): parse `Cache-Control: max-age` / `Expires`
+on the 3xx response and size the whitelist entry's TTL to match (capped at
+the proxy's configured maximum, with a floor). For 301/308 without explicit
+freshness headers, strip or rewrite the caching headers so the client can't
+outlive the whitelist entry. A simpler alternative is to always force
+`Cache-Control: no-store` on any 3xx we whitelist.
+
 ### Git Rules
 
 Git-specific rules provide a high-level way to control git smart HTTP operations (clone, fetch, push) without requiring users to understand the underlying protocol endpoints.

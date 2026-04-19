@@ -1462,6 +1462,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wait-timeout",
  "webpki-roots 1.0.6",
  "wiremock",

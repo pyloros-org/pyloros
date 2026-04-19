@@ -20,7 +20,9 @@ use crate::audit::{
 };
 use crate::error::{Error, Result};
 use crate::filter::lfs;
+use crate::filter::matcher::UrlPattern;
 use crate::filter::pktline;
+use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{CredentialEngine, FilterEngine, FilterResult, RequestInfo};
 use crate::tls::MitmCertificateGenerator;
 
@@ -29,6 +31,7 @@ pub struct TunnelHandler {
     mitm_generator: Arc<MitmCertificateGenerator>,
     filter_engine: Arc<FilterEngine>,
     credential_engine: Arc<CredentialEngine>,
+    redirect_whitelist: Arc<RedirectWhitelist>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -41,11 +44,13 @@ impl TunnelHandler {
         mitm_generator: Arc<MitmCertificateGenerator>,
         filter_engine: Arc<FilterEngine>,
         credential_engine: Arc<CredentialEngine>,
+        redirect_whitelist: Arc<RedirectWhitelist>,
     ) -> Self {
         Self {
             mitm_generator,
             filter_engine,
             credential_engine,
+            redirect_whitelist,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -107,6 +112,37 @@ impl TunnelHandler {
                 cred_type,
                 url_pattern,
             })
+    }
+
+    /// If the response is a redirect and `patterns` are non-None, check the
+    /// `Location` header against the patterns and insert into the whitelist on
+    /// match. A no-op otherwise. Returns the resolved redirect target URL when
+    /// an entry was inserted, for logging.
+    fn record_redirect_if_allowed(
+        &self,
+        status: u16,
+        headers: &hyper::header::HeaderMap,
+        request_url: &str,
+        patterns: Option<&Arc<Vec<UrlPattern>>>,
+    ) {
+        let Some(patterns) = patterns else { return };
+        let location = headers
+            .get(hyper::header::LOCATION)
+            .and_then(|v| v.to_str().ok());
+        if let Some(target) = maybe_whitelist_redirect(
+            status,
+            location,
+            request_url,
+            patterns,
+            &self.redirect_whitelist,
+        ) {
+            tracing::info!(
+                from = %request_url,
+                to = %target,
+                status = %status,
+                "REDIRECT whitelisted"
+            );
+        }
     }
 
     /// Run a MITM tunnel on an upgraded connection
@@ -196,8 +232,10 @@ impl TunnelHandler {
 
         let full_url = request_info.full_url();
 
-        // Check filter
-        let filter_result = self.filter_engine.check(&request_info);
+        // Check filter, consulting the redirect whitelist for short-lived allowances.
+        let filter_result = self
+            .filter_engine
+            .check_with_redirect_whitelist(&request_info, &self.redirect_whitelist);
 
         let ctx = RequestContext {
             method: &method,
@@ -209,11 +247,15 @@ impl TunnelHandler {
             label: "",
         };
 
-        match filter_result {
+        // Patterns used to evaluate a 3xx response Location. Set for rule-matched
+        // requests (the rule's allow_redirects) and whitelisted-by-redirect requests
+        // (origin rule's patterns, so chains extend recursively).
+        let redirect_patterns: Option<Arc<Vec<UrlPattern>>> = match filter_result {
             FilterResult::Blocked => {
                 if let Some(resp) = self.logger.log_blocked(&ctx) {
                     return Ok(resp);
                 }
+                None
             }
             FilterResult::AllowedWithBranchCheck {
                 ref filter,
@@ -286,6 +328,7 @@ impl TunnelHandler {
                     &body_bytes,
                 );
 
+                let rp = self.filter_engine.redirect_policy_for(&request_info);
                 if log_body {
                     return self
                         .forward_buffered_with_body_log(
@@ -296,13 +339,14 @@ impl TunnelHandler {
                             &method,
                             &full_url,
                             &allowed_ctx,
+                            rp,
                         )
                         .await;
                 }
 
                 self.logger.log_allowed(&allowed_ctx);
                 return self
-                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
+                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
             }
             FilterResult::AllowedWithLfsCheck {
@@ -364,6 +408,7 @@ impl TunnelHandler {
                     ..ctx
                 };
 
+                let rp = self.filter_engine.redirect_policy_for(&request_info);
                 if log_body {
                     return self
                         .forward_buffered_with_body_log(
@@ -374,13 +419,14 @@ impl TunnelHandler {
                             &method,
                             &full_url,
                             &allowed_ctx,
+                            rp,
                         )
                         .await;
                 }
 
                 self.logger.log_allowed(&allowed_ctx);
                 return self
-                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
+                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
             }
             FilterResult::Allowed { log_body } => {
@@ -388,6 +434,7 @@ impl TunnelHandler {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
+                let rp = self.filter_engine.redirect_policy_for(&request_info);
 
                 if log_body && !is_websocket {
                     // Body logging: buffer request, forward, capture response
@@ -415,13 +462,24 @@ impl TunnelHandler {
                             &method,
                             &full_url,
                             &allowed_ctx,
+                            rp,
                         )
                         .await;
                 }
 
                 self.logger.log_allowed(&allowed_ctx);
+                rp
             }
-        }
+            FilterResult::AllowedByRedirect { origin_patterns } => {
+                let allowed_ctx = RequestContext {
+                    credential: self.audit_credential(&request_info),
+                    ..ctx
+                };
+                self.logger
+                    .log_allowed_with_reason(&allowed_ctx, AuditReason::RedirectWhitelisted);
+                Some(origin_patterns)
+            }
+        };
 
         // Forward the request to the actual server
         let connect_port = self.upstream_port_override.unwrap_or(port);
@@ -502,7 +560,15 @@ impl TunnelHandler {
         };
 
         match result {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                self.record_redirect_if_allowed(
+                    resp.status().as_u16(),
+                    resp.headers(),
+                    &full_url,
+                    redirect_patterns.as_ref(),
+                );
+                Ok(resp)
+            }
             Err(e) => {
                 tracing::error!(method = %method, url = %full_url, error = %e, "Failed to forward request");
                 Ok(error_response(&e.to_string()))
@@ -547,10 +613,19 @@ impl TunnelHandler {
         method: &str,
         full_url: &str,
         ctx: &RequestContext<'_>,
+        redirect_patterns: Option<Arc<Vec<UrlPattern>>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
         let req_body_snapshot = body_bytes.clone();
         let resp = self
-            .forward_buffered(parts, body_bytes, host, port, method, full_url)
+            .forward_buffered(
+                parts,
+                body_bytes,
+                host,
+                port,
+                method,
+                full_url,
+                redirect_patterns,
+            )
             .await?;
 
         // Collect the response body for logging, then reconstruct the response
@@ -569,6 +644,7 @@ impl TunnelHandler {
 
     /// Rebuild a buffered request for upstream and forward it.
     /// Shared by branch-check and LFS-check arms.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_buffered(
         &self,
         mut parts: hyper::http::request::Parts,
@@ -577,6 +653,7 @@ impl TunnelHandler {
         port: u16,
         method: &str,
         full_url: &str,
+        redirect_patterns: Option<Arc<Vec<UrlPattern>>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
         let connect_port = self.upstream_port_override.unwrap_or(port);
         let connect_host = self
@@ -603,7 +680,15 @@ impl TunnelHandler {
         .await;
 
         match result {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                self.record_redirect_if_allowed(
+                    resp.status().as_u16(),
+                    resp.headers(),
+                    full_url,
+                    redirect_patterns.as_ref(),
+                );
+                Ok(resp)
+            }
             Err(e) => {
                 tracing::error!(method = %method, url = %full_url, error = %e, "Failed to forward request");
                 Ok(error_response(&e.to_string()))

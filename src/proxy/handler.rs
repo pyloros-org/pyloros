@@ -12,6 +12,8 @@ use super::response::{auth_required_response, blocked_response, error_response};
 use super::tunnel::TunnelHandler;
 use super::{RequestContext, RequestLogger};
 use crate::audit::{AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason};
+use crate::filter::matcher::UrlPattern;
+use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{FilterEngine, FilterResult, RequestInfo};
 
 use base64::Engine;
@@ -20,16 +22,22 @@ use base64::Engine;
 pub struct ProxyHandler {
     tunnel_handler: Arc<TunnelHandler>,
     filter_engine: Arc<FilterEngine>,
+    redirect_whitelist: Arc<RedirectWhitelist>,
     auth: Option<(String, String)>,
     logger: RequestLogger,
     max_body_log_size: usize,
 }
 
 impl ProxyHandler {
-    pub fn new(tunnel_handler: Arc<TunnelHandler>, filter_engine: Arc<FilterEngine>) -> Self {
+    pub fn new(
+        tunnel_handler: Arc<TunnelHandler>,
+        filter_engine: Arc<FilterEngine>,
+        redirect_whitelist: Arc<RedirectWhitelist>,
+    ) -> Self {
         Self {
             tunnel_handler,
             filter_engine,
+            redirect_whitelist,
             auth: None,
             logger: RequestLogger::new(),
             max_body_log_size: 1_048_576,
@@ -238,11 +246,19 @@ impl ProxyHandler {
             label: " (HTTP)",
         };
 
-        match self.filter_engine.check(&request_info) {
+        // Determines whether we should inspect the response for a whitelistable redirect,
+        // and with which patterns. Set when the request was rule-matched (using the rule's
+        // allow_redirects) or whitelisted-by-redirect (carrying origin patterns).
+        let redirect_patterns: Option<Arc<Vec<UrlPattern>>> = match self
+            .filter_engine
+            .check_with_redirect_whitelist(&request_info, &self.redirect_whitelist)
+        {
             FilterResult::Blocked => {
                 if let Some(resp) = self.logger.log_blocked(&ctx) {
                     return Ok(resp);
                 }
+                // Permissive mode: fall through with no redirect policy.
+                None
             }
             FilterResult::AllowedWithBranchCheck { .. }
             | FilterResult::AllowedWithLfsCheck { .. } => {
@@ -335,12 +351,41 @@ impl ProxyHandler {
                     }
                 }
                 self.logger.log_allowed(&ctx);
+                self.filter_engine.redirect_policy_for(&request_info)
             }
-        }
+            FilterResult::AllowedByRedirect { origin_patterns } => {
+                self.logger
+                    .log_allowed_with_reason(&ctx, AuditReason::RedirectWhitelisted);
+                Some(origin_patterns)
+            }
+        };
 
         let upstream_port = port.unwrap_or(80);
         match forward_http_request(&host, upstream_port, req).await {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                if let Some(patterns) = redirect_patterns.as_ref() {
+                    let status = resp.status().as_u16();
+                    let location = resp
+                        .headers()
+                        .get(hyper::header::LOCATION)
+                        .and_then(|v| v.to_str().ok());
+                    if let Some(target) = maybe_whitelist_redirect(
+                        status,
+                        location,
+                        &full_url,
+                        patterns,
+                        &self.redirect_whitelist,
+                    ) {
+                        tracing::info!(
+                            from = %full_url,
+                            to = %target,
+                            status = %status,
+                            "REDIRECT whitelisted (HTTP)"
+                        );
+                    }
+                }
+                Ok(resp)
+            }
             Err(e) => {
                 tracing::error!(host = %host, port = %upstream_port, error = %e, "HTTP forwarding error");
                 Ok(error_response(&e.to_string()))

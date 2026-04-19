@@ -13,6 +13,7 @@ fn rule(method: &str, url: &str) -> Rule {
         websocket: false,
         git: None,
         branches: None,
+        allow_redirects: Vec::new(),
         log_body: false,
     }
 }
@@ -24,6 +25,7 @@ fn ws_rule(url: &str) -> Rule {
         websocket: true,
         git: None,
         branches: None,
+        allow_redirects: Vec::new(),
         log_body: false,
     }
 }

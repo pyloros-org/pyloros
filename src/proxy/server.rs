@@ -19,8 +19,10 @@ use super::tunnel::TunnelHandler;
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::filter::redirect_whitelist::RedirectWhitelist;
 use crate::filter::{CredentialEngine, FilterEngine};
 use crate::tls::{CertificateAuthority, MitmCertificateGenerator};
+use std::time::Duration;
 
 /// The address the proxy is listening on after bind().
 pub enum ListenAddress {
@@ -65,6 +67,7 @@ pub struct ProxyServer {
     config: Config,
     filter_engine: Arc<FilterEngine>,
     credential_engine: Arc<CredentialEngine>,
+    redirect_whitelist: Arc<RedirectWhitelist>,
     mitm_generator: Arc<MitmCertificateGenerator>,
     resolved_auth: Option<(String, String)>,
     audit_logger: Option<Arc<AuditLogger>>,
@@ -118,10 +121,16 @@ impl ProxyServer {
             "Filter engine initialized"
         );
 
+        let redirect_whitelist = Arc::new(RedirectWhitelist::new(
+            Duration::from_secs(config.proxy.redirect_whitelist_ttl_secs),
+            1024,
+        ));
+
         Ok(Self {
             config,
             filter_engine,
             credential_engine,
+            redirect_whitelist,
             mitm_generator,
             resolved_auth,
             audit_logger: None,
@@ -144,10 +153,15 @@ impl ProxyServer {
         credential_engine: Arc<CredentialEngine>,
         mitm_generator: Arc<MitmCertificateGenerator>,
     ) -> Self {
+        let redirect_whitelist = Arc::new(RedirectWhitelist::new(
+            Duration::from_secs(config.proxy.redirect_whitelist_ttl_secs),
+            1024,
+        ));
         Self {
             config,
             filter_engine,
             credential_engine,
+            redirect_whitelist,
             mitm_generator,
             resolved_auth: None,
             audit_logger: None,
@@ -461,6 +475,7 @@ impl ProxyServer {
     {
         let tunnel_handler = tunnel_handler.clone();
         let filter_engine = self.filter_engine.clone();
+        let redirect_whitelist = self.redirect_whitelist.clone();
         let auth = self.resolved_auth.clone();
         let log_allowed = self.config.logging.log_allowed_requests;
         let log_blocked = self.config.logging.log_blocked_requests;
@@ -472,12 +487,16 @@ impl ProxyServer {
             let io = TokioIo::new(stream);
 
             let service = service_fn(move |req| {
-                let handler = ProxyHandler::new(tunnel_handler.clone(), filter_engine.clone())
-                    .with_request_logging(log_allowed, log_blocked)
-                    .with_auth(auth.clone())
-                    .with_audit_logger(audit_logger.clone())
-                    .with_permissive(permissive)
-                    .with_max_body_log_size(max_body_log_size);
+                let handler = ProxyHandler::new(
+                    tunnel_handler.clone(),
+                    filter_engine.clone(),
+                    redirect_whitelist.clone(),
+                )
+                .with_request_logging(log_allowed, log_blocked)
+                .with_auth(auth.clone())
+                .with_audit_logger(audit_logger.clone())
+                .with_permissive(permissive)
+                .with_max_body_log_size(max_body_log_size);
                 async move { handler.handle(req).await }
             });
 
@@ -500,6 +519,7 @@ impl ProxyServer {
             self.mitm_generator.clone(),
             self.filter_engine.clone(),
             self.credential_engine.clone(),
+            self.redirect_whitelist.clone(),
         )
         .with_request_logging(
             self.config.logging.log_allowed_requests,
