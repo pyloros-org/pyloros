@@ -56,6 +56,31 @@ Logging:
 - Normal logs distinguish redirect-whitelisted allowances from direct rule matches.
 - Audit log: follow-up requests allowed via the whitelist record `reason = "redirect_whitelisted"` (as opposed to `"rule_matched"`).
 
+#### Known limitation: client-cached redirects can outlive the whitelist
+
+3xx responses are cacheable per RFC 9111. A client may cache the original
+redirect (serving future requests to the origin URL from its own cache
+without re-hitting the proxy) and then attempt the cached target URL later,
+after our whitelist entry has expired. The proxy will block that follow-up.
+
+- 301 and 308 are **heuristically cacheable** — a cache may store them
+  effectively indefinitely when no `Cache-Control`/`Expires` is present.
+  Browsers commonly do (hours to days).
+- 302/303/307 are heuristically cacheable too, but most caches only store
+  them when explicit freshness headers are provided.
+
+The signed-URL case the feature is designed for is less exposed in practice:
+redirect responses in that flow typically carry `Cache-Control: no-store`
+and the signed target URL itself expires in minutes. But the race is real
+for rule authors relying on vanilla 301/308.
+
+A principled fix (future work): parse `Cache-Control: max-age` / `Expires`
+on the 3xx response and size the whitelist entry's TTL to match (capped at
+the proxy's configured maximum, with a floor). For 301/308 without explicit
+freshness headers, strip or rewrite the caching headers so the client can't
+outlive the whitelist entry. A simpler alternative is to always force
+`Cache-Control: no-store` on any 3xx we whitelist.
+
 ### Git Rules
 
 Git-specific rules provide a high-level way to control git smart HTTP operations (clone, fetch, push) without requiring users to understand the underlying protocol endpoints.
