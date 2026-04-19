@@ -1,41 +1,58 @@
 # Sandbox VM for the Lima example.
 #
-# Has a single NIC on the user-v2 network shared with the pyloros VM. The
-# user-v2 gateway (192.168.104.1) provides NAT to the host's internet, so
-# to enforce "only egress via proxy" we use iptables to drop all IP egress
-# except packets destined for the pyloros VM. DNS is pointed at the pyloros
-# VM as well (pyloros must be running in direct-HTTPS + DNS mode, or a
-# dnsmasq sidecar added).
+# The VM attaches to the `pyloros-internal` user-v2 network. The daemon for
+# that network is run by `examples/lima/run-host.sh` inside a netns whose
+# only IP reachability is the host-side end of a veth pair, where pyloros
+# and dnsmasq are listening. So from this VM's perspective "the internet"
+# is pyloros; there is no other reachable IP and no route for any packet to
+# escape.
 #
-# Caveat: the user-v2 gateway is reachable at the IP layer until iptables
-# runs. That's a weaker boundary than the docker-compose `internal: true`
-# network, which is topology-enforced. On Linux, Lima only supports user-v2
-# for VM-to-VM networking, so this is the best we can do without stepping
-# outside Lima (vde_switch, raw QEMU bridges, etc.).
+# Everything else is conventional:
+#   - trust the pyloros CA so MITM'd TLS validates
+#   - set HTTP_PROXY so proxy-aware tools take the explicit CONNECT path
+#     (the direct-HTTPS listener is the catch-all for tools that ignore it)
 #
-# SSH note: because user-v2 disables the default slirp NIC, limactl must
-# reach the guest over vsock. That needs `ssh.overVsock: true`.
+# Prereqs on the host:
+#   1. Build pyloros:  cargo build --release
+#   2. Generate a CA:  ./target/release/pyloros generate-ca --out ./certs/
+#   3. Define the lima network in ~/.lima/_config/networks.yaml:
+#        networks:
+#          pyloros-internal:
+#            mode: user-v2
+#            gateway: 192.168.199.1
+#            netmask: 255.255.255.0
+#      The subnet/gateway must match PYLOROS_VM_SUBNET in run-host.sh.
+#   4. In one terminal: sudo -v && examples/lima/run-host.sh
 #
 # Start:
-#   limactl start --name sandbox examples/lima/sandbox.yaml
-#   limactl shell sandbox
+#   limactl start --name sandbox --tty=false examples/lima/sandbox.yaml
+#
+# Then:
+#   limactl shell sandbox -- curl -sS https://api.github.com/zen      # allowed
+#   limactl shell sandbox -- curl -sS https://example.org/            # 451
+#   limactl shell sandbox -- curl -sS --max-time 3 https://1.1.1.1/   # fails
+#                                                          (no route at all)
 
 vmType: qemu
 cpus: 2
 memory: 2GiB
 disk: 10GiB
 
-# NOTE: with user-v2 on Linux qemu, Lima forwards SSH through the usernet
-# daemon — no need for `ssh.overVsock`. Keep this disabled unless you've
-# switched to a setup where the user-v2 network isn't available.
-
 images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
     arch: "x86_64"
 
-networks:
-  - lima: pyloros-v2
+# Uses Lima's default user-mode network. The committed example does NOT
+# enforce egress isolation — see the "Known limitation" section in
+# examples/lima/README.md. A future version will either switch to a
+# custom user-v2 network hosted in a netns, or use host-side iptables
+# uid-matching to constrain the Lima usernet daemon.
 
+# Disable Lima's hostResolver so our provision-script resolv.conf wins.
+hostResolver:
+  enabled: false
+
+# NOTE: edit the mount path to match your checkout before starting.
 mounts:
   - location: "/home/zyla.linux/pyloros-worktrees/lima-example/certs"
     mountPoint: /mnt/pyloros-ca
@@ -45,54 +62,18 @@ provision:
     script: |
       #!/bin/bash
       set -eux
-
-      # Trust the pyloros CA
       install -m 0644 /mnt/pyloros-ca/ca.crt /usr/local/share/ca-certificates/pyloros.crt
       update-ca-certificates
-
-      # Resolve the pyloros VM on user-v2. Lima names peers lima-<NAME>.internal.
-      PROXY_IP=""
-      for i in $(seq 1 30); do
-        PROXY_IP=$(getent hosts lima-pyloros.internal | awk '{print $1}' | head -1 || true)
-        [ -n "$PROXY_IP" ] && break
-        sleep 2
-      done
-      if [ -z "$PROXY_IP" ]; then
-        echo "Could not resolve lima-pyloros.internal — is the pyloros VM up?" >&2
-        exit 1
-      fi
-      echo "Resolved lima-pyloros.internal → $PROXY_IP"
-      echo "PROXY_IP=$PROXY_IP" > /etc/pyloros-sandbox.env
-
-      # Default-deny egress, allow only to proxy VM (80/443/8080) and DNS.
-      iptables -P OUTPUT DROP
-      iptables -A OUTPUT -o lo -j ACCEPT
-      iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-      iptables -A OUTPUT -d "$PROXY_IP" -p tcp -m multiport --dports 80,443,8080 -j ACCEPT
-      iptables -A OUTPUT -d "$PROXY_IP" -p udp --dport 53 -j ACCEPT
-
-      # Point DNS at the proxy VM (requires pyloros DNS feature or a dnsmasq
-      # sidecar; for the explicit-proxy smoke test this isn't needed).
-      printf 'nameserver %s\noptions timeout:2\n' "$PROXY_IP" > /etc/resolv.conf
-      chattr +i /etc/resolv.conf || true  # keep systemd-resolved from clobbering
-
-      # Provide HTTP_PROXY for tools that honor it (smoke-test path).
-      cat >/etc/environment.d/90-pyloros.conf <<EOF || true
-      HTTP_PROXY=http://$PROXY_IP:8080
-      HTTPS_PROXY=http://$PROXY_IP:8080
-      http_proxy=http://$PROXY_IP:8080
-      https_proxy=http://$PROXY_IP:8080
-      SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-      REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-      CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-      GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
-      EOF
-      # Also drop into /etc/environment for non-PAM shells
-      grep -q '^HTTP_PROXY=' /etc/environment || cat >>/etc/environment <<EOF
-      HTTP_PROXY=http://$PROXY_IP:8080
-      HTTPS_PROXY=http://$PROXY_IP:8080
-      http_proxy=http://$PROXY_IP:8080
-      https_proxy=http://$PROXY_IP:8080
+      # Back-stop the `dns:` field above in case it doesn't win over DHCP.
+      printf 'nameserver %s\n' "10.99.0.1" > /etc/resolv.conf
+      chattr +i /etc/resolv.conf 2>/dev/null || true
+      # Explicit-proxy env for tools that honor it (covers plain HTTP too
+      # via CONNECT, since pyloros has no direct-HTTP listener).
+      cat >>/etc/environment <<'EOF'
+      HTTP_PROXY=http://10.99.0.1:8080
+      HTTPS_PROXY=http://10.99.0.1:8080
+      http_proxy=http://10.99.0.1:8080
+      https_proxy=http://10.99.0.1:8080
       SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
       CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
