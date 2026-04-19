@@ -850,6 +850,28 @@ pub fn git_rule_with_branches(git_op: &str, url: &str, branches: &[&str]) -> pyl
     }
 }
 
+pub fn git_rule_with_protected(
+    git_op: &str,
+    url: &str,
+    branches: &[&str],
+    protected: &[&str],
+) -> pyloros::config::Rule {
+    pyloros::config::Rule {
+        method: None,
+        url: url.to_string(),
+        websocket: false,
+        git: Some(git_op.to_string()),
+        branches: if branches.is_empty() {
+            None
+        } else {
+            Some(branches.iter().map(|b| b.to_string()).collect())
+        },
+        protected_branches: Some(protected.iter().map(|p| p.to_string()).collect()),
+        allow_redirects: Vec::new(),
+        log_body: false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Git test infrastructure
 // ---------------------------------------------------------------------------
