@@ -86,6 +86,18 @@ impl<'a> RequestInfo<'a> {
 pub struct BranchFilter {
     pub allow: Vec<PatternMatcher>,
     pub deny: Vec<PatternMatcher>,
+    /// Ref patterns on which force-push and deletion are forbidden.
+    /// Empty means "no ref is protected".
+    pub protected: Vec<PatternMatcher>,
+}
+
+impl BranchFilter {
+    /// Returns true if the given ref name matches any protected pattern.
+    /// Protected patterns use the same expansion semantics as `branches`
+    /// (bare patterns → `refs/heads/<pattern>`).
+    pub fn is_protected(&self, refname: &str) -> bool {
+        super::pktline::ref_matches_any_pattern(refname, &self.protected)
+    }
 }
 
 /// A compiled rule ready for efficient matching
@@ -199,12 +211,12 @@ impl CompiledRule {
                 redirects.clone(),
                 log_body,
             )?);
-            let branch_filter = rule
-                .branches
-                .as_ref()
-                .map(|branches| {
-                    let mut allow = Vec::new();
-                    let mut deny = Vec::new();
+            // POST <repo>/git-receive-pack (with optional branch filter)
+            let has_filter = rule.branches.is_some() || rule.protected_branches.is_some();
+            let branch_filter = if has_filter {
+                let mut allow = Vec::new();
+                let mut deny = Vec::new();
+                if let Some(branches) = &rule.branches {
                     for b in branches {
                         if let Some(stripped) = b.strip_prefix('!') {
                             deny.push(PatternMatcher::new(stripped)?);
@@ -212,9 +224,21 @@ impl CompiledRule {
                             allow.push(PatternMatcher::new(b)?);
                         }
                     }
-                    Ok::<BranchFilter, crate::error::Error>(BranchFilter { allow, deny })
+                }
+                let mut protected = Vec::new();
+                if let Some(list) = &rule.protected_branches {
+                    for p in list {
+                        protected.push(PatternMatcher::new(p)?);
+                    }
+                }
+                Some(BranchFilter {
+                    allow,
+                    deny,
+                    protected,
                 })
-                .transpose()?;
+            } else {
+                None
+            };
             rules.extend(Self::compile_git_endpoint(
                 base_url,
                 "/git-receive-pack",
@@ -559,6 +583,7 @@ mod tests {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         }
     }
 
@@ -571,6 +596,7 @@ mod tests {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         }
     }
 
@@ -834,6 +860,7 @@ mod tests {
             branches: Some(vec!["feature/*".to_string()]),
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
 
@@ -909,6 +936,7 @@ mod tests {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         }
     }
 
@@ -1144,6 +1172,7 @@ mod tests {
             branches: Some(vec!["feature/*".to_string()]),
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
 
@@ -1195,6 +1224,7 @@ mod tests {
             branches: Some(vec!["feature/*".to_string()]),
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         };
         let engine = FilterEngine::new(vec![rule]).unwrap();
 
@@ -1446,6 +1476,7 @@ mod tests {
             branches: None,
             allow_redirects: redirects.iter().map(|s| s.to_string()).collect(),
             log_body: false,
+            protected_branches: None,
         }
     }
 

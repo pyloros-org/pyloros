@@ -314,6 +314,12 @@ pub struct Rule {
     /// Log request and response bodies in the audit log when this rule matches.
     #[serde(default)]
     pub log_body: bool,
+
+    /// Ref patterns on which force-push and deletion are forbidden.
+    /// Only valid with git = "push" or git = "*". Same pattern syntax as `branches`
+    /// but `!` prefix is not accepted.
+    #[serde(default)]
+    pub protected_branches: Option<Vec<String>>,
 }
 
 impl Config {
@@ -387,6 +393,12 @@ impl Config {
                     "`branches` is only valid with `git = \"push\"` or `git = \"*\"`",
                 ));
             }
+
+            if rule.protected_branches.is_some() && git == "fetch" {
+                return Err(ctx(
+                    "`protected_branches` is only valid with `git = \"push\"` or `git = \"*\"`",
+                ));
+            }
         }
 
         if rule.branches.is_some() && rule.git.is_none() {
@@ -412,12 +424,34 @@ impl Config {
             }
         }
 
+        if rule.protected_branches.is_some() && rule.git.is_none() {
+            return Err(ctx("`protected_branches` is only valid on git rules"));
+        }
+
         // Validate branch patterns: bare "!" (empty after prefix strip) is an error
         if let Some(ref branches) = rule.branches {
             for (j, pattern) in branches.iter().enumerate() {
                 if pattern == "!" {
                     return Err(ctx(&format!(
                         "branch pattern #{} is bare `!` (empty pattern after prefix strip)",
+                        j + 1
+                    )));
+                }
+            }
+        }
+
+        // Validate protected_branches: `!` prefix is not allowed, empty disallowed.
+        if let Some(ref protected) = rule.protected_branches {
+            for (j, pattern) in protected.iter().enumerate() {
+                if pattern.is_empty() {
+                    return Err(ctx(&format!(
+                        "protected_branches pattern #{} is empty",
+                        j + 1
+                    )));
+                }
+                if pattern.starts_with('!') {
+                    return Err(ctx(&format!(
+                        "protected_branches pattern #{} uses `!` prefix; protected_branches is an allow-list",
                         j + 1
                     )));
                 }

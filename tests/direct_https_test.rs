@@ -66,6 +66,7 @@ async fn test_direct_https_allowed_request() {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }];
 
     let (_proxy_addr, direct_addr, shutdown_tx) =
@@ -125,6 +126,7 @@ async fn test_direct_https_blocked_request() {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }];
 
     let (_proxy_addr, direct_addr, shutdown_tx) =
@@ -177,6 +179,7 @@ async fn test_direct_https_credential_injection() {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }];
 
     let credentials = vec![pyloros::config::Credential::Header {

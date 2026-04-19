@@ -55,6 +55,7 @@ fn build_rules() -> Vec<Rule> {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
 
@@ -82,6 +83,7 @@ fn build_rules() -> Vec<Rule> {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
 
@@ -127,6 +129,7 @@ fn build_rules() -> Vec<Rule> {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
 
@@ -150,6 +153,7 @@ fn build_rules() -> Vec<Rule> {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
 
@@ -170,6 +174,7 @@ fn build_rules() -> Vec<Rule> {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
     // Push with branch restrictions
@@ -186,6 +191,7 @@ fn build_rules() -> Vec<Rule> {
             ]),
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
 
@@ -205,6 +211,7 @@ fn build_rules() -> Vec<Rule> {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
 
@@ -230,6 +237,7 @@ fn build_rules() -> Vec<Rule> {
             branches: None,
             allow_redirects: Vec::new(),
             log_body: false,
+            protected_branches: None,
         });
     }
 

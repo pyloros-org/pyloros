@@ -781,6 +781,7 @@ pub fn rule(method: &str, url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -793,6 +794,7 @@ pub fn rule_with_redirects(method: &str, url: &str, redirects: &[&str]) -> pylor
         branches: None,
         allow_redirects: redirects.iter().map(|s| s.to_string()).collect(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -805,6 +807,7 @@ pub fn rule_with_body_log(method: &str, url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: true,
+        protected_branches: None,
     }
 }
 
@@ -817,6 +820,7 @@ pub fn ws_rule(url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -829,6 +833,7 @@ pub fn git_rule(git_op: &str, url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -841,6 +846,7 @@ pub fn git_rule_with_branches(git_op: &str, url: &str, branches: &[&str]) -> pyl
         branches: Some(branches.iter().map(|b| b.to_string()).collect()),
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
