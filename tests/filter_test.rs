@@ -14,6 +14,7 @@ fn rule(method: &str, url: &str) -> Rule {
         git: None,
         branches: None,
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -25,6 +26,7 @@ fn ws_rule(url: &str) -> Rule {
         git: None,
         branches: None,
         log_body: false,
+        protected_branches: None,
     }
 }
 

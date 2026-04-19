@@ -205,6 +205,28 @@ fn build_plain_report_status(blocked: &[String]) -> Vec<u8> {
     result
 }
 
+/// A single ref update from a git push: `<old-sha> <new-sha> <refname>`.
+///
+/// `old` is all-zero for new ref creation; `new` is all-zero for ref deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefUpdate {
+    pub old: [u8; 20],
+    pub new: [u8; 20],
+    pub name: String,
+}
+
+impl RefUpdate {
+    /// Returns true if `old` is all zeros (this is a new ref creation).
+    pub fn is_create(&self) -> bool {
+        self.old == [0u8; 20]
+    }
+
+    /// Returns true if `new` is all zeros (this is a ref deletion).
+    pub fn is_delete(&self) -> bool {
+        self.new == [0u8; 20]
+    }
+}
+
 /// Extract ref names from git push pkt-line data.
 ///
 /// Reads pkt-lines until the flush packet (`0000`), parsing each command
@@ -213,17 +235,25 @@ fn build_plain_report_status(blocked: &[String]) -> Vec<u8> {
 ///
 /// Returns the list of ref names being pushed (e.g. `refs/heads/main`).
 pub fn extract_push_refs(data: &[u8]) -> Vec<String> {
-    let mut refs = Vec::new();
+    extract_push_updates(data)
+        .into_iter()
+        .map(|u| u.name)
+        .collect()
+}
+
+/// Extract full ref updates (old-sha, new-sha, refname) from git push pkt-line data.
+///
+/// Reads pkt-lines until the flush packet (`0000`). Returns parsed `RefUpdate`s.
+pub fn extract_push_updates(data: &[u8]) -> Vec<RefUpdate> {
+    let mut updates = Vec::new();
     let mut pos = 0;
 
     while pos + 4 <= data.len() {
-        // Read 4-hex-digit length
         let len_str = match std::str::from_utf8(&data[pos..pos + 4]) {
             Ok(s) => s,
             Err(_) => break,
         };
 
-        // Flush packet
         if len_str == "0000" {
             break;
         }
@@ -237,42 +267,86 @@ pub fn extract_push_refs(data: &[u8]) -> Vec<String> {
             break;
         }
 
-        // The pkt-line content (excluding the 4-byte length prefix)
         let content = &data[pos + 4..pos + pkt_len];
 
-        // Parse: "<old-sha> <new-sha> <refname>[\0capabilities][\n]"
-        if let Some(refname) = parse_ref_from_command(content) {
-            refs.push(refname);
+        if let Some(update) = parse_update_from_command(content) {
+            updates.push(update);
         }
 
         pos += pkt_len;
     }
 
-    refs
+    updates
 }
 
-/// Parse a single command line to extract the ref name.
-fn parse_ref_from_command(content: &[u8]) -> Option<String> {
-    // Strip trailing newline if present
+/// Locate the packfile bytes within a full receive-pack request body.
+///
+/// The wire format is: [pkt-line commands...] flush-pkt [PACK header + data + trailer].
+/// Returns the slice of `data` starting at the first byte after the command flush-pkt,
+/// or `None` if no flush-pkt is found.
+pub fn pack_bytes_in_body(data: &[u8]) -> Option<&[u8]> {
+    let mut pos = 0;
+
+    while pos + 4 <= data.len() {
+        let len_str = match std::str::from_utf8(&data[pos..pos + 4]) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        if len_str == "0000" {
+            return Some(&data[pos + 4..]);
+        }
+
+        let pkt_len = match usize::from_str_radix(len_str, 16) {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+
+        if pkt_len < 4 || pos + pkt_len > data.len() {
+            return None;
+        }
+
+        pos += pkt_len;
+    }
+
+    None
+}
+
+/// Parse a single command line into a `RefUpdate`.
+fn parse_update_from_command(content: &[u8]) -> Option<RefUpdate> {
     let content = if content.last() == Some(&b'\n') {
         &content[..content.len() - 1]
     } else {
         content
     };
 
-    // Convert to string (command lines are ASCII)
     let line = std::str::from_utf8(content).ok()?;
-
-    // Strip capabilities after NUL
     let line = line.split('\0').next().unwrap_or(line);
 
-    // Split by spaces: old-sha, new-sha, refname
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
-    if parts.len() == 3 {
-        Some(parts[2].to_string())
-    } else {
-        None
+    if parts.len() != 3 {
+        return None;
     }
+
+    let old = parse_hex_sha(parts[0])?;
+    let new = parse_hex_sha(parts[1])?;
+
+    Some(RefUpdate {
+        old,
+        new,
+        name: parts[2].to_string(),
+    })
+}
+
+fn parse_hex_sha(s: &str) -> Option<[u8; 20]> {
+    if s.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Check if all push refs match the given branch patterns.
@@ -297,7 +371,9 @@ pub fn check_push_branches(data: &[u8], patterns: &[PatternMatcher]) -> bool {
 }
 
 /// Check if a single ref matches any of the given branch patterns.
-fn ref_matches_any_pattern(refname: &str, patterns: &[PatternMatcher]) -> bool {
+///
+/// Bare patterns (not starting with `refs/`) are expanded to `refs/heads/<pattern>`.
+pub fn ref_matches_any_pattern(refname: &str, patterns: &[PatternMatcher]) -> bool {
     for pattern in patterns {
         let pat = pattern.pattern();
         if pat.starts_with("refs/") {
@@ -883,6 +959,7 @@ mod tests {
                 .iter()
                 .map(|p| PatternMatcher::new(p).unwrap())
                 .collect(),
+            protected: Vec::new(),
         }
     }
 
@@ -1037,5 +1114,79 @@ mod tests {
         let filter = make_branch_filter(&["*"], &[]);
         let blocked = blocked_refs_with_filter(&data, &filter);
         t.assert_eq("tag blocked (no allow match)", &blocked.len(), &1usize);
+    }
+
+    // --- Tests for extract_push_updates and RefUpdate ---
+
+    fn make_push_data_with_shas(
+        entries: &[(&str, &str, &str)], // (old_sha, new_sha, refname)
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (i, (old, new, refname)) in entries.iter().enumerate() {
+            let cmd = if i == 0 {
+                format!("{} {} {}\0report-status side-band-64k\n", old, new, refname)
+            } else {
+                format!("{} {} {}\n", old, new, refname)
+            };
+            data.extend(format_pktline(cmd.as_bytes()));
+        }
+        data.extend(b"0000");
+        data
+    }
+
+    #[test]
+    fn test_extract_push_updates_single() {
+        let t = test_report!("extract_push_updates parses old/new shas");
+        let data = make_push_data_with_shas(&[(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "refs/heads/main",
+        )]);
+        let updates = extract_push_updates(&data);
+        t.assert_eq("one update", &updates.len(), &1usize);
+        t.assert_eq("name", &updates[0].name.as_str(), &"refs/heads/main");
+        t.assert_eq("old byte 0", &updates[0].old[0], &0xaa);
+        t.assert_eq("new byte 0", &updates[0].new[0], &0xbb);
+        t.assert_true("not create", !updates[0].is_create());
+        t.assert_true("not delete", !updates[0].is_delete());
+    }
+
+    #[test]
+    fn test_extract_push_updates_create_and_delete() {
+        let t = test_report!("detects create (old=0) and delete (new=0)");
+        let zero = "0000000000000000000000000000000000000000";
+        let sha = "1111111111111111111111111111111111111111";
+        let data = make_push_data_with_shas(&[
+            (zero, sha, "refs/heads/new-branch"),
+            (sha, zero, "refs/heads/old-branch"),
+        ]);
+        let updates = extract_push_updates(&data);
+        t.assert_eq("two updates", &updates.len(), &2usize);
+        t.assert_true("first is create", updates[0].is_create());
+        t.assert_true("first not delete", !updates[0].is_delete());
+        t.assert_true("second is delete", updates[1].is_delete());
+        t.assert_true("second not create", !updates[1].is_create());
+    }
+
+    #[test]
+    fn test_pack_bytes_in_body_locates_pack() {
+        let t = test_report!("pack_bytes_in_body returns slice after flush-pkt");
+        let sha = "1111111111111111111111111111111111111111";
+        let mut data = make_push_data_with_shas(&[(sha, sha, "refs/heads/main")]);
+        let pack_marker = b"PACK\x00\x00\x00\x02FAKE";
+        data.extend_from_slice(pack_marker);
+        let pack = pack_bytes_in_body(&data).expect("should find pack bytes");
+        t.assert_eq(
+            "pack starts with PACK marker",
+            &pack,
+            &pack_marker.as_slice(),
+        );
+    }
+
+    #[test]
+    fn test_pack_bytes_in_body_no_flush() {
+        let t = test_report!("pack_bytes_in_body returns None if no flush-pkt");
+        let result = pack_bytes_in_body(b"1234567890");
+        t.assert_true("no pack found", result.is_none());
     }
 }

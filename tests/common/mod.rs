@@ -756,6 +756,7 @@ pub fn rule(method: &str, url: &str) -> pyloros::config::Rule {
         git: None,
         branches: None,
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -767,6 +768,7 @@ pub fn rule_with_body_log(method: &str, url: &str) -> pyloros::config::Rule {
         git: None,
         branches: None,
         log_body: true,
+        protected_branches: None,
     }
 }
 
@@ -778,6 +780,7 @@ pub fn ws_rule(url: &str) -> pyloros::config::Rule {
         git: None,
         branches: None,
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -789,6 +792,7 @@ pub fn git_rule(git_op: &str, url: &str) -> pyloros::config::Rule {
         git: Some(git_op.to_string()),
         branches: None,
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -800,6 +804,7 @@ pub fn git_rule_with_branches(git_op: &str, url: &str, branches: &[&str]) -> pyl
         git: Some(git_op.to_string()),
         branches: Some(branches.iter().map(|b| b.to_string()).collect()),
         log_body: false,
+        protected_branches: None,
     }
 }
 
