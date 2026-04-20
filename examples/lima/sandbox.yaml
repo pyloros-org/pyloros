@@ -1,0 +1,78 @@
+# Sandbox VM for the Lima example.
+#
+# The VM attaches to the `pyloros-internal` user-v2 network. The daemon for
+# that network is run by `examples/lima/run-host.sh` inside a netns whose
+# only IP reachability is the host-side end of a veth pair, where pyloros
+# and dnsmasq are listening. So from this VM's perspective "the internet"
+# is pyloros; there is no other reachable IP and no route for any packet to
+# escape.
+#
+# Everything else is conventional:
+#   - trust the pyloros CA so MITM'd TLS validates
+#   - set HTTP_PROXY so proxy-aware tools take the explicit CONNECT path
+#     (the direct-HTTPS listener is the catch-all for tools that ignore it)
+#
+# Prereqs on the host:
+#   1. Build pyloros:  cargo build --release
+#   2. Generate a CA:  ./target/release/pyloros generate-ca --out ./certs/
+#   3. Define the lima network in ~/.lima/_config/networks.yaml:
+#        networks:
+#          pyloros-internal:
+#            mode: user-v2
+#            gateway: 192.168.199.1
+#            netmask: 255.255.255.0
+#      The subnet/gateway must match PYLOROS_VM_SUBNET in run-host.sh.
+#   4. In one terminal: sudo -v && examples/lima/run-host.sh
+#
+# Start:
+#   limactl start --name sandbox --tty=false examples/lima/sandbox.yaml
+#
+# Then:
+#   limactl shell sandbox -- curl -sS https://api.github.com/zen      # allowed
+#   limactl shell sandbox -- curl -sS https://example.org/            # 451
+#   limactl shell sandbox -- curl -sS --max-time 3 https://1.1.1.1/   # fails
+#                                                          (no route at all)
+
+vmType: qemu
+cpus: 2
+memory: 2GiB
+disk: 10GiB
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+networks:
+  - lima: pyloros-internal
+
+# Disable Lima's hostResolver so our provision-script resolv.conf wins.
+hostResolver:
+  enabled: false
+
+# NOTE: edit the mount path to match your checkout before starting.
+mounts:
+  - location: "/home/zyla.linux/pyloros-worktrees/lima-example/certs"
+    mountPoint: /mnt/pyloros-ca
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      install -m 0644 /mnt/pyloros-ca/ca.crt /usr/local/share/ca-certificates/pyloros.crt
+      update-ca-certificates
+      # Back-stop the `dns:` field above in case it doesn't win over DHCP.
+      printf 'nameserver %s\n' "10.99.0.1" > /etc/resolv.conf
+      chattr +i /etc/resolv.conf 2>/dev/null || true
+      # Explicit-proxy env for tools that honor it (covers plain HTTP too
+      # via CONNECT, since pyloros has no direct-HTTP listener).
+      cat >>/etc/environment <<'EOF'
+      HTTP_PROXY=http://10.99.0.1:8080
+      HTTPS_PROXY=http://10.99.0.1:8080
+      http_proxy=http://10.99.0.1:8080
+      https_proxy=http://10.99.0.1:8080
+      SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+      CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+      GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
+      EOF
