@@ -74,44 +74,6 @@ async fn test_agent_api_unknown_id_returns_404() {
     upstream.shutdown();
 }
 
-/// The dashboard listener is bound to a separate port when approvals are
-/// enabled. Its Phase 1 stub returns 501 for any request.
-#[tokio::test]
-async fn test_dashboard_listener_bound_and_returns_501() {
-    let t = test_report!("Dashboard listener is bound and returns 501 (Phase 1 stub)");
-
-    let ca = TestCa::generate();
-    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
-        .report(&t, "unused")
-        .start()
-        .await;
-
-    let sidecar = tempfile::NamedTempFile::new().unwrap();
-    let sidecar_path = sidecar.path().to_string_lossy().into_owned();
-
-    let proxy = TestProxy::builder(&ca, vec![], upstream.port())
-        .with_approvals(&sidecar_path)
-        .report(&t)
-        .start()
-        .await;
-
-    let dashboard_addr = proxy
-        .dashboard_addr
-        .expect("dashboard addr should be bound");
-
-    // Plain HTTP client, no proxy — the dashboard is a direct endpoint.
-    let client = reqwest::Client::builder().build().unwrap();
-    let resp = client
-        .get(format!("http://{}/", dashboard_addr))
-        .send()
-        .await
-        .unwrap();
-    t.assert_eq("Status", &resp.status().as_u16(), &501u16);
-
-    proxy.shutdown();
-    upstream.shutdown();
-}
-
 // ---------------------------------------------------------------------------
 // Phase 2: agent API end-to-end (POST + long-poll GET, resolved via
 // ApprovalManager::resolve_for_test). Rule merging (Phase 4) and dashboard
@@ -325,6 +287,235 @@ async fn test_long_poll_times_out_returns_pending() {
     t.assert_eq("status code", &resp.status().as_u16(), &200u16);
     let got: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     t.assert_eq("status", &got["status"].as_str().unwrap(), &"pending");
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: dashboard + SSE + decision endpoint.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_dashboard_get_root_returns_html() {
+    let t = test_report!("Dashboard GET / returns HTML");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let dashboard_addr = proxy.dashboard_addr.unwrap();
+
+    let client = reqwest::Client::builder().build().unwrap();
+    let resp = client
+        .get(format!("http://{}/", dashboard_addr))
+        .send()
+        .await
+        .unwrap();
+    t.assert_eq("Status", &resp.status().as_u16(), &200u16);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    t.assert_contains("content-type is html", ct.as_str(), "text/html");
+    let body = resp.text().await.unwrap();
+    t.assert_contains("doctype present", body.as_str(), "<!doctype html>");
+    t.assert_contains("script present", body.as_str(), "EventSource");
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_dashboard_decision_approves_and_wakes_long_poll() {
+    let t = test_report!("Dashboard POST /approvals/{id}/decision resolves a pending approval");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let dashboard_addr = proxy.dashboard_addr.unwrap();
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let id = serde_json::from_str::<serde_json::Value>(
+        &client
+            .post_with_body(
+                "https://pyloros.internal/approvals",
+                json!({"rules": ["GET https://api.foo.com/*"]}).to_string(),
+            )
+            .await
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Post a decision over the dashboard listener. Concurrently, long-poll
+    // for the result.
+    let poll_url = format!("https://pyloros.internal/approvals/{}?wait=5s", id);
+    let poll_fut = client.get(&poll_url);
+
+    let dashboard = reqwest::Client::builder().build().unwrap();
+    let id_for_dash = id.clone();
+    let dash_fut = async move {
+        // Tiny delay so the long-poll has actually subscribed.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        dashboard
+            .post(format!(
+                "http://{}/approvals/{}/decision",
+                dashboard_addr, id_for_dash
+            ))
+            .header("Content-Type", "application/json")
+            .body(json!({"action": "approve", "ttl": "one_hour"}).to_string())
+            .send()
+            .await
+            .unwrap()
+    };
+
+    let (poll_resp, dash_resp) = tokio::join!(poll_fut, dash_fut);
+
+    t.assert_eq(
+        "Dashboard decision status",
+        &dash_resp.status().as_u16(),
+        &204u16,
+    );
+    t.assert_eq("Long-poll status", &poll_resp.status().as_u16(), &200u16);
+    let got: serde_json::Value = serde_json::from_str(&poll_resp.text().await.unwrap()).unwrap();
+    t.assert_eq("status", &got["status"].as_str().unwrap(), &"approved");
+    t.assert_eq("ttl", &got["ttl"].as_str().unwrap(), &"one_hour");
+    t.assert_eq(
+        "rules_applied defaulted to proposed",
+        &got["rules_applied"][0].as_str().unwrap(),
+        &"GET https://api.foo.com/*",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_dashboard_sse_streams_pending_and_resolved() {
+    let t = test_report!("Dashboard /events streams snapshot, pending, and resolved events");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let dashboard_addr = proxy.dashboard_addr.unwrap();
+    let manager = proxy.approvals.clone().unwrap();
+
+    // Open the SSE stream and read frames in a background task.
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let url = format!("http://{}/events", dashboard_addr);
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder().build().unwrap();
+        let mut resp = client.get(&url).send().await.unwrap();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            let s = String::from_utf8_lossy(&chunk).to_string();
+            for line in s.split("\n\n") {
+                if let Some(rest) = line.strip_prefix("data: ") {
+                    if ev_tx.send(rest.to_string()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    // First frame should be a snapshot (initially empty).
+    let snap = tokio::time::timeout(std::time::Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    t.assert_contains("snapshot event", snap.as_str(), "\"snapshot\"");
+
+    // Post a new approval; a Pending event must arrive on the stream.
+    let req = manager.post(
+        vec!["GET https://api.foo.com/*".to_string()],
+        Some("because".to_string()),
+        None,
+        None,
+    );
+    let id = req.id.clone();
+
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    t.assert_contains("pending event", pending.as_str(), "\"pending\"");
+    t.assert_contains("approval id", pending.as_str(), id.as_str());
+
+    // Resolve; a Resolved event must arrive.
+    manager
+        .resolve(
+            &id,
+            ApprovalStatus::Approved {
+                rules_applied: vec!["GET https://api.foo.com/*".to_string()],
+                ttl: Lifetime::Session,
+            },
+        )
+        .unwrap();
+    let resolved = tokio::time::timeout(std::time::Duration::from_secs(2), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    t.assert_contains("resolved event", resolved.as_str(), "\"resolved\"");
+    t.assert_contains("same id", resolved.as_str(), id.as_str());
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_dashboard_decision_with_custom_rules_and_message() {
+    let t = test_report!("Dashboard decision may edit rules_applied and include deny message");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let dashboard_addr = proxy.dashboard_addr.unwrap();
+    let manager = proxy.approvals.clone().unwrap();
+
+    let req = manager.post(vec!["GET https://broad/*".to_string()], None, None, None);
+
+    let dashboard = reqwest::Client::builder().build().unwrap();
+    // Deny with a message.
+    let resp = dashboard
+        .post(format!(
+            "http://{}/approvals/{}/decision",
+            dashboard_addr, req.id
+        ))
+        .header("Content-Type", "application/json")
+        .body(json!({"action": "deny", "message": "too broad"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    t.assert_eq("Decision status", &resp.status().as_u16(), &204u16);
+
+    let got = manager
+        .get(&req.id, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    match got.status {
+        ApprovalStatus::Denied { message } => {
+            t.assert_eq("message", &message.unwrap().as_str(), &"too broad");
+        }
+        other => panic!("expected denied, got {:?}", other),
+    }
 
     proxy.shutdown();
     upstream.shutdown();

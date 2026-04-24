@@ -5,13 +5,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::config::ApprovalsConfig;
 
 use super::types::{
     ApprovalError, ApprovalRequest, ApprovalStatus, Lifetime, NotifierEvent, TriggeredBy,
 };
+
+/// Capacity for the dashboard notifier broadcast channel. Each dashboard
+/// connection subscribes independently; capacity exceeded = client drops
+/// and reconnects (dashboard JS handles this).
+const NOTIFIER_CAPACITY: usize = 64;
 
 /// Facade held by `ProxyServer` when the approvals feature is enabled.
 #[derive(Debug)]
@@ -20,6 +25,7 @@ pub struct ApprovalManager {
     config: ApprovalsConfig,
     state: Mutex<State>,
     id_counter: AtomicU64,
+    notifier: broadcast::Sender<NotifierEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -45,10 +51,12 @@ struct PendingEntry {
 impl ApprovalManager {
     /// Construct a new manager from the user's `[approvals]` config.
     pub fn new(config: ApprovalsConfig) -> Arc<Self> {
+        let (notifier, _) = broadcast::channel(NOTIFIER_CAPACITY);
         Arc::new(Self {
             config,
             state: Mutex::new(State::default()),
             id_counter: AtomicU64::new(1),
+            notifier,
         })
     }
 
@@ -77,14 +85,19 @@ impl ApprovalManager {
             status: ApprovalStatus::Pending,
         };
         let (status_tx, _rx) = watch::channel(ApprovalStatus::Pending);
-        let mut state = self.state.lock().unwrap();
-        state.pending.insert(
-            id,
-            PendingEntry {
-                request: request.clone(),
-                status_tx,
-            },
-        );
+        {
+            let mut state = self.state.lock().unwrap();
+            state.pending.insert(
+                id,
+                PendingEntry {
+                    request: request.clone(),
+                    status_tx,
+                },
+            );
+        }
+        let _ = self.notifier.send(NotifierEvent::Pending {
+            approval: request.clone(),
+        });
         request
     }
 
@@ -127,12 +140,19 @@ impl ApprovalManager {
                 "cannot resolve to Pending".into(),
             ));
         }
-        let mut state = self.state.lock().unwrap();
-        let entry = state.pending.remove(id).ok_or(ApprovalError::NotFound)?;
-        let mut req = entry.request;
-        req.status = status.clone();
-        let _ = entry.status_tx.send(status);
-        state.resolved.insert(id.to_string(), req);
+        let final_status = {
+            let mut state = self.state.lock().unwrap();
+            let entry = state.pending.remove(id).ok_or(ApprovalError::NotFound)?;
+            let mut req = entry.request;
+            req.status = status.clone();
+            let _ = entry.status_tx.send(status.clone());
+            state.resolved.insert(id.to_string(), req);
+            status
+        };
+        let _ = self.notifier.send(NotifierEvent::Resolved {
+            id: id.to_string(),
+            status: final_status,
+        });
         Ok(())
     }
 
@@ -148,6 +168,14 @@ impl ApprovalManager {
         state.pending.values().map(|e| e.request.clone()).collect()
     }
 
+    /// Return a pending approval's snapshot by id. None if unknown or
+    /// already resolved (used by the dashboard decision endpoint to
+    /// pick default `rules_applied` from the agent's proposal).
+    pub fn snapshot_pending(&self, id: &str) -> Option<ApprovalRequest> {
+        let state = self.state.lock().unwrap();
+        state.pending.get(id).map(|e| e.request.clone())
+    }
+
     fn snapshot(&self, id: &str) -> Option<ApprovalRequest> {
         let state = self.state.lock().unwrap();
         if let Some(req) = state.resolved.get(id) {
@@ -156,14 +184,9 @@ impl ApprovalManager {
         state.pending.get(id).map(|e| e.request.clone())
     }
 
-    // ---- Phase 3+ surface (stubs, not yet used) ----
-    /// Subscribe to dashboard notifier events. Returns a receiver that
-    /// never yields in Phase 2; wired up in Phase 3.
-    #[allow(dead_code)]
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<NotifierEvent> {
-        // Placeholder channel so the signature is stable across phases.
-        // Replaced in Phase 3 with a shared broadcast sender.
-        let (_tx, rx) = tokio::sync::broadcast::channel(1);
-        rx
+    /// Subscribe to dashboard notifier events. Each dashboard `/events`
+    /// connection calls this once at stream open.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<NotifierEvent> {
+        self.notifier.subscribe()
     }
 }
