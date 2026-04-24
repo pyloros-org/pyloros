@@ -15,6 +15,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::response::{blocked_response, error_response, git_blocked_push_response};
 use super::{RequestContext, RequestLogger};
+use crate::approvals::{self, ApprovalManager};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
 };
@@ -25,6 +26,11 @@ use crate::filter::pktline;
 use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{CredentialEngine, FilterEngine, FilterResult, RequestInfo};
 use crate::tls::MitmCertificateGenerator;
+
+/// Magic hostname used by the approvals agent API. Requests to this host
+/// terminate inside the proxy and are routed to the approvals handler
+/// instead of being forwarded upstream.
+pub(crate) const APPROVALS_HOST: &str = "pyloros.internal";
 
 /// Handles CONNECT tunnels with TLS MITM
 pub struct TunnelHandler {
@@ -37,6 +43,10 @@ pub struct TunnelHandler {
     upstream_tls_config: Option<Arc<ClientConfig>>,
     logger: RequestLogger,
     max_body_log_size: usize,
+    /// Approvals manager — `Some` when the `[approvals]` section is set in
+    /// config; `None` means the feature is disabled and the agent API
+    /// returns 404.
+    approvals: Option<Arc<ApprovalManager>>,
 }
 
 impl TunnelHandler {
@@ -56,7 +66,16 @@ impl TunnelHandler {
             upstream_tls_config: None,
             logger: RequestLogger::new(),
             max_body_log_size: 1_048_576,
+            approvals: None,
         }
+    }
+
+    /// Attach the approvals manager. When set, requests to
+    /// `https://pyloros.internal/` are routed to the agent API handler
+    /// instead of being treated as a normal upstream host.
+    pub fn with_approvals(mut self, manager: Arc<ApprovalManager>) -> Self {
+        self.approvals = Some(manager);
+        self
     }
 
     /// Override the upstream port for all forwarded connections (for testing).
@@ -185,7 +204,12 @@ impl TunnelHandler {
         let service = service_fn(move |req: Request<Incoming>| {
             let host = host.clone();
             let handler = Arc::clone(&handler);
-            async move { handler.handle_tunneled_request(req, &host, port).await }
+            async move {
+                if host == APPROVALS_HOST {
+                    return approvals::api::serve(handler.approvals.as_ref(), req).await;
+                }
+                handler.handle_tunneled_request(req, &host, port).await
+            }
         });
 
         let io = TokioIo::new(tls_stream);

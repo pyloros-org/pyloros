@@ -16,6 +16,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::handler::ProxyHandler;
 use super::tunnel::TunnelHandler;
+use crate::approvals::{self, ApprovalManager};
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -76,6 +77,10 @@ pub struct ProxyServer {
     direct_https_listener: Option<BoundListener>,
     /// Optional direct HTTP listener (accepts plain HTTP, uses Host header for routing).
     direct_http_listener: Option<BoundListener>,
+    /// Optional dashboard listener (plain HTTP, dedicated address for approvals UI).
+    dashboard_listener: Option<BoundListener>,
+    /// Approvals manager when the `[approvals]` config section is present.
+    approvals: Option<Arc<ApprovalManager>>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -128,6 +133,11 @@ impl ProxyServer {
             1024,
         ));
 
+        let approvals = config
+            .approvals
+            .as_ref()
+            .map(|ac| ApprovalManager::new(ac.clone()));
+
         Ok(Self {
             config,
             filter_engine,
@@ -139,6 +149,8 @@ impl ProxyServer {
             listener: None,
             direct_https_listener: None,
             direct_http_listener: None,
+            dashboard_listener: None,
+            approvals,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -160,6 +172,10 @@ impl ProxyServer {
             Duration::from_secs(config.proxy.redirect_whitelist_ttl_secs),
             1024,
         ));
+        let approvals = config
+            .approvals
+            .as_ref()
+            .map(|ac| ApprovalManager::new(ac.clone()));
         Self {
             config,
             filter_engine,
@@ -171,6 +187,8 @@ impl ProxyServer {
             listener: None,
             direct_https_listener: None,
             direct_http_listener: None,
+            dashboard_listener: None,
+            approvals,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -249,6 +267,12 @@ impl ProxyServer {
             tracing::info!(address = %direct_addr, "Direct HTTP listener active");
         }
 
+        // Bind dashboard listener if approvals are enabled
+        if let Some(ref ac) = self.config.approvals.clone() {
+            let dashboard_addr = self.bind_dashboard(&ac.dashboard_bind).await?;
+            tracing::info!(address = %dashboard_addr, "Approvals dashboard listener active");
+        }
+
         self.serve(shutdown).await
     }
 
@@ -276,6 +300,14 @@ impl ProxyServer {
     pub async fn bind_direct_http(&mut self, bind_address: &str) -> Result<ListenAddress> {
         let (listener, addr) = bind_listener(bind_address).await?;
         self.direct_http_listener = Some(listener);
+        Ok(addr)
+    }
+
+    /// Bind the approvals dashboard listener to the given address.
+    /// The address can be a TCP socket address or a Unix socket path (containing '/').
+    pub async fn bind_dashboard(&mut self, bind_address: &str) -> Result<ListenAddress> {
+        let (listener, addr) = bind_listener(bind_address).await?;
+        self.dashboard_listener = Some(listener);
         Ok(addr)
     }
 
@@ -307,6 +339,14 @@ impl ProxyServer {
         // Spawn direct HTTP listener if bound (shares the watch receiver)
         if let Some(direct_listener) = self.direct_http_listener.take() {
             spawn_direct_http_accept_loop(direct_listener, tunnel_handler_rx.clone());
+        }
+
+        // Spawn dashboard listener if bound (independent of tunnel_handler; only
+        // needs the approvals manager).
+        if let Some(dashboard_listener) = self.dashboard_listener.take() {
+            if let Some(ref manager) = self.approvals {
+                spawn_dashboard_accept_loop(dashboard_listener, manager.clone());
+            }
         }
 
         // Set up reload channel. We always create one so the select! branch blocks.
@@ -565,7 +605,15 @@ impl ProxyServer {
         if let Some(ref logger) = self.audit_logger {
             handler = handler.with_audit_logger(logger.clone());
         }
+        if let Some(ref approvals) = self.approvals {
+            handler = handler.with_approvals(approvals.clone());
+        }
         handler
+    }
+
+    /// Accessor for tests that need to poke at the approvals manager directly.
+    pub fn approvals_manager(&self) -> Option<&Arc<ApprovalManager>> {
+        self.approvals.as_ref()
     }
 
     /// Get the bind address
@@ -849,4 +897,38 @@ fn spawn_sighup_handler(reload_tx: tokio::sync::mpsc::Sender<()>) {
             }
         }
     });
+}
+
+/// Spawn the dashboard accept loop. Each accepted connection serves the
+/// approvals dashboard (plain HTTP, no MITM, no proxy semantics).
+fn spawn_dashboard_accept_loop(listener: BoundListener, manager: Arc<ApprovalManager>) {
+    match listener {
+        BoundListener::Tcp(tcp_listener) => {
+            tokio::spawn(accept_loop_dashboard(tcp_listener, manager));
+        }
+        #[cfg(unix)]
+        BoundListener::Unix(unix_listener) => {
+            tokio::spawn(accept_loop_dashboard(unix_listener, manager));
+        }
+    }
+}
+
+async fn accept_loop_dashboard<L>(listener: L, manager: Arc<ApprovalManager>)
+where
+    L: DirectAccept,
+{
+    loop {
+        let (stream, client_addr) = match listener.accept_conn().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = %e, "Dashboard: failed to accept connection");
+                continue;
+            }
+        };
+        tracing::debug!(client = %client_addr, "Dashboard: new connection");
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            approvals::dashboard::serve_connection(manager, stream).await;
+        });
+    }
 }

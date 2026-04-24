@@ -23,6 +23,28 @@ pub struct Config {
     /// Credential injection entries
     #[serde(default)]
     pub credentials: Vec<Credential>,
+
+    /// Approvals feature (opt-in). When present, enables the agent API at
+    /// `https://pyloros.internal/` and binds a dashboard listener.
+    #[serde(default)]
+    pub approvals: Option<ApprovalsConfig>,
+}
+
+/// Configuration for the approvals feature.
+///
+/// Both fields are required when the `[approvals]` section is present.
+/// Without the section, the feature is disabled: the agent API returns 404
+/// and no dashboard listener is bound.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalsConfig {
+    /// Path to the sidecar TOML file where permanent approvals are persisted.
+    pub sidecar_file: String,
+
+    /// Address to bind the dashboard listener (plain HTTP).
+    /// MUST be an address the sandbox cannot reach — the dashboard has no
+    /// built-in authentication; bind isolation is the trust boundary.
+    pub dashboard_bind: String,
 }
 
 /// A credential to inject into matching outgoing requests.
@@ -504,6 +526,7 @@ impl Config {
             logging: LoggingConfig::default(),
             rules: Vec::new(),
             credentials: Vec::new(),
+            approvals: None,
         }
     }
 
