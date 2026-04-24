@@ -812,6 +812,7 @@ async fn connect_upstream_tls(
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            config.key_log = Arc::new(rustls::KeyLogFile::new());
             Arc::new(config)
         }
     };
@@ -979,6 +980,7 @@ fn h1_only_tls_config(base: Option<&ClientConfig>) -> Arc<ClientConfig> {
         }
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.key_log = Arc::new(rustls::KeyLogFile::new());
     Arc::new(config)
 }
 

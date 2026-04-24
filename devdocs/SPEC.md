@@ -306,6 +306,9 @@ The proxy shuts down cleanly on both `SIGINT` (Ctrl+C) and `SIGTERM`. On receivi
 - Separate control over logging of allowed and blocked requests (e.g., log only blocked to reduce noise, or only allowed for auditing)
 - Error messages for failed upstream requests must include the request method and URL for diagnostics
 
+#### TLS Key Logging
+When the `SSLKEYLOGFILE` environment variable is set to a writable path, pyloros writes TLS session secrets in NSS Key Log Format for both legs of every MITM connection (client↔proxy and proxy↔upstream). Load the file into Wireshark (Preferences → Protocols → TLS → (Pre)-Master-Secret log filename) to decrypt captures. Unset by default; no configuration required. Intended for debugging — do not enable in production.
+
 ### Audit Log
 
 An optional structured audit log records every request decision as a JSON object per line (JSONL) in a dedicated file. This is separate from the human-readable tracing output and designed for compliance, SIEM integration, and post-hoc analysis.
