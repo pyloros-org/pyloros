@@ -338,6 +338,52 @@ pub struct Rule {
     pub log_body: bool,
 }
 
+impl Rule {
+    /// Parse a rule from its short-form string representation.
+    ///
+    /// Examples:
+    /// - `"GET https://api.foo.com/*"`
+    /// - `"POST https://api.foo.com/v1/*"`
+    /// - `"* https://api.foo.com/*"` (any method)
+    ///
+    /// Used by the approvals feature where agents submit rule strings
+    /// rather than full TOML. Git-style rules (`git=fetch …`) are not
+    /// supported in v1 of the approvals feature — an agent that needs
+    /// one should ask the user to add it to the main config.
+    pub fn parse_shortform(s: &str) -> Result<Rule> {
+        let trimmed = s.trim();
+        let (method, url) = trimmed.split_once(char::is_whitespace).ok_or_else(|| {
+            Error::config(format!(
+                "approval rule must be 'METHOD URL' (got {:?})",
+                trimmed
+            ))
+        })?;
+        let method = method.trim();
+        let url = url.trim();
+        if method.is_empty() || url.is_empty() {
+            return Err(Error::config(format!(
+                "approval rule must be 'METHOD URL' (got {:?})",
+                trimmed
+            )));
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(Error::config(format!(
+                "approval rule URL must start with http:// or https:// (got {:?})",
+                url
+            )));
+        }
+        Ok(Rule {
+            method: Some(method.to_string()),
+            url: url.to_string(),
+            websocket: false,
+            git: None,
+            branches: None,
+            allow_redirects: Vec::new(),
+            log_body: false,
+        })
+    }
+}
+
 impl Config {
     /// Load configuration from a TOML file
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {

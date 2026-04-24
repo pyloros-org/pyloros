@@ -358,6 +358,14 @@ impl ProxyServer {
             tokio::sync::mpsc::channel(1)
         };
 
+        // Approvals rebuild channel: ApprovalManager sends `()` when the
+        // active approval rules change; we rebuild the effective FilterEngine
+        // in response.
+        let (approval_rebuild_tx, mut approval_rebuild_rx) = tokio::sync::mpsc::channel::<()>(1);
+        if let Some(ref manager) = self.approvals {
+            manager.attach_rebuild_tx(approval_rebuild_tx.clone());
+        }
+
         // Spawn file watcher and SIGHUP handler if config_path is set
         if let Some(ref config_path) = self.config_path {
             spawn_file_watcher(config_path.clone(), reload_tx.clone());
@@ -367,6 +375,7 @@ impl ProxyServer {
 
         // Keep one sender alive so recv() blocks (never returns None)
         let _reload_tx_keepalive = reload_tx;
+        let _approval_rebuild_tx_keepalive = approval_rebuild_tx;
 
         match listener {
             BoundListener::Tcp(tcp_listener) => loop {
@@ -377,6 +386,9 @@ impl ProxyServer {
                     }
                     Some(()) = reload_rx.recv() => {
                         self.apply_reload(&tunnel_handler_tx);
+                    }
+                    Some(()) = approval_rebuild_rx.recv() => {
+                        self.apply_approval_rebuild(&tunnel_handler_tx);
                     }
                     result = tcp_listener.accept() => {
                         let (stream, client_addr) = match result {
@@ -402,6 +414,9 @@ impl ProxyServer {
                     }
                     Some(()) = reload_rx.recv() => {
                         self.apply_reload(&tunnel_handler_tx);
+                    }
+                    Some(()) = approval_rebuild_rx.recv() => {
+                        self.apply_approval_rebuild(&tunnel_handler_tx);
                     }
                     result = unix_listener.accept() => {
                         let (stream, _addr) = match result {
@@ -578,6 +593,37 @@ impl ProxyServer {
                 }
             }
         });
+    }
+
+    /// Rebuild the effective FilterEngine from `config.rules ++ active_approval_rules`
+    /// and broadcast a new TunnelHandler. Called when an approval is granted
+    /// or expires. No-op if approvals are disabled (shouldn't happen — the
+    /// channel would never fire).
+    fn apply_approval_rebuild(
+        &mut self,
+        tunnel_handler_tx: &tokio::sync::watch::Sender<Arc<TunnelHandler>>,
+    ) {
+        let Some(ref manager) = self.approvals else {
+            return;
+        };
+
+        let mut combined = self.config.rules.clone();
+        combined.extend(manager.active_rules());
+
+        let new_filter = match FilterEngine::new(combined) {
+            Ok(f) => Arc::new(f),
+            Err(e) => {
+                tracing::error!(error = %e, "approval rebuild failed: rule compilation error");
+                return;
+            }
+        };
+
+        self.filter_engine = new_filter;
+        let _ = tunnel_handler_tx.send(Arc::new(self.make_tunnel_handler()));
+        tracing::info!(
+            rules = self.filter_engine.rule_count(),
+            "Approval rebuild applied"
+        );
     }
 
     fn make_tunnel_handler(&self) -> TunnelHandler {

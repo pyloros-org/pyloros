@@ -521,6 +521,99 @@ async fn test_dashboard_decision_with_custom_rules_and_message() {
     upstream.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: approved rules take effect on live traffic.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_approved_session_rule_unblocks_traffic() {
+    let t = test_report!("After approving, a previously blocked URL is allowed");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("hello from upstream"))
+        .report(&t, "returns 'hello from upstream'")
+        .start()
+        .await;
+    // Proxy with NO base rules — everything is blocked until approved.
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+
+    // 1. Before approval, request is blocked (451).
+    let resp = client.get("https://localhost/hello").await;
+    t.assert_eq("pre-approval status", &resp.status().as_u16(), &451u16);
+
+    // 2. Post an approval and resolve it out-of-band.
+    let manager = proxy.approvals.clone().unwrap();
+    let req = manager.post(
+        vec!["GET https://localhost/*".to_string()],
+        None,
+        None,
+        None,
+    );
+    manager
+        .resolve(
+            &req.id,
+            ApprovalStatus::Approved {
+                rules_applied: vec!["GET https://localhost/*".to_string()],
+                ttl: Lifetime::Session,
+            },
+        )
+        .unwrap();
+
+    // Give the rebuild signal a moment to propagate through the watch channel.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 3. The same request now succeeds — must use a fresh client because
+    // reqwest pools CONNECT tunnels and an existing tunnel is tied to the
+    // old FilterEngine (same pattern as config-reload tests).
+    let client2 = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client2.get("https://localhost/hello").await;
+    t.assert_eq("post-approval status", &resp.status().as_u16(), &200u16);
+    let body = resp.text().await.unwrap();
+    t.assert_eq("body", &body.as_str(), &"hello from upstream");
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_approve_invalid_rule_rejected() {
+    let t = test_report!("Approving with an unparseable rule string fails cleanly");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let manager = proxy.approvals.clone().unwrap();
+
+    let req = manager.post(vec!["this is not a rule".to_string()], None, None, None);
+
+    let err = manager
+        .resolve(
+            &req.id,
+            ApprovalStatus::Approved {
+                rules_applied: vec!["this is not a rule".to_string()],
+                ttl: Lifetime::Session,
+            },
+        )
+        .unwrap_err();
+    t.assert_contains(
+        "InvalidRule error",
+        err.to_string().as_str(),
+        "invalid rule",
+    );
+
+    // The approval remains pending (not consumed by the failed resolve).
+    let snap = manager.snapshot_pending(&req.id);
+    t.assert_true("still pending after invalid resolve", snap.is_some());
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
 #[tokio::test]
 async fn test_post_rejects_empty_rules() {
     let t = test_report!("POST with empty rules returns 400");
