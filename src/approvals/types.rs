@@ -12,15 +12,21 @@ pub struct ApprovalRequest {
     pub rules: Vec<String>,
 
     /// Free-text reason shown to the user in the dashboard.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 
     /// Optional context about the request that triggered this approval.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub triggered_by: Option<TriggeredBy>,
 
     /// Agent's suggested lifetime; used as the dashboard form default only.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_ttl: Option<Lifetime>,
 
-    /// Current decision state.
+    /// Current decision state. Flattened into the parent object so the
+    /// wire format is `{"id":..., "status":"approved", "rules_applied":[...]}`
+    /// rather than a nested object.
+    #[serde(flatten)]
     pub status: ApprovalStatus,
 }
 

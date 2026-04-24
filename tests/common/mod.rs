@@ -450,6 +450,7 @@ pub fn echo_handler() -> UpstreamHandler {
 pub struct TestProxy {
     pub addr: SocketAddr,
     pub dashboard_addr: Option<SocketAddr>,
+    pub approvals: Option<Arc<pyloros::approvals::ApprovalManager>>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -510,6 +511,7 @@ impl TestProxy {
         } else {
             None
         };
+        let approvals = server.approvals_manager().cloned();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
@@ -519,6 +521,7 @@ impl TestProxy {
         Self {
             addr,
             dashboard_addr,
+            approvals,
             shutdown_tx,
         }
     }
