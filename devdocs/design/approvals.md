@@ -37,13 +37,26 @@ We want: a **coding agent running inside the sandbox can request permission from
 
 ## API
 
-All endpoints are served by the proxy itself under a **magic hostname**: `https://pyloros.internal/`. The proxy intercepts requests to this host (just as it intercepts everything via MITM) and routes them to the internal API handler instead of forwarding upstream. No separate admin port, no dedicated listener — the sandbox already trusts and reaches the proxy, so this reuses the existing trust/reachability path.
+The approval system has **two audiences with two different entry points**, both served by the same proxy process on the same TCP listener — routing is by what the client sent:
 
-Implications:
-- **Works in both connection modes.** In HTTP-proxy mode the sandbox client sends `CONNECT pyloros.internal:443` and the proxy terminates TLS itself instead of dialing upstream. In direct-https mode the client just opens a TLS connection to the proxy and sends SNI `pyloros.internal`. Same handler either way; no new listener needed.
-- Any HTTP client that trusts the pyloros CA can hit `https://pyloros.internal/approvals` directly from inside the sandbox.
-- The browser dashboard is served at `https://pyloros.internal/` too. For the laptop browser, the user forwards the proxy port with SSH `LocalForward` and points their browser at it (via `/etc/hosts` entry or the direct-https entry point). Cert trust is the same install step as any MITM setup.
-- `pyloros.internal` is chosen because `.internal` is a reserved TLD (RFC-scoped for private use) and won't collide with real DNS.
+**Agent API — inside the sandbox.** Reachable at `https://pyloros.internal/` *through* the configured proxy. The proxy intercepts traffic to this magic hostname and routes it to the internal API handler instead of forwarding upstream.
+- In HTTP-proxy mode: sandbox client sends `CONNECT pyloros.internal:443`; proxy terminates TLS itself.
+- In direct-https mode: sandbox client opens TLS to the proxy with SNI `pyloros.internal`.
+- The sandbox already trusts the pyloros CA, so TLS works without extra setup.
+- `pyloros.internal` uses the reserved `.internal` TLD and won't collide with real DNS.
+- **Only sandboxes reach this hostname** — it resolves nowhere, and anyone who doesn't have pyloros configured as a proxy cannot see it. That's intentional: the agent API is deliberately scoped to the trust boundary.
+
+**Dashboard — laptop browser.** The user's laptop has no pyloros proxy configured and cannot resolve `pyloros.internal`. Instead, they SSH-forward the proxy port (`ssh -L 7777:localhost:<proxy-port> devserver`) and open `http://localhost:7777/` in their browser. When the proxy sees a **direct** HTTP request on its listener (not `CONNECT`, not an absolute-form request-target typical of HTTP proxying) with a `Host` that isn't one of the MITM targets, it serves the dashboard as plain HTTP. Plain HTTP is fine because the traffic stays inside the SSH tunnel — same security story as a locally-bound admin server.
+
+So: one listener, three traffic shapes:
+1. `CONNECT host:port` → tunnel / MITM (existing behavior)
+2. HTTP with absolute-URI or `Host: <upstream>` via proxy config → forward (existing)
+3. Direct HTTP request (e.g. `GET /` with `Host: localhost:7777`) → dashboard (new)
+
+And inside `CONNECT`/direct-https, a fourth case:
+- TLS SNI = `pyloros.internal` → agent API handler
+
+### `POST https://pyloros.internal/approvals`
 
 ### `POST https://pyloros.internal/approvals`
 
@@ -104,6 +117,8 @@ Simple per-minute rate limit on `POST https://pyloros.internal/approvals`. Exces
 
 v1: **browser Notification API**, triggered by SSE push to the open dashboard tab. Requires the tab to be open; if it's not, approvals just queue until the user comes back (strictly better than today, where the agent stalls).
 
+The Notification API technically requires a "secure context," but browsers explicitly treat `http://localhost` and `http://127.0.0.1` as secure contexts for exactly this kind of local-dev scenario (per W3C Secure Contexts). So plain HTTP over the SSH tunnel is fine — no TLS cert on the dashboard needed in v1. If we later want to serve the dashboard over HTTPS (e.g. to avoid the scary URL bar, or for Web Push w/ service workers), the proxy can mint a cert for `localhost` signed by its own CA, and the user already has that CA installed.
+
 Future layers, same approval UI:
 - **ntfy.sh** push — reaches the phone when user is AFK. The notification body is a link back to the same dashboard URL.
 - **Companion desktop app** — wraps the dashboard in a webview and auto-pops on new approvals, no browser tab needed.
@@ -147,4 +162,4 @@ If all proposed rules are already matched by the active ruleset, the approval au
 
 3. **Do denied approvals get remembered across requests?** We said "not crucial for v1." Leaving unbuilt but not precluded.
 
-4. **Bootstrapping the browser URL** — how does the user know to open `https://pyloros.internal/`? Print it on proxy startup; document in README; maybe auto-open on first blocked request if running under a TTY.
+4. **Bootstrapping the browser URL** — how does the user know to open `http://localhost:<forwarded-port>/`? Print setup instructions (including the `ssh -L` snippet) on proxy startup; document in README; maybe auto-open on first blocked request if running under a TTY.
