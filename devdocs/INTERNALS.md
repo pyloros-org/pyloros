@@ -288,3 +288,36 @@ build an in-memory SHA → index map; second, iteratively resolve deltas whose b
 resolves at least one object or makes no progress (all remaining deltas have
 unresolvable external bases).
 
+### Upstream want/have fallback (src/filter/upstream_negotiate.rs)
+
+The pack walk alone produces false positives: if a fast-forward push carries zero
+or few new commits (because `new-sha` already exists on the server under another
+ref, or because an intermediate commit in the chain is server-known and the pack
+is thin), the walk has no edges to follow and reports `NotAncestor`. We can't
+distinguish that from a genuine force-push.
+
+So on `NotAncestor`/`Indeterminate` from the pack walk, the proxy issues its own
+`POST <repo>/git-upload-pack` to the upstream, using protocol v2 with
+`command=fetch` + `want=<new-sha>` + `have=<old-sha>` + `done`. The server is the
+authoritative source on its own commit graph and responds with:
+
+- `ACK <old-sha> ready` — `old-sha` is reachable from `new-sha`. Fast-forward.
+- `NAK` — no common ancestor. Force-push.
+- Anything else (transport error, `ERR unknown want`, unparseable response) —
+  fail closed: block.
+
+Credentials are copied from the client's `Authorization` header (same as the
+normal push forward). Host/port/TLS use the same overrides as the main proxy
+path, so tests can point the sidecar at a local test upstream.
+
+### Natural extension (not implemented)
+
+The same negotiation machinery generalizes to tree/content inspection: v2
+`command=fetch` with `want`/`have` returns a `packfile` section after
+`acknowledgments` containing the commits (and optionally trees, via `filter=...`)
+between the two SHAs. A future "ban binaries on protected branches" or "require
+signed commits" check could walk the pushed pack first, then fetch a completion
+pack for any missing range, and inspect trees/blobs across the combined object
+set. The pack parser already handles all object types via the same delta
+resolution. Not built yet — noted for future reference.
+

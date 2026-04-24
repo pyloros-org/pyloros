@@ -168,8 +168,9 @@ The optional `protected_branches` field names ref patterns (same syntax as `bran
   - it is a **new ref** (`old-sha = 000…0`), or
   - it is a **fast-forward update**: `new-sha` is a descendant of `old-sha` via commits present in the pushed packfile.
 - **Deletions** of a protected ref (`new-sha = 000…0`) are always blocked.
-- **Non-fast-forward updates** (history rewrite, rewind) are always blocked. The proxy walks commits in the pushed pack from `new-sha` toward parents; if `old-sha` is not reachable the push is rejected. This is exact because a legitimate fast-forward pack always contains the chain of new commits linking back to `old-sha`; a thinned/forced pack does not.
-- If the pack is malformed, truncated, or the ancestry walk exceeds a sanity bound, the push is rejected (fail closed).
+- **Non-fast-forward updates** (history rewrite, rewind) are always blocked. The proxy first walks commits in the pushed pack from `new-sha` toward parents. If `old-sha` is reached, the push is allowed without further checks.
+- If the pack walk cannot confirm fast-forward (thin pack omits the chain, pack is empty because `new-sha` already exists on the server, or the pack is otherwise unresolvable), the proxy issues a sidecar **git protocol v2 `want`/`have` negotiation** to the upstream server (`POST <repo>/git-upload-pack` with forwarded client credentials). The server responds with `ACK <old-sha> ready` when `old-sha` is reachable from `new-sha` in its commit graph — this is the authoritative ancestry check. On `ACK ready` the push is allowed; on `NAK` (no common ancestor) it is blocked; on any transport, auth, or parse failure the push is blocked (fail closed).
+- This two-stage design keeps the common path (new commits on a protected branch) fast — the pack walk resolves it without any upstream round-trip — while still correctly allowing legitimate edge cases like fast-forwarding to a commit that already exists under another ref.
 - Protected-branch checks layer on top of `branches`: a ref must first pass the `branches` allow/deny filter, then the protected check.
 - Blocked pushes return the same git `receive-pack` error response mechanism used for `branches`, with a per-ref message like `! [remote rejected] main -> main (force-push to protected ref denied by proxy policy)`.
 

@@ -8,6 +8,7 @@ pub mod pktline;
 pub mod redirect_whitelist;
 mod rules;
 pub mod sigv4;
+pub mod upstream_negotiate;
 
 pub use credentials::CredentialEngine;
 pub use matcher::PatternMatcher;

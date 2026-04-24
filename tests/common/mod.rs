@@ -1015,6 +1015,16 @@ pub fn git_cgi_handler(
                 .unwrap_or("")
                 .to_string();
 
+            // Forward the Git-Protocol header so the backend can negotiate v2.
+            // git-http-backend reads the `GIT_PROTOCOL` env var (not
+            // `HTTP_GIT_PROTOCOL`) per its source.
+            let git_protocol = req
+                .headers()
+                .get("git-protocol")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
             let body_bytes = req.collect().await.unwrap().to_bytes();
 
             let mut cmd = std::process::Command::new(&backend_path);
@@ -1030,6 +1040,9 @@ pub fn git_cgi_handler(
                 .stderr(std::process::Stdio::piped());
             if !content_length.is_empty() {
                 cmd.env("CONTENT_LENGTH", &content_length);
+            }
+            if !git_protocol.is_empty() {
+                cmd.env("GIT_PROTOCOL", &git_protocol);
             }
 
             let mut child = cmd.spawn().expect("failed to spawn git http-backend");

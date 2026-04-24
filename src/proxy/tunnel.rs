@@ -399,7 +399,16 @@ impl TunnelHandler {
 
                 // Protected-branch (force-push / delete / non-FF) check
                 if !filter.protected.is_empty() {
-                    let protected_blocked = protected_branch_violations(&body_bytes, filter);
+                    let protected_blocked = self
+                        .protected_branch_violations(
+                            &body_bytes,
+                            filter,
+                            host,
+                            port,
+                            &path,
+                            &parts.headers,
+                        )
+                        .await;
                     if !protected_blocked.is_empty() {
                         if self.logger.log_blocked_requests {
                             tracing::warn!(
@@ -1122,43 +1131,188 @@ async fn forward_websocket(
 /// we require either a new-ref creation or a fast-forward update (verified by
 /// walking the pushed packfile's commit graph). Deletions of protected refs
 /// and non-fast-forward updates are reported as blocked.
-fn protected_branch_violations(
-    body_bytes: &[u8],
-    filter: &crate::filter::BranchFilter,
-) -> Vec<String> {
-    let updates = pktline::extract_push_updates(body_bytes);
-    let pack_bytes = pktline::pack_bytes_in_body(body_bytes);
-    let mut blocked = Vec::new();
+impl TunnelHandler {
+    /// Evaluate each protected ref update. Pack walk first; fall back to a
+    /// want/have negotiation against the upstream for cases the walk can't
+    /// confirm (thin pack, empty pack, `new-sha` already server-known).
+    async fn protected_branch_violations(
+        &self,
+        body_bytes: &[u8],
+        filter: &crate::filter::BranchFilter,
+        host: &str,
+        port: u16,
+        request_path: &str,
+        client_headers: &hyper::header::HeaderMap,
+    ) -> Vec<String> {
+        use crate::filter::upstream_negotiate::AncestryCheck;
 
-    for u in updates {
-        if !filter.is_protected(&u.name) {
-            continue;
-        }
-        // Deletion of a protected ref is always blocked.
-        if u.is_delete() {
-            blocked.push(u.name);
-            continue;
-        }
-        // Creating a new protected ref is always allowed.
-        if u.is_create() {
-            continue;
-        }
-        // Existing ref update: must be a fast-forward.
-        let pack_bytes = match pack_bytes {
-            Some(p) => p,
-            // No pack data — any non-trivial update cannot be verified.
-            None => {
+        let updates = pktline::extract_push_updates(body_bytes);
+        let pack_bytes = pktline::pack_bytes_in_body(body_bytes);
+        let mut blocked = Vec::new();
+
+        for u in updates {
+            if !filter.is_protected(&u.name) {
+                continue;
+            }
+            // Deletion of a protected ref is always blocked.
+            if u.is_delete() {
+                tracing::warn!(
+                    refname = %u.name,
+                    "force-push check: delete of protected ref — blocking"
+                );
                 blocked.push(u.name);
                 continue;
             }
-        };
-        match pack::pack_contains_ancestry(pack_bytes, &u.old, &u.new) {
-            AncestryResult::IsAncestor => {}
-            AncestryResult::NotAncestor | AncestryResult::Indeterminate => {
-                blocked.push(u.name);
+            // Creating a new protected ref is always allowed.
+            if u.is_create() {
+                continue;
+            }
+
+            // Existing ref update: require fast-forward.
+            let pack_walk = pack_bytes.map(|pb| pack::pack_contains_ancestry(pb, &u.old, &u.new));
+
+            match pack_walk {
+                Some(AncestryResult::IsAncestor) => {
+                    tracing::info!(
+                        refname = %u.name,
+                        "force-push check: fast-forward confirmed by pack walk"
+                    );
+                }
+                Some(AncestryResult::NotAncestor) | Some(AncestryResult::Indeterminate) | None => {
+                    // Pack walk can't confirm — ask the upstream via want/have.
+                    tracing::info!(
+                        refname = %u.name,
+                        "force-push check: pack walk inconclusive, querying upstream"
+                    );
+                    let check = self
+                        .upstream_ancestry_check(
+                            host,
+                            port,
+                            request_path,
+                            client_headers,
+                            &u.old,
+                            &u.new,
+                        )
+                        .await;
+                    match check {
+                        AncestryCheck::Acked => {
+                            tracing::info!(
+                                refname = %u.name,
+                                "force-push check: fast-forward confirmed by upstream ACK"
+                            );
+                        }
+                        AncestryCheck::Nak => {
+                            tracing::warn!(
+                                refname = %u.name,
+                                "force-push check: upstream NAK — force-push detected"
+                            );
+                            blocked.push(u.name);
+                        }
+                        AncestryCheck::Error(reason) => {
+                            tracing::warn!(
+                                refname = %u.name,
+                                reason = %reason,
+                                "force-push check: upstream query failed — blocking (fail closed)"
+                            );
+                            blocked.push(u.name);
+                        }
+                    }
+                }
             }
         }
+
+        blocked
     }
 
-    blocked
+    /// Issue a git protocol v2 `fetch` `want`/`have` negotiation against the
+    /// upstream's `git-upload-pack` endpoint and interpret the ACK/NAK reply.
+    ///
+    /// Host/port/TLS reuse the same overrides as the main forwarding path so
+    /// tests can point at a local upstream; the client's Authorization header
+    /// is forwarded so authenticated repos work.
+    async fn upstream_ancestry_check(
+        &self,
+        host: &str,
+        port: u16,
+        request_path: &str,
+        client_headers: &hyper::header::HeaderMap,
+        old: &[u8; 20],
+        new: &[u8; 20],
+    ) -> crate::filter::upstream_negotiate::AncestryCheck {
+        use crate::filter::upstream_negotiate::{self, AncestryCheck};
+
+        // Derive git-upload-pack URL from the receive-pack request path.
+        // Strip an optional trailing "/git-receive-pack" to get the repo base.
+        let base = request_path
+            .strip_suffix("/git-receive-pack")
+            .unwrap_or(request_path);
+        let upload_pack_path = format!("{}/git-upload-pack", base);
+
+        let body_bytes = Bytes::from(upstream_negotiate::build_v2_fetch_body(new, old));
+        let body_len = body_bytes.len();
+
+        let connect_host = self
+            .upstream_host_override
+            .clone()
+            .unwrap_or_else(|| host.to_string());
+        let connect_port = self.upstream_port_override.unwrap_or(port);
+        let sni_host = host.to_string();
+        let authority = if port == 443 {
+            sni_host.clone()
+        } else {
+            format!("{}:{}", sni_host, port)
+        };
+        let uri_str = format!("https://{}{}", authority, upload_pack_path);
+
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(&uri_str)
+            .header(hyper::header::HOST, &authority)
+            .header(
+                hyper::header::CONTENT_TYPE,
+                "application/x-git-upload-pack-request",
+            )
+            .header(
+                hyper::header::ACCEPT,
+                "application/x-git-upload-pack-result",
+            )
+            .header("Git-Protocol", "version=2")
+            .header(hyper::header::CONTENT_LENGTH, body_len.to_string());
+
+        if let Some(v) = client_headers.get(hyper::header::AUTHORIZATION) {
+            builder = builder.header(hyper::header::AUTHORIZATION, v);
+        }
+
+        let req_body = Full::new(body_bytes)
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed();
+        let req = match builder.body(req_body) {
+            Ok(r) => r,
+            Err(e) => return AncestryCheck::Error(format!("build request: {}", e)),
+        };
+
+        let resp = match forward_request_boxed(
+            req,
+            connect_host,
+            connect_port,
+            sni_host,
+            self.upstream_tls_config.clone(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return AncestryCheck::Error(format!("upstream request failed: {}", e)),
+        };
+
+        if !resp.status().is_success() {
+            return AncestryCheck::Error(format!("upstream HTTP {}", resp.status()));
+        }
+
+        let body = match resp.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => return AncestryCheck::Error(format!("read response: {}", e)),
+        };
+
+        upstream_negotiate::parse_fetch_response(&body)
+    }
 }
