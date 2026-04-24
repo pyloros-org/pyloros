@@ -1,9 +1,13 @@
 //! Core state for the approvals feature.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Rolling window for the POST rate limit.
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const RATE_LIMIT_MAX: usize = 60;
 
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -53,6 +57,9 @@ struct State {
     /// Rules that are currently in effect, merged into the FilterEngine
     /// on top of the base config rules.
     active: Vec<ActiveApproval>,
+    /// Timestamps of recent POST /approvals calls, for sliding-window
+    /// rate limiting.
+    recent_posts: VecDeque<Instant>,
 }
 
 #[derive(Debug)]
@@ -136,15 +143,33 @@ impl ApprovalManager {
     }
 
     /// Submit a new approval request. Returns the created request with
-    /// its assigned id. The rules vector is stored verbatim; validation
-    /// of rule syntax happens at decision time (Phase 4).
+    /// its assigned id. Enforces a sliding-window rate limit
+    /// (60 POSTs/minute per manager); exceeding returns `RateLimited`.
     pub fn post(
         &self,
         rules: Vec<String>,
         reason: Option<String>,
         triggered_by: Option<TriggeredBy>,
         suggested_ttl: Option<Lifetime>,
-    ) -> ApprovalRequest {
+    ) -> Result<ApprovalRequest, ApprovalError> {
+        // Rate limit check. Prune entries older than the window, then
+        // compare against the cap.
+        {
+            let mut state = self.state.lock().unwrap();
+            let now = Instant::now();
+            while let Some(&oldest) = state.recent_posts.front() {
+                if now.duration_since(oldest) >= RATE_LIMIT_WINDOW {
+                    state.recent_posts.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if state.recent_posts.len() >= RATE_LIMIT_MAX {
+                return Err(ApprovalError::RateLimited);
+            }
+            state.recent_posts.push_back(now);
+        }
+
         let id = self.next_id();
         let request = ApprovalRequest {
             id: id.clone(),
@@ -168,7 +193,7 @@ impl ApprovalManager {
         let _ = self.notifier.send(NotifierEvent::Pending {
             approval: request.clone(),
         });
-        request
+        Ok(request)
     }
 
     /// Fetch an approval by id, waiting up to `wait` for a pending

@@ -13,8 +13,11 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
 
+use crate::filter::FilterEngine;
+
+use super::dedup;
 use super::state::ApprovalManager;
-use super::types::{ApprovalRequest, Lifetime, TriggeredBy};
+use super::types::{ApprovalError, ApprovalRequest, ApprovalStatus, Lifetime, TriggeredBy};
 
 /// Max time an agent may request to long-poll. Agents asking for more
 /// get clamped; they should re-poll on timeout anyway.
@@ -28,6 +31,7 @@ const DEFAULT_LONG_POLL: Duration = Duration::from_secs(30);
 /// "endpoint doesn't exist".
 pub async fn serve(
     manager: Option<&Arc<ApprovalManager>>,
+    engine: Arc<FilterEngine>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let Some(manager) = manager else {
@@ -38,7 +42,7 @@ pub async fn serve(
     let path = req.uri().path().to_string();
 
     match (&method, path.as_str()) {
-        (&Method::POST, "/approvals") => Ok(handle_post(manager, req).await),
+        (&Method::POST, "/approvals") => Ok(handle_post(manager, engine.as_ref(), req).await),
         (&Method::GET, p) if p.starts_with("/approvals/") => {
             let id = p.trim_start_matches("/approvals/").to_string();
             let wait = parse_wait(req.uri().query());
@@ -68,6 +72,7 @@ struct Context {
 
 async fn handle_post(
     manager: &Arc<ApprovalManager>,
+    engine: &FilterEngine,
     req: Request<Incoming>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = match req.into_body().collect().await {
@@ -83,14 +88,44 @@ async fn handle_post(
     }
 
     let triggered_by = parsed.context.and_then(|c| c.triggered_by);
-    let request = manager.post(
+
+    // Dedup (I4): if the proposed rules are already covered by the
+    // active ruleset, short-circuit as approved — no pending entry,
+    // no rate-limit consumption, no dashboard notification.
+    if dedup::all_subsumed(engine, &parsed.rules, triggered_by.as_ref()) {
+        let auto = ApprovalRequest {
+            id: "apr_dedup".to_string(),
+            rules: parsed.rules.clone(),
+            reason: parsed.reason,
+            triggered_by,
+            suggested_ttl: parsed.suggested_ttl,
+            status: ApprovalStatus::Approved {
+                rules_applied: parsed.rules,
+                ttl: Lifetime::Session,
+            },
+        };
+        tracing::debug!("approvals: auto-approved via dedup");
+        return json_response(StatusCode::OK, &auto);
+    }
+
+    match manager.post(
         parsed.rules,
         parsed.reason,
         triggered_by,
         parsed.suggested_ttl,
-    );
-
-    json_response(StatusCode::ACCEPTED, &request)
+    ) {
+        Ok(request) => json_response(StatusCode::ACCEPTED, &request),
+        Err(ApprovalError::RateLimited) => Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("Content-Type", "text/plain")
+            .body(
+                Full::new(Bytes::from_static(b"approvals rate limit exceeded\n"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
+            .unwrap(),
+        Err(e) => bad_request(&e.to_string()),
+    }
 }
 
 async fn handle_get(

@@ -441,12 +441,14 @@ async fn test_dashboard_sse_streams_pending_and_resolved() {
     t.assert_contains("snapshot event", snap.as_str(), "\"snapshot\"");
 
     // Post a new approval; a Pending event must arrive on the stream.
-    let req = manager.post(
-        vec!["GET https://api.foo.com/*".to_string()],
-        Some("because".to_string()),
-        None,
-        None,
-    );
+    let req = manager
+        .post(
+            vec!["GET https://api.foo.com/*".to_string()],
+            Some("because".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
     let id = req.id.clone();
 
     let pending = tokio::time::timeout(std::time::Duration::from_secs(2), ev_rx.recv())
@@ -490,7 +492,9 @@ async fn test_dashboard_decision_with_custom_rules_and_message() {
     let dashboard_addr = proxy.dashboard_addr.unwrap();
     let manager = proxy.approvals.clone().unwrap();
 
-    let req = manager.post(vec!["GET https://broad/*".to_string()], None, None, None);
+    let req = manager
+        .post(vec!["GET https://broad/*".to_string()], None, None, None)
+        .unwrap();
 
     let dashboard = reqwest::Client::builder().build().unwrap();
     // Deny with a message.
@@ -545,12 +549,14 @@ async fn test_approved_session_rule_unblocks_traffic() {
 
     // 2. Post an approval and resolve it out-of-band.
     let manager = proxy.approvals.clone().unwrap();
-    let req = manager.post(
-        vec!["GET https://localhost/*".to_string()],
-        None,
-        None,
-        None,
-    );
+    let req = manager
+        .post(
+            vec!["GET https://localhost/*".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     manager
         .resolve(
             &req.id,
@@ -589,7 +595,9 @@ async fn test_approve_invalid_rule_rejected() {
     let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().unwrap();
 
-    let req = manager.post(vec!["this is not a rule".to_string()], None, None, None);
+    let req = manager
+        .post(vec!["this is not a rule".to_string()], None, None, None)
+        .unwrap();
 
     let err = manager
         .resolve(
@@ -643,12 +651,14 @@ async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
         .start()
         .await;
     let manager = proxy1.approvals.clone().unwrap();
-    let req = manager.post(
-        vec!["GET https://localhost/*".to_string()],
-        None,
-        None,
-        None,
-    );
+    let req = manager
+        .post(
+            vec!["GET https://localhost/*".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     manager
         .resolve(
             &req.id,
@@ -701,12 +711,14 @@ async fn test_revoke_removes_active_rule() {
     let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().unwrap();
 
-    let req = manager.post(
-        vec!["GET https://localhost/*".to_string()],
-        None,
-        None,
-        None,
-    );
+    let req = manager
+        .post(
+            vec!["GET https://localhost/*".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     manager
         .resolve(
             &req.id,
@@ -759,12 +771,14 @@ async fn test_permanent_revoke_rewrites_sidecar_empty() {
         .await;
     let manager = proxy.approvals.clone().unwrap();
 
-    let req = manager.post(
-        vec!["GET https://localhost/*".to_string()],
-        None,
-        None,
-        None,
-    );
+    let req = manager
+        .post(
+            vec!["GET https://localhost/*".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     manager
         .resolve(
             &req.id,
@@ -780,6 +794,92 @@ async fn test_permanent_revoke_rewrites_sidecar_empty() {
     manager.revoke_approval(&req.id);
     let after = std::fs::read_to_string(&sidecar_path).unwrap();
     t.assert_true("after revoke: url absent", !after.contains("localhost/*"));
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: dedup (I4) + rate limit.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_dedup_auto_approves_subsumed_rule() {
+    let t = test_report!("POST with rule already covered by ruleset auto-approves as 200");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    // Start the proxy with a base rule that already covers api.foo.com.
+    // The approval POST should be short-circuited.
+    let sidecar = tempfile::NamedTempFile::new().unwrap();
+    let sidecar_path = sidecar.path().to_string_lossy().into_owned();
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![pyloros::config::Rule {
+            method: Some("GET".to_string()),
+            url: "https://api.foo.com/*".to_string(),
+            websocket: false,
+            git: None,
+            branches: None,
+            allow_redirects: Vec::new(),
+            log_body: false,
+        }],
+        upstream.port(),
+    )
+    .with_approvals(&sidecar_path)
+    .report(&t)
+    .start()
+    .await;
+    let manager = proxy.approvals.clone().unwrap();
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client
+        .post_with_body(
+            "https://pyloros.internal/approvals",
+            json!({"rules": ["GET https://api.foo.com/v1/weather"]}).to_string(),
+        )
+        .await;
+    t.assert_eq("status", &resp.status().as_u16(), &200u16);
+    let got: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    t.assert_eq("status", &got["status"].as_str().unwrap(), &"approved");
+
+    // No pending approval should have been created.
+    let pending = manager.list_pending();
+    t.assert_eq("no pending created", &pending.len(), &0usize);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_rate_limit_returns_429() {
+    let t = test_report!("Bursting past 60 POSTs in <60s eventually returns 429");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let mut saw_429 = false;
+    for i in 0..65 {
+        let resp = client
+            .post_with_body(
+                "https://pyloros.internal/approvals",
+                json!({"rules": [format!("GET https://api.foo.com/{}", i)]}).to_string(),
+            )
+            .await;
+        if resp.status().as_u16() == 429 {
+            saw_429 = true;
+            break;
+        }
+    }
+    t.assert_true("saw 429 within 65 posts", saw_429);
 
     proxy.shutdown();
     upstream.shutdown();

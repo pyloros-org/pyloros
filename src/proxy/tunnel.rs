@@ -206,7 +206,12 @@ impl TunnelHandler {
             let handler = Arc::clone(&handler);
             async move {
                 if host == APPROVALS_HOST {
-                    return approvals::api::serve(handler.approvals.as_ref(), req).await;
+                    return approvals::api::serve(
+                        handler.approvals.as_ref(),
+                        handler.filter_engine.clone(),
+                        req,
+                    )
+                    .await;
                 }
                 handler.handle_tunneled_request(req, &host, port).await
             }
