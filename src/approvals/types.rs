@@ -50,6 +50,24 @@ pub enum Lifetime {
     Permanent,
 }
 
+impl Lifetime {
+    /// Duration for lifetimes that have a natural expiry, else `None`.
+    /// Session and Permanent never expire in memory — Session is dropped
+    /// on process exit, Permanent is loaded from the sidecar on startup.
+    pub fn duration(self) -> Option<std::time::Duration> {
+        match self {
+            Lifetime::OneHour => Some(std::time::Duration::from_secs(3600)),
+            Lifetime::OneDay => Some(std::time::Duration::from_secs(86_400)),
+            Lifetime::Session | Lifetime::Permanent => None,
+        }
+    }
+
+    /// Whether approvals with this lifetime should persist to the sidecar.
+    pub fn is_permanent(self) -> bool {
+        matches!(self, Lifetime::Permanent)
+    }
+}
+
 /// Current state of an approval request.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

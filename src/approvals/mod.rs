@@ -10,6 +10,7 @@
 pub mod api;
 pub mod dashboard;
 pub mod state;
+pub mod storage;
 pub mod types;
 
 pub use state::ApprovalManager;

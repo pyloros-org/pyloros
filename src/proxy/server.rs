@@ -81,6 +81,10 @@ pub struct ProxyServer {
     dashboard_listener: Option<BoundListener>,
     /// Approvals manager when the `[approvals]` config section is present.
     approvals: Option<Arc<ApprovalManager>>,
+    /// Receiver for the approvals rebuild channel (consumed by `serve`).
+    /// Paired with a sender attached to `ApprovalManager` at construction
+    /// time so resolve signals don't race the serve loop's startup.
+    approval_rebuild_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -138,6 +142,29 @@ impl ProxyServer {
             .as_ref()
             .map(|ac| ApprovalManager::new(ac.clone()));
 
+        // Create the rebuild channel up front and attach the sender to the
+        // manager. This avoids a race where an early resolve() signals
+        // rebuild before serve()'s select loop is wired up, which would
+        // silently drop the rebuild.
+        let approval_rebuild_rx = if let Some(ref manager) = approvals {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            manager.attach_rebuild_tx(tx);
+            Some(rx)
+        } else {
+            None
+        };
+
+        // Build the initial FilterEngine from base rules ++ approval rules
+        // loaded from the sidecar. Replaces the earlier `filter_engine`
+        // that used only config.rules.
+        let filter_engine = if let Some(ref manager) = approvals {
+            let mut combined = config.rules.clone();
+            combined.extend(manager.active_rules());
+            Arc::new(FilterEngine::new(combined)?)
+        } else {
+            filter_engine
+        };
+
         Ok(Self {
             config,
             filter_engine,
@@ -151,6 +178,7 @@ impl ProxyServer {
             direct_http_listener: None,
             dashboard_listener: None,
             approvals,
+            approval_rebuild_rx,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -189,6 +217,7 @@ impl ProxyServer {
             direct_http_listener: None,
             dashboard_listener: None,
             approvals,
+            approval_rebuild_rx: None,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -359,12 +388,14 @@ impl ProxyServer {
         };
 
         // Approvals rebuild channel: ApprovalManager sends `()` when the
-        // active approval rules change; we rebuild the effective FilterEngine
-        // in response.
-        let (approval_rebuild_tx, mut approval_rebuild_rx) = tokio::sync::mpsc::channel::<()>(1);
-        if let Some(ref manager) = self.approvals {
-            manager.attach_rebuild_tx(approval_rebuild_tx.clone());
-        }
+        // active approval rules change. The sender was attached at
+        // construction time (in `new`) so early resolves don't race the
+        // serve loop's startup. If approvals are disabled, build a dummy
+        // receiver so the select! arm stays `Pending` forever.
+        let mut approval_rebuild_rx = match self.approval_rebuild_rx.take() {
+            Some(rx) => rx,
+            None => tokio::sync::mpsc::channel::<()>(1).1,
+        };
 
         // Spawn file watcher and SIGHUP handler if config_path is set
         if let Some(ref config_path) = self.config_path {
@@ -375,7 +406,6 @@ impl ProxyServer {
 
         // Keep one sender alive so recv() blocks (never returns None)
         let _reload_tx_keepalive = reload_tx;
-        let _approval_rebuild_tx_keepalive = approval_rebuild_tx;
 
         match listener {
             BoundListener::Tcp(tcp_listener) => loop {

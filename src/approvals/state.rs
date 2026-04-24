@@ -32,13 +32,14 @@ pub struct ApprovalManager {
     rebuild_tx: OnceLock<mpsc::Sender<()>>,
 }
 
-/// A currently-active approval rule. Phase 4 stores only the rule; TTL
-/// expiry and permanent storage are added in Phase 5.
+/// A currently-active approval rule.
 #[derive(Debug, Clone)]
 pub struct ActiveApproval {
     pub rule: Rule,
-    #[allow(dead_code)] // Phase 5
     pub lifetime: Lifetime,
+    /// The approval id this rule came from. Used by TTL expiry timers
+    /// to find all rules from a single approval and remove them together.
+    pub approval_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -66,11 +67,40 @@ struct PendingEntry {
 
 impl ApprovalManager {
     /// Construct a new manager from the user's `[approvals]` config.
+    ///
+    /// Loads permanent rules from the sidecar file (if any) on startup so
+    /// they're active from the first FilterEngine build.
     pub fn new(config: ApprovalsConfig) -> Arc<Self> {
         let (notifier, _) = broadcast::channel(NOTIFIER_CAPACITY);
+        let mut state = State::default();
+        match super::storage::load_permanent_rules(&config.sidecar_file) {
+            Ok(rules) => {
+                for rule in rules {
+                    state.active.push(ActiveApproval {
+                        rule,
+                        lifetime: Lifetime::Permanent,
+                        approval_id: String::new(), // permanent rules loaded from disk have no originating approval id
+                    });
+                }
+                if !state.active.is_empty() {
+                    tracing::info!(
+                        count = state.active.len(),
+                        path = %config.sidecar_file,
+                        "Loaded permanent approval rules from sidecar"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %config.sidecar_file,
+                    "Failed to load approvals sidecar; continuing with empty permanent set"
+                );
+            }
+        }
         Arc::new(Self {
             config,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
             id_counter: AtomicU64::new(1),
             notifier,
             rebuild_tx: OnceLock::new(),
@@ -179,7 +209,11 @@ impl ApprovalManager {
     /// the effective FilterEngine. If any rule fails to parse, the whole
     /// resolve is rejected with `InvalidRule` and the approval stays
     /// pending (so the user can edit and retry from the dashboard).
-    pub fn resolve(&self, id: &str, status: ApprovalStatus) -> Result<(), ApprovalError> {
+    pub fn resolve(
+        self: &Arc<Self>,
+        id: &str,
+        status: ApprovalStatus,
+    ) -> Result<(), ApprovalError> {
         if matches!(status, ApprovalStatus::Pending) {
             return Err(ApprovalError::InvalidRule(
                 "cannot resolve to Pending".into(),
@@ -208,25 +242,36 @@ impl ApprovalManager {
             None
         };
 
-        let (final_status, rebuilt) = {
+        let (final_status, rebuilt, permanent_snapshot) = {
             let mut state = self.state.lock().unwrap();
             let entry = state.pending.remove(id).ok_or(ApprovalError::NotFound)?;
             let mut req = entry.request;
             req.status = status.clone();
             let _ = entry.status_tx.send(status.clone());
             state.resolved.insert(id.to_string(), req);
-            let rebuilt = if let Some(ttl) = approve_ttl {
+            let mut rebuilt = false;
+            let mut permanent_snapshot: Option<Vec<Rule>> = None;
+            if let Some(ttl) = approve_ttl {
                 for rule in parsed_rules {
                     state.active.push(ActiveApproval {
                         rule,
                         lifetime: ttl,
+                        approval_id: id.to_string(),
                     });
                 }
-                true
-            } else {
-                false
-            };
-            (status, rebuilt)
+                rebuilt = true;
+                if ttl.is_permanent() {
+                    permanent_snapshot = Some(
+                        state
+                            .active
+                            .iter()
+                            .filter(|a| a.lifetime.is_permanent())
+                            .map(|a| a.rule.clone())
+                            .collect(),
+                    );
+                }
+            }
+            (status, rebuilt, permanent_snapshot)
         };
 
         let _ = self.notifier.send(NotifierEvent::Resolved {
@@ -234,15 +279,84 @@ impl ApprovalManager {
             status: final_status,
         });
 
+        if let Some(snapshot) = permanent_snapshot {
+            if let Err(e) =
+                super::storage::save_permanent_rules(&self.config.sidecar_file, &snapshot)
+            {
+                tracing::error!(
+                    error = %e,
+                    path = %self.config.sidecar_file,
+                    "Failed to persist approvals sidecar"
+                );
+            }
+        }
+
+        // Schedule expiry for timed lifetimes. Permanent never expires
+        // automatically; Session is dropped on process exit.
+        if let Some(ttl) = approve_ttl {
+            if let Some(duration) = ttl.duration() {
+                self.spawn_expiry_timer(id.to_string(), duration);
+            }
+        }
+
         if rebuilt {
             self.request_rebuild();
         }
         Ok(())
     }
 
+    /// Revoke all rules from a previously approved approval. Removes them
+    /// from the active set, persists the sidecar if any were permanent,
+    /// and signals a rebuild. No-op if no rules match.
+    pub fn revoke_approval(&self, approval_id: &str) {
+        let (removed_any, permanent_snapshot) = {
+            let mut state = self.state.lock().unwrap();
+            let before = state.active.len();
+            let had_permanent = state
+                .active
+                .iter()
+                .any(|a| a.approval_id == approval_id && a.lifetime.is_permanent());
+            state.active.retain(|a| a.approval_id != approval_id);
+            let removed_any = state.active.len() != before;
+            let permanent_snapshot = if removed_any && had_permanent {
+                Some(
+                    state
+                        .active
+                        .iter()
+                        .filter(|a| a.lifetime.is_permanent())
+                        .map(|a| a.rule.clone())
+                        .collect::<Vec<Rule>>(),
+                )
+            } else {
+                None
+            };
+            (removed_any, permanent_snapshot)
+        };
+
+        if let Some(snapshot) = permanent_snapshot {
+            let _ = super::storage::save_permanent_rules(&self.config.sidecar_file, &snapshot);
+        }
+
+        if removed_any {
+            self.request_rebuild();
+        }
+    }
+
+    fn spawn_expiry_timer(self: &Arc<Self>, approval_id: String, duration: Duration) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            this.revoke_approval(&approval_id);
+        });
+    }
+
     /// Test-only: resolve without going through the dashboard API.
     #[doc(hidden)]
-    pub fn resolve_for_test(&self, id: &str, status: ApprovalStatus) -> Result<(), ApprovalError> {
+    pub fn resolve_for_test(
+        self: &Arc<Self>,
+        id: &str,
+        status: ApprovalStatus,
+    ) -> Result<(), ApprovalError> {
         self.resolve(id, status)
     }
 

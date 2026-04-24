@@ -614,6 +614,177 @@ async fn test_approve_invalid_rule_rejected() {
     upstream.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5: TTL + sidecar persistence.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
+    let t = test_report!("Permanent approval writes sidecar and a new proxy loads it on startup");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("hello from upstream"))
+        .report(&t, "returns 'hello from upstream'")
+        .start()
+        .await;
+
+    // Pick an explicit sidecar path so we can restart against the same file.
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar_path = dir
+        .path()
+        .join("approvals.toml")
+        .to_string_lossy()
+        .into_owned();
+
+    // Proxy #1 — approve with permanent lifetime; sidecar should be written.
+    let proxy1 = TestProxy::builder(&ca, vec![], upstream.port())
+        .with_approvals(&sidecar_path)
+        .report(&t)
+        .start()
+        .await;
+    let manager = proxy1.approvals.clone().unwrap();
+    let req = manager.post(
+        vec!["GET https://localhost/*".to_string()],
+        None,
+        None,
+        None,
+    );
+    manager
+        .resolve(
+            &req.id,
+            ApprovalStatus::Approved {
+                rules_applied: vec!["GET https://localhost/*".to_string()],
+                ttl: Lifetime::Permanent,
+            },
+        )
+        .unwrap();
+    t.assert_true(
+        "sidecar file exists",
+        std::path::Path::new(&sidecar_path).exists(),
+    );
+    let sidecar_contents = std::fs::read_to_string(&sidecar_path).unwrap();
+    t.assert_contains(
+        "sidecar has url",
+        sidecar_contents.as_str(),
+        "https://localhost/*",
+    );
+    proxy1.shutdown();
+    // Drain the connection pool — otherwise a cached tunnel from proxy1
+    // may race the proxy2 startup.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Proxy #2 — start a fresh proxy pointing at the same sidecar.
+    // Its base rules are empty; the rule should be loaded from disk and
+    // the request should succeed immediately.
+    let proxy2 = TestProxy::builder(&ca, vec![], upstream.port())
+        .with_approvals(&sidecar_path)
+        .report(&t)
+        .start()
+        .await;
+    let client = ReportingClient::new(&t, proxy2.addr(), &ca);
+    let resp = client.get("https://localhost/hello").await;
+    t.assert_eq("after restart: status", &resp.status().as_u16(), &200u16);
+
+    proxy2.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_revoke_removes_active_rule() {
+    let t = test_report!("revoke_approval removes active rules and triggers rebuild");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let manager = proxy.approvals.clone().unwrap();
+
+    let req = manager.post(
+        vec!["GET https://localhost/*".to_string()],
+        None,
+        None,
+        None,
+    );
+    manager
+        .resolve(
+            &req.id,
+            ApprovalStatus::Approved {
+                rules_applied: vec!["GET https://localhost/*".to_string()],
+                ttl: Lifetime::Session,
+            },
+        )
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Rule is active.
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client.get("https://localhost/x").await;
+    t.assert_eq("after approve", &resp.status().as_u16(), &200u16);
+
+    // Revoke.
+    manager.revoke_approval(&req.id);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Rule is gone — fresh client because the old tunnel is sticky.
+    let client2 = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client2.get("https://localhost/x").await;
+    t.assert_eq("after revoke", &resp.status().as_u16(), &451u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_permanent_revoke_rewrites_sidecar_empty() {
+    let t = test_report!("Revoking a permanent approval rewrites the sidecar without it");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar_path = dir
+        .path()
+        .join("approvals.toml")
+        .to_string_lossy()
+        .into_owned();
+
+    let proxy = TestProxy::builder(&ca, vec![], upstream.port())
+        .with_approvals(&sidecar_path)
+        .report(&t)
+        .start()
+        .await;
+    let manager = proxy.approvals.clone().unwrap();
+
+    let req = manager.post(
+        vec!["GET https://localhost/*".to_string()],
+        None,
+        None,
+        None,
+    );
+    manager
+        .resolve(
+            &req.id,
+            ApprovalStatus::Approved {
+                rules_applied: vec!["GET https://localhost/*".to_string()],
+                ttl: Lifetime::Permanent,
+            },
+        )
+        .unwrap();
+    let before = std::fs::read_to_string(&sidecar_path).unwrap();
+    t.assert_contains("before revoke: url", before.as_str(), "localhost/*");
+
+    manager.revoke_approval(&req.id);
+    let after = std::fs::read_to_string(&sidecar_path).unwrap();
+    t.assert_true("after revoke: url absent", !after.contains("localhost/*"));
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
 #[tokio::test]
 async fn test_post_rejects_empty_rules() {
     let t = test_report!("POST with empty rules returns 400");
