@@ -37,9 +37,15 @@ We want: a **coding agent running inside the sandbox can request permission from
 
 ## API
 
-All endpoints on the existing proxy listener. Path prefix `/__pyloros__/` to avoid colliding with real proxied traffic. (Open question: dedicated admin port instead? See §Open questions.)
+All endpoints are served by the proxy itself under a **magic hostname**: `https://pyloros.internal/`. The proxy intercepts requests to this host (just as it intercepts everything via MITM) and routes them to the internal API handler instead of forwarding upstream. No separate admin port, no dedicated listener — the sandbox already trusts and reaches the proxy, so this reuses the existing trust/reachability path.
 
-### `POST /__pyloros__/approvals`
+Implications:
+- **Works in both connection modes.** In HTTP-proxy mode the sandbox client sends `CONNECT pyloros.internal:443` and the proxy terminates TLS itself instead of dialing upstream. In direct-https mode the client just opens a TLS connection to the proxy and sends SNI `pyloros.internal`. Same handler either way; no new listener needed.
+- Any HTTP client that trusts the pyloros CA can hit `https://pyloros.internal/approvals` directly from inside the sandbox.
+- The browser dashboard is served at `https://pyloros.internal/` too. For the laptop browser, the user forwards the proxy port with SSH `LocalForward` and points their browser at it (via `/etc/hosts` entry or the direct-https entry point). Cert trust is the same install step as any MITM setup.
+- `pyloros.internal` is chosen because `.internal` is a reserved TLD (RFC-scoped for private use) and won't collide with real DNS.
+
+### `POST https://pyloros.internal/approvals`
 
 Request:
 ```json
@@ -60,7 +66,7 @@ Response `202`:
 
 No agent-identity field. Self-reported strings we can't verify don't belong in the UI.
 
-### `GET /__pyloros__/approvals/{id}?wait=60s`
+### `GET https://pyloros.internal/approvals/{id}?wait=60s`
 
 Long-poll. Returns when the decision is made, or when `wait` elapses (then poll again).
 
@@ -80,8 +86,8 @@ Long-poll (not streaming, not blocking-forever) because it survives proxy restar
 ### Browser-facing endpoints (loopback only, not for the agent)
 
 - `GET /` — the approval dashboard HTML.
-- `GET /__pyloros__/events` — SSE stream of pending/resolved approvals.
-- `POST /__pyloros__/approvals/{id}/decision` — approve/deny with lifetime + optional message.
+- `GET https://pyloros.internal/events` — SSE stream of pending/resolved approvals.
+- `POST https://pyloros.internal/approvals/{id}/decision` — approve/deny with lifetime + optional message.
 
 ## Rule lifetime and storage
 
@@ -92,7 +98,7 @@ Long-poll (not streaming, not blocking-forever) because it survives proxy restar
 
 ## Anti-spam
 
-Simple per-minute rate limit on `POST /__pyloros__/approvals`. Excess → `429`. A burst triggers a visible warning on the dashboard ("20 approval requests in the last minute"). No shared secret — the sandbox already reaches the proxy, that's the trust boundary.
+Simple per-minute rate limit on `POST https://pyloros.internal/approvals`. Excess → `429`. A burst triggers a visible warning on the dashboard ("20 approval requests in the last minute"). No shared secret — the sandbox already reaches the proxy, that's the trust boundary.
 
 ## Notification channel
 
@@ -135,12 +141,10 @@ If all proposed rules are already matched by the active ruleset, the approval au
 
 ## Open questions
 
-1. **Admin port vs magic prefix on the proxy port?** Magic prefix (`/__pyloros__/`) is convenient — the sandbox already has proxy credentials/reachability, no second endpoint to discover. But it means the proxy is now also a web app, which complicates TLS (the approval dashboard wants plain HTTPS or HTTP-on-loopback, not the MITM flow). A dedicated admin listener on a separate port is cleaner but adds config surface. Leaning: **separate admin port**, bound to loopback by default, with the agent-facing approval API *also* reachable via the proxy port using the magic prefix. Two doors into the same handler.
+1. **Session-only rules and the Notifier trait** — if the approval is resolved with `session` lifetime, is the "session" the proxy process lifetime, or something narrower (one run of the agent)? Proxy lifetime is simpler; a narrower notion requires the agent to identify its session, which we said we don't trust.
 
-2. **Session-only rules and the Notifier trait** — if the approval is resolved with `session` lifetime, is the "session" the proxy process lifetime, or something narrower (one run of the agent)? Proxy lifetime is simpler; a narrower notion requires the agent to identify its session, which we said we don't trust.
+2. **What does the dashboard show for historical approvals?** A simple scrollback of resolved approvals is nice for the user to audit their own past decisions. Pull from the existing audit log rather than a second store.
 
-3. **What does the dashboard show for historical approvals?** A simple scrollback of resolved approvals is nice for the user to audit their own past decisions. Pull from the existing audit log rather than a second store.
+3. **Do denied approvals get remembered across requests?** We said "not crucial for v1." Leaving unbuilt but not precluded.
 
-4. **Do denied approvals get remembered across requests?** We said "not crucial for v1." Leaving unbuilt but not precluded.
-
-5. **Bootstrapping the browser URL** — how does the user know to open `http://localhost:7777/`? Print it on proxy startup; document in README; maybe auto-open on first blocked request if running under a TTY.
+4. **Bootstrapping the browser URL** — how does the user know to open `https://pyloros.internal/`? Print it on proxy startup; document in README; maybe auto-open on first blocked request if running under a TTY.
