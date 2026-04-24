@@ -34,6 +34,8 @@ ring = "0.17"
 base64 = "0.22"
 notify = "8"
 url = "2"
+futures-util = "0.3"
+tempfile = "3"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

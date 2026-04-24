@@ -449,6 +449,8 @@ pub fn echo_handler() -> UpstreamHandler {
 
 pub struct TestProxy {
     pub addr: SocketAddr,
+    pub dashboard_addr: Option<SocketAddr>,
+    pub approvals: Option<Arc<pyloros::approvals::ApprovalManager>>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -474,6 +476,14 @@ impl TestProxy {
         if let Some(size) = builder.max_body_log_size {
             config.logging.max_body_log_size = size;
         }
+        if let Some(ref sidecar) = builder.approvals_sidecar {
+            // Dashboard bind at 127.0.0.1:0 so the OS picks a port;
+            // real addr is captured after bind below.
+            config.approvals = Some(pyloros::config::ApprovalsConfig {
+                sidecar_file: sidecar.clone(),
+                dashboard_bind: "127.0.0.1:0".to_string(),
+            });
+        }
 
         let client_tls = builder.ca.client_tls_config();
 
@@ -490,13 +500,30 @@ impl TestProxy {
         }
 
         let addr = server.bind().await.unwrap().tcp_addr();
+        let dashboard_addr = if builder.approvals_sidecar.is_some() {
+            Some(
+                server
+                    .bind_dashboard("127.0.0.1:0")
+                    .await
+                    .unwrap()
+                    .tcp_addr(),
+            )
+        } else {
+            None
+        };
+        let approvals = server.approvals_manager().cloned();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
             let _ = server.serve(shutdown_rx).await;
         });
 
-        Self { addr, shutdown_tx }
+        Self {
+            addr,
+            dashboard_addr,
+            approvals,
+            shutdown_tx,
+        }
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -525,6 +552,7 @@ impl TestProxy {
             redirect_whitelist_ttl_secs: None,
             max_body_log_size: None,
             report: None,
+            approvals_sidecar: None,
         }
     }
 }
@@ -541,6 +569,7 @@ pub struct TestProxyBuilder<'a> {
     redirect_whitelist_ttl_secs: Option<u64>,
     max_body_log_size: Option<usize>,
     report: Option<&'a TestReport>,
+    approvals_sidecar: Option<String>,
 }
 
 impl<'a> TestProxyBuilder<'a> {
@@ -581,6 +610,14 @@ impl<'a> TestProxyBuilder<'a> {
 
     pub fn report(mut self, report: &'a TestReport) -> Self {
         self.report = Some(report);
+        self
+    }
+
+    /// Enable the approvals feature with the given sidecar file path.
+    /// The dashboard is bound to 127.0.0.1:0 (ephemeral); read the
+    /// assigned port from `TestProxy::dashboard_addr` after start.
+    pub fn with_approvals(mut self, sidecar_path: &str) -> Self {
+        self.approvals_sidecar = Some(sidecar_path.to_string());
         self
     }
 
