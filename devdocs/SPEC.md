@@ -28,6 +28,59 @@ The intended deployment is one proxy per VM/container running an AI agent. All o
 - Method `*` matches any HTTP method
 - Example: `https://*.github.com/api/*` matches `https://foo.github.com/api/v1/repos`
 
+### Redirect Following
+
+Many allowed destinations (GitHub release assets, CDNs, package mirrors) respond with a 3xx redirect to a freshly-signed, short-lived URL on a different host that cannot realistically be listed in config. A rule may opt in to following redirects:
+
+```toml
+[[rules]]
+method = "GET"
+url = "https://github.com/neovim/neovim/releases/download/*"
+allow_redirects = ["https://release-assets.githubusercontent.com/*"]
+
+# Accept any redirect target
+[[rules]]
+method = "GET"
+url = "https://example.com/download/*"
+allow_redirects = ["*"]
+```
+
+Semantics:
+- `allow_redirects` is a list of URL patterns (same wildcard syntax as `url`). The bare string `"*"` is a shorthand for "match any URL" (accepted here but not in other pattern fields, which require a scheme). Omitted or empty = redirects are not followed (follow-up request will be blocked as usual).
+- When a rule-matched request produces a response with a 3xx status and a `Location` header, the Location URL is resolved against the request URL (absolute or relative) and checked against the rule's `allow_redirects` patterns. On match, the exact resolved URL is added to a time-limited global whitelist. Any subsequent request matching that URL exactly is allowed regardless of other rules.
+- Chains are followed recursively. If a whitelisted-by-redirect request itself returns a 3xx, the new Location is checked against the **original** rule's patterns (which travel with the whitelist entry).
+- The whitelist TTL is controlled by `redirect_whitelist_ttl_secs` under `[proxy]` (default **60**). The whitelist is global — keying per client is not feasible when `direct_https_bind` is used.
+- Applies to both plain HTTP and MITM'd HTTPS (all HTTPS in pyloros is MITM'd).
+
+Logging:
+- Normal logs distinguish redirect-whitelisted allowances from direct rule matches.
+- Audit log: follow-up requests allowed via the whitelist record `reason = "redirect_whitelisted"` (as opposed to `"rule_matched"`).
+
+#### Known limitation: client-cached redirects can outlive the whitelist
+
+3xx responses are cacheable per RFC 9111. A client may cache the original
+redirect (serving future requests to the origin URL from its own cache
+without re-hitting the proxy) and then attempt the cached target URL later,
+after our whitelist entry has expired. The proxy will block that follow-up.
+
+- 301 and 308 are **heuristically cacheable** — a cache may store them
+  effectively indefinitely when no `Cache-Control`/`Expires` is present.
+  Browsers commonly do (hours to days).
+- 302/303/307 are heuristically cacheable too, but most caches only store
+  them when explicit freshness headers are provided.
+
+The signed-URL case the feature is designed for is less exposed in practice:
+redirect responses in that flow typically carry `Cache-Control: no-store`
+and the signed target URL itself expires in minutes. But the race is real
+for rule authors relying on vanilla 301/308.
+
+A principled fix (future work): parse `Cache-Control: max-age` / `Expires`
+on the 3xx response and size the whitelist entry's TTL to match (capped at
+the proxy's configured maximum, with a floor). For 301/308 without explicit
+freshness headers, strip or rewrite the caching headers so the client can't
+outlive the whitelist entry. A simpler alternative is to always force
+`Cache-Control: no-store` on any 3xx we whitelist.
+
 ### Git Rules
 
 Git-specific rules provide a high-level way to control git smart HTTP operations (clone, fetch, push) without requiring users to understand the underlying protocol endpoints.
@@ -60,7 +113,7 @@ url = "https://github.com/*"
 | `push`  | push                |
 | `*`     | all                 |
 
-The `url` is the repo base URL (what you'd pass to `git clone`).
+The `url` is the repo base URL (what you'd pass to `git clone`). The trailing `.git` suffix is optional: rules match both `repo` and `repo.git` request forms regardless of which form was written in the rule, so `url = "https://github.com/org/repo"` and `url = "https://github.com/org/repo.git"` are equivalent.
 
 #### Branch restriction
 
@@ -174,6 +227,31 @@ traffic is routed to the proxy for filtering and forwarding.
 The `generate-hosts` CLI subcommand extracts literal hostnames from config rules and outputs them in
 `/etc/hosts` format for this purpose.
 
+### Direct HTTP Mode
+
+A plain-HTTP counterpart to direct-HTTPS, used when a sandboxed program must fetch plain `http://`
+URLs (e.g. `apt` pulling `.deb` packages from a mirror) and does not honour `HTTP_PROXY`.
+
+**How it works:**
+1. The proxy listens on an additional address (e.g. `0.0.0.0:80`) for plain-HTTP connections.
+2. When a request arrives, the target hostname is read from the `Host` header (no SNI since no TLS).
+3. The path and query come from the request URI, which is origin-form (`GET /path HTTP/1.1`).
+4. Filtering and audit logging mirror the plain-HTTP path used by the regular proxy listener.
+   Rules that require body inspection (branch restrictions, LFS operation checks) still block —
+   plain HTTP is not trusted for body-gated rules.
+5. Credentials are **not** injected (consistent with the plain-HTTP handling elsewhere — see
+   "Credential Injection"). Direct-HTTP is for allowing plain traffic through a policy gate, not
+   for adding secrets to it.
+
+**Configuration:**
+```toml
+[proxy]
+direct_http_bind = "0.0.0.0:80"  # optional, enables direct HTTP mode
+```
+
+The same `/etc/hosts` / wildcard-DNS setup used for direct-HTTPS works for direct-HTTP: a single
+IP can carry both ports simultaneously.
+
 ### CLI
 
 subcommands:
@@ -228,6 +306,9 @@ The proxy shuts down cleanly on both `SIGINT` (Ctrl+C) and `SIGTERM`. On receivi
 - Separate control over logging of allowed and blocked requests (e.g., log only blocked to reduce noise, or only allowed for auditing)
 - Error messages for failed upstream requests must include the request method and URL for diagnostics
 
+#### TLS Key Logging
+When the `SSLKEYLOGFILE` environment variable is set to a writable path, pyloros writes TLS session secrets in NSS Key Log Format for both legs of every MITM connection (client↔proxy and proxy↔upstream). Load the file into Wireshark (Preferences → Protocols → TLS → (Pre)-Master-Secret log filename) to decrypt captures. Unset by default; no configuration required. Intended for debugging — do not enable in production.
+
 ### Audit Log
 
 An optional structured audit log records every request decision as a JSON object per line (JSONL) in a dedicated file. This is separate from the human-readable tracing output and designed for compliance, SIEM integration, and post-hoc analysis.
@@ -252,6 +333,32 @@ Each audit entry contains:
 - `git` (optional) — `{ "blocked_refs": ["refs/heads/main"] }` when branch restrictions apply
 
 Optional fields are omitted when not applicable.
+
+#### Body Logging
+
+Rules can opt in to capturing request and response bodies in the audit log. This is useful for traffic inspection — e.g. logging GraphQL queries to develop tighter filter rules.
+
+- Enabled per-rule via `log_body = true` (default false). Valid on both HTTP and git rules.
+- When a rule with `log_body = true` matches and the request is **allowed**, both request and response bodies are captured and included in the audit entry.
+- Blocked requests do not log bodies (there is no response body, and the request body may not have been received).
+- Global size limit: `max_body_log_size` in `[logging]` (default 1 MB / 1,048,576 bytes). Bodies exceeding this limit are truncated.
+- Body encoding: UTF-8 if valid; otherwise base64-encoded.
+- Audit entries with body logging are emitted **after** the response is received (deferred from the normal pre-forward emission point).
+
+Additional audit entry fields when body logging is active:
+- `request_body` — captured request body (string)
+- `request_body_encoding` (optional) — `"base64"` if the body is not valid UTF-8; absent means UTF-8
+- `response_body` — captured response body (string)
+- `response_body_encoding` (optional) — same encoding convention
+- `body_truncated` (optional) — `true` if either body was truncated to `max_body_log_size`
+
+Example rule:
+```toml
+[[rules]]
+method = "*"
+url = "https://api.example.com/graphql"
+log_body = true
+```
 
 ### Proxy Authentication
 
@@ -385,6 +492,8 @@ level = "info"
 log_requests = { allowed = true, blocked = true }
 # Optional: structured JSONL audit log for compliance/SIEM
 # audit_log = "/var/log/pyloros/audit.jsonl"
+# Optional: max bytes to capture per body for log_body rules (default 1048576)
+# max_body_log_size = 1048576
 
 [[rules]]
 method = "GET"

@@ -40,6 +40,10 @@ enum Commands {
         #[arg(long)]
         direct_https_bind: Option<String>,
 
+        /// Direct HTTP listener bind address (optional, enables Host-header-based direct plain-HTTP mode)
+        #[arg(long)]
+        direct_http_bind: Option<String>,
+
         /// Auto-generate CA certificate at configured paths if files don't exist
         #[arg(long)]
         auto_generate_ca: bool,
@@ -96,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca_key,
             bind,
             direct_https_bind,
+            direct_http_bind,
             auto_generate_ca,
             log_level,
         } => {
@@ -130,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(addr) = direct_https_bind {
                 cfg.proxy.direct_https_bind = Some(addr);
+            }
+            if let Some(addr) = direct_http_bind {
+                cfg.proxy.direct_http_bind = Some(addr);
             }
 
             // Validate CA cert/key paths are specified
@@ -195,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_root_certificates(root_store)
                     .with_no_client_auth();
                 tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
                 server = server.with_upstream_tls(Arc::new(tls_config));
             }
 
@@ -219,16 +228,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("  export HTTPS_PROXY=http://{}", server.bind_address());
             }
 
-            // Handle SIGINT (Ctrl+C) and SIGTERM
+            // Handle SIGINT (Ctrl+C) and SIGTERM.
+            // Use tokio::signal::unix::signal() for both — it installs the handler
+            // eagerly at construction time, avoiding a race where the default handler
+            // fires before the async select loop is polled.
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            #[cfg(unix)]
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("failed to install SIGINT handler");
+            #[cfg(unix)]
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
             tokio::spawn(async move {
                 #[cfg(unix)]
                 {
-                    let mut sigterm =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .expect("failed to install SIGTERM handler");
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {},
+                        _ = sigint.recv() => {},
                         _ = sigterm.recv() => {},
                     }
                 }

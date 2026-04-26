@@ -19,8 +19,10 @@ use super::tunnel::TunnelHandler;
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::filter::redirect_whitelist::RedirectWhitelist;
 use crate::filter::{CredentialEngine, FilterEngine, GeneratedSecret};
 use crate::tls::{CertificateAuthority, MitmCertificateGenerator};
+use std::time::Duration;
 
 /// The address the proxy is listening on after bind().
 pub enum ListenAddress {
@@ -65,12 +67,15 @@ pub struct ProxyServer {
     config: Config,
     filter_engine: Arc<FilterEngine>,
     credential_engine: Arc<CredentialEngine>,
+    redirect_whitelist: Arc<RedirectWhitelist>,
     mitm_generator: Arc<MitmCertificateGenerator>,
     resolved_auth: Option<(String, String)>,
     audit_logger: Option<Arc<AuditLogger>>,
     listener: Option<BoundListener>,
     /// Optional direct HTTPS listener (accepts raw TLS, uses SNI for routing).
     direct_https_listener: Option<BoundListener>,
+    /// Optional direct HTTP listener (accepts plain HTTP, uses Host header for routing).
+    direct_http_listener: Option<BoundListener>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -136,15 +141,22 @@ impl ProxyServer {
             "Filter engine initialized"
         );
 
+        let redirect_whitelist = Arc::new(RedirectWhitelist::new(
+            Duration::from_secs(config.proxy.redirect_whitelist_ttl_secs),
+            1024,
+        ));
+
         Ok(Self {
             config,
             filter_engine,
             credential_engine,
+            redirect_whitelist,
             mitm_generator,
             resolved_auth,
             audit_logger: None,
             listener: None,
             direct_https_listener: None,
+            direct_http_listener: None,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -163,15 +175,21 @@ impl ProxyServer {
         credential_engine: Arc<CredentialEngine>,
         mitm_generator: Arc<MitmCertificateGenerator>,
     ) -> Self {
+        let redirect_whitelist = Arc::new(RedirectWhitelist::new(
+            Duration::from_secs(config.proxy.redirect_whitelist_ttl_secs),
+            1024,
+        ));
         Self {
             config,
             filter_engine,
             credential_engine,
+            redirect_whitelist,
             mitm_generator,
             resolved_auth: None,
             audit_logger: None,
             listener: None,
             direct_https_listener: None,
+            direct_http_listener: None,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -245,6 +263,12 @@ impl ProxyServer {
             tracing::info!(address = %direct_addr, "Direct HTTPS listener active");
         }
 
+        // Bind direct HTTP listener if configured
+        if let Some(ref addr) = self.config.proxy.direct_http_bind.clone() {
+            let direct_addr = self.bind_direct_http(addr).await?;
+            tracing::info!(address = %direct_addr, "Direct HTTP listener active");
+        }
+
         self.serve(shutdown).await
     }
 
@@ -264,6 +288,14 @@ impl ProxyServer {
     pub async fn bind_direct_https(&mut self, bind_address: &str) -> Result<ListenAddress> {
         let (listener, addr) = bind_listener(bind_address).await?;
         self.direct_https_listener = Some(listener);
+        Ok(addr)
+    }
+
+    /// Bind the direct HTTP listener to the given address.
+    /// The address can be a TCP socket address or a Unix socket path (containing '/').
+    pub async fn bind_direct_http(&mut self, bind_address: &str) -> Result<ListenAddress> {
+        let (listener, addr) = bind_listener(bind_address).await?;
+        self.direct_http_listener = Some(listener);
         Ok(addr)
     }
 
@@ -290,6 +322,11 @@ impl ProxyServer {
                 tls_acceptor,
                 tunnel_handler_rx.clone(),
             );
+        }
+
+        // Spawn direct HTTP listener if bound (shares the watch receiver)
+        if let Some(direct_listener) = self.direct_http_listener.take() {
+            spawn_direct_http_accept_loop(direct_listener, tunnel_handler_rx.clone());
         }
 
         // Set up reload channel. We always create one so the select! branch blocks.
@@ -398,6 +435,9 @@ impl ProxyServer {
         if new_config.proxy.direct_https_bind != self.config.proxy.direct_https_bind {
             tracing::warn!("direct_https_bind changed but requires restart to take effect");
         }
+        if new_config.proxy.direct_http_bind != self.config.proxy.direct_http_bind {
+            tracing::warn!("direct_http_bind changed but requires restart to take effect");
+        }
 
         // Compile new filter engine
         let new_filter = match FilterEngine::new(new_config.rules.clone()) {
@@ -481,21 +521,28 @@ impl ProxyServer {
     {
         let tunnel_handler = tunnel_handler.clone();
         let filter_engine = self.filter_engine.clone();
+        let redirect_whitelist = self.redirect_whitelist.clone();
         let auth = self.resolved_auth.clone();
         let log_allowed = self.config.logging.log_allowed_requests;
         let log_blocked = self.config.logging.log_blocked_requests;
         let audit_logger = self.audit_logger.clone();
         let permissive = self.config.proxy.permissive;
+        let max_body_log_size = self.config.logging.max_body_log_size;
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
 
             let service = service_fn(move |req| {
-                let handler = ProxyHandler::new(tunnel_handler.clone(), filter_engine.clone())
-                    .with_request_logging(log_allowed, log_blocked)
-                    .with_auth(auth.clone())
-                    .with_audit_logger(audit_logger.clone())
-                    .with_permissive(permissive);
+                let handler = ProxyHandler::new(
+                    tunnel_handler.clone(),
+                    filter_engine.clone(),
+                    redirect_whitelist.clone(),
+                )
+                .with_request_logging(log_allowed, log_blocked)
+                .with_auth(auth.clone())
+                .with_audit_logger(audit_logger.clone())
+                .with_permissive(permissive)
+                .with_max_body_log_size(max_body_log_size);
                 async move { handler.handle(req).await }
             });
 
@@ -518,12 +565,14 @@ impl ProxyServer {
             self.mitm_generator.clone(),
             self.filter_engine.clone(),
             self.credential_engine.clone(),
+            self.redirect_whitelist.clone(),
         )
         .with_request_logging(
             self.config.logging.log_allowed_requests,
             self.config.logging.log_blocked_requests,
         )
-        .with_permissive(self.config.proxy.permissive);
+        .with_permissive(self.config.proxy.permissive)
+        .with_max_body_log_size(self.config.logging.max_body_log_size);
         if let Some(port) = self.upstream_port_override {
             handler = handler.with_upstream_port_override(port);
         }
@@ -699,6 +748,45 @@ impl DirectAccept for UnixListener {
     async fn accept_conn(&self) -> std::io::Result<(Self::Stream, String)> {
         let (stream, _addr) = self.accept().await?;
         Ok((stream, "unix".to_string()))
+    }
+}
+
+/// Spawn the direct HTTP accept loop as a background task.
+fn spawn_direct_http_accept_loop(
+    listener: BoundListener,
+    tunnel_handler_rx: tokio::sync::watch::Receiver<Arc<TunnelHandler>>,
+) {
+    match listener {
+        BoundListener::Tcp(tcp_listener) => {
+            tokio::spawn(accept_loop_direct_http(tcp_listener, tunnel_handler_rx));
+        }
+        #[cfg(unix)]
+        BoundListener::Unix(unix_listener) => {
+            tokio::spawn(accept_loop_direct_http(unix_listener, tunnel_handler_rx));
+        }
+    }
+}
+
+/// Generic accept loop for the direct HTTP listener (works for both TCP and Unix).
+async fn accept_loop_direct_http<L>(
+    listener: L,
+    tunnel_handler_rx: tokio::sync::watch::Receiver<Arc<TunnelHandler>>,
+) where
+    L: DirectAccept,
+{
+    loop {
+        let (stream, client_addr) = match listener.accept_conn().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = %e, "Direct HTTP: failed to accept connection");
+                continue;
+            }
+        };
+        tracing::debug!(client = %client_addr, "Direct HTTP: new connection");
+        let handler = tunnel_handler_rx.borrow().clone();
+        tokio::spawn(async move {
+            handler.serve_direct_http(stream).await;
+        });
     }
 }
 

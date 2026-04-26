@@ -22,7 +22,9 @@ use crate::audit::{
 };
 use crate::error::{Error, Result};
 use crate::filter::lfs;
+use crate::filter::matcher::UrlPattern;
 use crate::filter::pktline;
+use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{CredentialEngine, FilterEngine, FilterResult, RequestInfo};
 use crate::tls::MitmCertificateGenerator;
 
@@ -31,10 +33,12 @@ pub struct TunnelHandler {
     mitm_generator: Arc<MitmCertificateGenerator>,
     filter_engine: Arc<FilterEngine>,
     credential_engine: Arc<CredentialEngine>,
+    redirect_whitelist: Arc<RedirectWhitelist>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
     logger: RequestLogger,
+    max_body_log_size: usize,
 }
 
 impl TunnelHandler {
@@ -42,15 +46,18 @@ impl TunnelHandler {
         mitm_generator: Arc<MitmCertificateGenerator>,
         filter_engine: Arc<FilterEngine>,
         credential_engine: Arc<CredentialEngine>,
+        redirect_whitelist: Arc<RedirectWhitelist>,
     ) -> Self {
         Self {
             mitm_generator,
             filter_engine,
             credential_engine,
+            redirect_whitelist,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
             logger: RequestLogger::new(),
+            max_body_log_size: 1_048_576,
         }
     }
 
@@ -91,6 +98,12 @@ impl TunnelHandler {
         self
     }
 
+    /// Set the maximum body size for body logging.
+    pub fn with_max_body_log_size(mut self, size: usize) -> Self {
+        self.max_body_log_size = size;
+        self
+    }
+
     /// Build the first matching credential info for the audit entry.
     fn audit_credential(&self, request_info: &RequestInfo) -> Option<AuditCredential> {
         self.credential_engine
@@ -101,6 +114,37 @@ impl TunnelHandler {
                 cred_type,
                 url_pattern,
             })
+    }
+
+    /// If the response is a redirect and `patterns` are non-None, check the
+    /// `Location` header against the patterns and insert into the whitelist on
+    /// match. A no-op otherwise. Returns the resolved redirect target URL when
+    /// an entry was inserted, for logging.
+    fn record_redirect_if_allowed(
+        &self,
+        status: u16,
+        headers: &hyper::header::HeaderMap,
+        request_url: &str,
+        patterns: Option<&Arc<Vec<UrlPattern>>>,
+    ) {
+        let Some(patterns) = patterns else { return };
+        let location = headers
+            .get(hyper::header::LOCATION)
+            .and_then(|v| v.to_str().ok());
+        if let Some(target) = maybe_whitelist_redirect(
+            status,
+            location,
+            request_url,
+            patterns,
+            &self.redirect_whitelist,
+        ) {
+            tracing::info!(
+                from = %request_url,
+                to = %target,
+                status = %status,
+                "REDIRECT whitelisted"
+            );
+        }
     }
 
     /// Run a MITM tunnel on an upgraded connection
@@ -158,6 +202,85 @@ impl TunnelHandler {
         }
     }
 
+    /// Serve plain-HTTP requests on a direct-HTTP listener.
+    ///
+    /// Clients send origin-form requests (`GET /path HTTP/1.1` + `Host:` header).
+    /// Reuses `ProxyHandler::handle_http` by rewriting the request URI from
+    /// origin-form to absolute-form (`http://host:port/path`) — after that, the
+    /// request is indistinguishable from one sent to the explicit-proxy listener,
+    /// so filter / audit / body-inspection-blocking / redirect-whitelisting are
+    /// all shared.
+    pub async fn serve_direct_http<S>(self: &Arc<Self>, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let self_arc = Arc::clone(self);
+
+        let service = service_fn(move |mut req: Request<Incoming>| {
+            let self_arc = Arc::clone(&self_arc);
+            async move {
+                // Rewrite origin-form URI to absolute-form using the Host header.
+                let host_header = req
+                    .headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let authority = match host_header {
+                    Some(h) => h,
+                    None => {
+                        tracing::warn!("Direct HTTP: missing or invalid Host header");
+                        return Ok(error_response("missing Host header"));
+                    }
+                };
+                let path_and_query = req
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/");
+                let new_uri =
+                    match format!("http://{}{}", authority, path_and_query).parse::<hyper::Uri>() {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Direct HTTP: invalid request URI");
+                            return Ok(error_response("invalid request URI"));
+                        }
+                    };
+                *req.uri_mut() = new_uri;
+
+                // Reuse the plain-HTTP handler used by the explicit proxy listener.
+                // Auth is intentionally None: direct-HTTP clients connect to what they
+                // think is the origin server, so Proxy-Authorization is not expected.
+                let handler = super::handler::ProxyHandler::new(
+                    Arc::clone(&self_arc),
+                    self_arc.filter_engine.clone(),
+                    self_arc.redirect_whitelist.clone(),
+                )
+                .with_request_logging(
+                    self_arc.logger.log_allowed_requests,
+                    self_arc.logger.log_blocked_requests,
+                )
+                .with_audit_logger(self_arc.logger.audit_logger.clone())
+                .with_permissive(self_arc.logger.permissive)
+                .with_max_body_log_size(self_arc.max_body_log_size);
+                handler.handle(req).await
+            }
+        });
+
+        let io = TokioIo::new(stream);
+        if let Err(e) = hyper::server::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(io, service)
+            .with_upgrades()
+            .await
+        {
+            let err_str = e.to_string();
+            if !err_str.contains("connection closed") && !err_str.contains("early eof") {
+                tracing::debug!("Direct HTTP service error: {}", e);
+            }
+        }
+    }
+
     /// Handle a request that came through the MITM tunnel or direct HTTPS listener.
     pub async fn handle_tunneled_request(
         &self,
@@ -190,8 +313,10 @@ impl TunnelHandler {
 
         let full_url = request_info.full_url();
 
-        // Check filter
-        let filter_result = self.filter_engine.check(&request_info);
+        // Check filter, consulting the redirect whitelist for short-lived allowances.
+        let filter_result = self
+            .filter_engine
+            .check_with_redirect_whitelist(&request_info, &self.redirect_whitelist);
 
         let ctx = RequestContext {
             method: &method,
@@ -203,13 +328,20 @@ impl TunnelHandler {
             label: "",
         };
 
-        match filter_result {
+        // Patterns used to evaluate a 3xx response Location. Set for rule-matched
+        // requests (the rule's allow_redirects) and whitelisted-by-redirect requests
+        // (origin rule's patterns, so chains extend recursively).
+        let redirect_patterns: Option<Arc<Vec<UrlPattern>>> = match filter_result {
             FilterResult::Blocked => {
                 if let Some(resp) = self.logger.log_blocked(&ctx) {
                     return Ok(resp);
                 }
+                None
             }
-            FilterResult::AllowedWithBranchCheck(ref filter) => {
+            FilterResult::AllowedWithBranchCheck {
+                ref filter,
+                log_body,
+            } => {
                 if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
@@ -255,6 +387,11 @@ impl TunnelHandler {
                         git: Some(AuditGitInfo {
                             blocked_refs: blocked.clone(),
                         }),
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
                 }
@@ -278,6 +415,11 @@ impl TunnelHandler {
                         reason: AuditReason::LocalCredentialMismatch,
                         credential: None,
                         git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(local_credential_mismatch_response(&method, &full_url));
                 }
@@ -287,7 +429,6 @@ impl TunnelHandler {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
-                self.logger.log_allowed(&allowed_ctx);
 
                 // Inject credentials (body already buffered)
                 self.credential_engine.inject_with_body(
@@ -296,11 +437,31 @@ impl TunnelHandler {
                     &body_bytes,
                 );
 
+                let rp = self.filter_engine.redirect_policy_for(&request_info);
+                if log_body {
+                    return self
+                        .forward_buffered_with_body_log(
+                            parts,
+                            body_bytes,
+                            host,
+                            port,
+                            &method,
+                            &full_url,
+                            &allowed_ctx,
+                            rp,
+                        )
+                        .await;
+                }
+
+                self.logger.log_allowed(&allowed_ctx);
                 return self
-                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
+                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
             }
-            FilterResult::AllowedWithLfsCheck(ref allowed_ops) => {
+            FilterResult::AllowedWithLfsCheck {
+                ref allowed_ops,
+                log_body,
+            } => {
                 if self.logger.log_allowed_requests {
                     tracing::info!(
                         method = %method,
@@ -341,6 +502,11 @@ impl TunnelHandler {
                         reason: AuditReason::LfsOperationNotAllowed,
                         credential: None,
                         git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(blocked_response(&method, &full_url));
                 }
@@ -364,6 +530,11 @@ impl TunnelHandler {
                         reason: AuditReason::LocalCredentialMismatch,
                         credential: None,
                         git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
                     });
                     return Ok(local_credential_mismatch_response(&method, &full_url));
                 }
@@ -373,20 +544,79 @@ impl TunnelHandler {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
-                self.logger.log_allowed(&allowed_ctx);
 
+                let rp = self.filter_engine.redirect_policy_for(&request_info);
+                if log_body {
+                    return self
+                        .forward_buffered_with_body_log(
+                            parts,
+                            body_bytes,
+                            host,
+                            port,
+                            &method,
+                            &full_url,
+                            &allowed_ctx,
+                            rp,
+                        )
+                        .await;
+                }
+
+                self.logger.log_allowed(&allowed_ctx);
                 return self
-                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url)
+                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
             }
-            FilterResult::Allowed => {
+            FilterResult::Allowed { log_body } => {
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
+                let rp = self.filter_engine.redirect_policy_for(&request_info);
+
+                if log_body && !is_websocket {
+                    // Body logging: buffer request, forward, capture response
+                    let (mut parts, body) = req.into_parts();
+                    let body_bytes = body
+                        .collect()
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "Failed to buffer request body for body logging");
+                            e
+                        })?
+                        .to_bytes();
+                    super::strip_hop_by_hop_headers(&mut parts.headers);
+                    self.credential_engine.inject_with_body(
+                        &request_info,
+                        &mut parts.headers,
+                        &body_bytes,
+                    );
+                    return self
+                        .forward_buffered_with_body_log(
+                            parts,
+                            body_bytes,
+                            host,
+                            port,
+                            &method,
+                            &full_url,
+                            &allowed_ctx,
+                            rp,
+                        )
+                        .await;
+                }
+
                 self.logger.log_allowed(&allowed_ctx);
+                rp
             }
-        }
+            FilterResult::AllowedByRedirect { origin_patterns } => {
+                let allowed_ctx = RequestContext {
+                    credential: self.audit_credential(&request_info),
+                    ..ctx
+                };
+                self.logger
+                    .log_allowed_with_reason(&allowed_ctx, AuditReason::RedirectWhitelisted);
+                Some(origin_patterns)
+            }
+        };
 
         // Verify local credentials (header-only check, before body is consumed)
         if let Err(mismatch) = self
@@ -406,6 +636,11 @@ impl TunnelHandler {
                 reason: AuditReason::LocalCredentialMismatch,
                 credential: None,
                 git: None,
+                request_body: None,
+                request_body_encoding: None,
+                response_body: None,
+                response_body_encoding: None,
+                body_truncated: None,
             });
             return Ok(local_credential_mismatch_response(&method, &full_url));
         }
@@ -464,6 +699,11 @@ impl TunnelHandler {
                     reason: AuditReason::LocalCredentialMismatch,
                     credential: None,
                     git: None,
+                    request_body: None,
+                    request_body_encoding: None,
+                    response_body: None,
+                    response_body_encoding: None,
+                    body_truncated: None,
                 });
                 return Ok(local_credential_mismatch_response(&method, &full_url));
             }
@@ -517,7 +757,15 @@ impl TunnelHandler {
         };
 
         match result {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                self.record_redirect_if_allowed(
+                    resp.status().as_u16(),
+                    resp.headers(),
+                    &full_url,
+                    redirect_patterns.as_ref(),
+                );
+                Ok(resp)
+            }
             Err(e) => {
                 tracing::error!(method = %method, url = %full_url, error = %e, "Failed to forward request");
                 Ok(error_response(&e.to_string()))
@@ -525,8 +773,75 @@ impl TunnelHandler {
         }
     }
 
+    /// Emit a body-logging audit entry with captured request and response bodies.
+    fn emit_body_audit(&self, ctx: &RequestContext<'_>, req_body: &[u8], resp_body: &[u8]) {
+        let max = self.max_body_log_size;
+        let (req_str, req_enc, req_trunc) = crate::audit::encode_body(req_body, max);
+        let (resp_str, resp_enc, resp_trunc) = crate::audit::encode_body(resp_body, max);
+        let truncated = req_trunc || resp_trunc;
+        self.logger.emit_audit(AuditEntry {
+            timestamp: crate::audit::now_iso8601(),
+            event: AuditEvent::RequestAllowed,
+            method: ctx.method.to_string(),
+            url: ctx.url.to_string(),
+            host: ctx.host.to_string(),
+            scheme: ctx.scheme.to_string(),
+            protocol: ctx.protocol.to_string(),
+            decision: AuditDecision::Allowed,
+            reason: AuditReason::RuleMatched,
+            credential: ctx.credential.clone(),
+            git: None,
+            request_body: Some(req_str),
+            request_body_encoding: req_enc,
+            response_body: Some(resp_str),
+            response_body_encoding: resp_enc,
+            body_truncated: if truncated { Some(true) } else { None },
+        });
+    }
+
+    /// Forward a buffered request and capture the response body for body logging.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_buffered_with_body_log(
+        &self,
+        parts: hyper::http::request::Parts,
+        body_bytes: Bytes,
+        host: &str,
+        port: u16,
+        method: &str,
+        full_url: &str,
+        ctx: &RequestContext<'_>,
+        redirect_patterns: Option<Arc<Vec<UrlPattern>>>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        let req_body_snapshot = body_bytes.clone();
+        let resp = self
+            .forward_buffered(
+                parts,
+                body_bytes,
+                host,
+                port,
+                method,
+                full_url,
+                redirect_patterns,
+            )
+            .await?;
+
+        // Collect the response body for logging, then reconstruct the response
+        let (resp_parts, resp_body) = resp.into_parts();
+        let resp_body_bytes = resp_body
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+
+        self.emit_body_audit(ctx, &req_body_snapshot, &resp_body_bytes);
+
+        let new_body = Full::new(resp_body_bytes).map_err(|e| match e {}).boxed();
+        Ok(Response::from_parts(resp_parts, new_body))
+    }
+
     /// Rebuild a buffered request for upstream and forward it.
     /// Shared by branch-check and LFS-check arms.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_buffered(
         &self,
         mut parts: hyper::http::request::Parts,
@@ -535,6 +850,7 @@ impl TunnelHandler {
         port: u16,
         method: &str,
         full_url: &str,
+        redirect_patterns: Option<Arc<Vec<UrlPattern>>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
         let connect_port = self.upstream_port_override.unwrap_or(port);
         let connect_host = self
@@ -561,7 +877,15 @@ impl TunnelHandler {
         .await;
 
         match result {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                self.record_redirect_if_allowed(
+                    resp.status().as_u16(),
+                    resp.headers(),
+                    full_url,
+                    redirect_patterns.as_ref(),
+                );
+                Ok(resp)
+            }
             Err(e) => {
                 tracing::error!(method = %method, url = %full_url, error = %e, "Failed to forward request");
                 Ok(error_response(&e.to_string()))
@@ -606,6 +930,7 @@ async fn connect_upstream_tls(
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            config.key_log = Arc::new(rustls::KeyLogFile::new());
             Arc::new(config)
         }
     };
@@ -773,6 +1098,7 @@ fn h1_only_tls_config(base: Option<&ClientConfig>) -> Arc<ClientConfig> {
         }
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.key_log = Arc::new(rustls::KeyLogFile::new());
     Arc::new(config)
 }
 

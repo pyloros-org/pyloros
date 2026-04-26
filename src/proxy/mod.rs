@@ -126,6 +126,11 @@ impl RequestLogger {
             reason: AuditReason::NoMatchingRule,
             credential: ctx.credential.clone(),
             git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         });
         if self.permissive {
             None
@@ -134,10 +139,29 @@ impl RequestLogger {
         }
     }
 
-    /// Handle the `FilterResult::Allowed` pattern: log and emit audit.
+    /// Handle the `FilterResult::Allowed` pattern: log and emit audit with `RuleMatched`.
     pub fn log_allowed(&self, ctx: &RequestContext<'_>) {
+        self.log_allowed_with_reason(ctx, AuditReason::RuleMatched);
+    }
+
+    /// Log and emit audit for an allowed request, with an explicit `reason`.
+    /// Used to distinguish redirect-whitelist allowances (`RedirectWhitelisted`)
+    /// from direct rule matches.
+    pub fn log_allowed_with_reason(&self, ctx: &RequestContext<'_>, reason: AuditReason) {
         if self.log_allowed_requests {
-            tracing::info!(method = %ctx.method, url = %ctx.url, "ALLOWED{}", ctx.label);
+            match reason {
+                AuditReason::RedirectWhitelisted => {
+                    tracing::info!(
+                        method = %ctx.method,
+                        url = %ctx.url,
+                        "ALLOWED (redirect whitelist){}",
+                        ctx.label
+                    );
+                }
+                _ => {
+                    tracing::info!(method = %ctx.method, url = %ctx.url, "ALLOWED{}", ctx.label);
+                }
+            }
         }
         self.emit_audit(AuditEntry {
             timestamp: crate::audit::now_iso8601(),
@@ -148,9 +172,14 @@ impl RequestLogger {
             scheme: ctx.scheme.to_string(),
             protocol: ctx.protocol.to_string(),
             decision: AuditDecision::Allowed,
-            reason: AuditReason::RuleMatched,
+            reason,
             credential: ctx.credential.clone(),
             git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
         });
     }
 }
