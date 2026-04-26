@@ -172,6 +172,7 @@ Git-LFS uses a separate HTTP endpoint (`POST {repo}/info/lfs/objects/batch`) to 
   - Activation is automatic for any rule with `git = "fetch" | "push" | "*"`. Whitelisted actions are filtered by the rule's allowed LFS operations: a fetch-only rule whitelists `download` actions; a push-only rule whitelists `upload` and `verify`; `*` whitelists all three.
   - TTL: per-action `expires_at` (RFC 3339) or `expires_in` (seconds) from the response is used when present, clamped to `[60s, 3600s]`. Otherwise falls back to the existing `proxy.redirect_whitelist_ttl_secs` setting (default 60s).
   - Body size for inspection is capped at 10 MiB; oversized batch responses are forwarded unchanged with no whitelisting (warn-logged).
+  - `Content-Encoding: gzip`/`deflate` is decoded for parsing; the original (compressed) bytes are forwarded unchanged to the client. Other encodings (e.g. `br`, `zstd`) are not decoded — the response forwards through but no actions are whitelisted.
   - Trust model is identical to redirect whitelisting: the upstream is MITM-inspected and authenticated, so we trust its instructions about where the client will go next.
   - The whitelist is method-pinned: a leaked `verify` URL cannot be used for `GET` or `PUT`.
 

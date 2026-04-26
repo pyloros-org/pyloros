@@ -105,6 +105,48 @@ struct BatchAction {
     expires_in: Option<i64>,
 }
 
+/// Decompress `body` according to `content_encoding` (None / "identity" / "gzip" / "x-gzip" / "deflate").
+/// Returns the original bytes (no copy) when no decoding is needed, an owned
+/// `Vec<u8>` when it is, and `None` when the encoding is unsupported or the
+/// body is malformed.
+pub fn decode_body<'a>(
+    body: &'a [u8],
+    content_encoding: Option<&str>,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+    use std::borrow::Cow;
+    use std::io::Read;
+    match content_encoding {
+        None => Some(Cow::Borrowed(body)),
+        Some(enc) if enc.is_empty() || enc.eq_ignore_ascii_case("identity") => {
+            Some(Cow::Borrowed(body))
+        }
+        Some(enc) if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") => {
+            let mut decoder = flate2::read::GzDecoder::new(body);
+            let mut buf = Vec::with_capacity(body.len() * 4);
+            decoder.read_to_end(&mut buf).ok()?;
+            Some(Cow::Owned(buf))
+        }
+        Some(enc) if enc.eq_ignore_ascii_case("deflate") => {
+            let mut decoder = flate2::read::ZlibDecoder::new(body);
+            let mut buf = Vec::with_capacity(body.len() * 4);
+            decoder.read_to_end(&mut buf).ok()?;
+            Some(Cow::Owned(buf))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Parse an LFS batch response body — possibly compressed with `Content-Encoding`
+/// `gzip`/`deflate` — and extract advertised actions. Returns `None` on
+/// unsupported encoding, decompression failure, or invalid JSON.
+pub fn parse_lfs_batch_response_encoded(
+    body: &[u8],
+    content_encoding: Option<&str>,
+) -> Option<Vec<LfsAction>> {
+    let decoded = decode_body(body, content_encoding)?;
+    parse_lfs_batch_response(&decoded)
+}
+
 /// Parse an LFS batch response body and extract advertised actions. Returns
 /// `None` if the body is not valid JSON; returns `Some(empty)` if it parses
 /// but has no actions to whitelist.
@@ -259,6 +301,57 @@ mod tests {
             "only the second object yields an action",
             &actions.len(),
             &1usize,
+        );
+    }
+
+    #[test]
+    fn test_parse_encoded_gzip() {
+        let t = test_report!("parse_lfs_batch_response_encoded gunzips Content-Encoding: gzip");
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let raw = br#"{"objects":[{"actions":{"download":{"href":"https://x/y"}}}]}"#;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(raw).unwrap();
+        let gz = enc.finish().unwrap();
+        let actions =
+            parse_lfs_batch_response_encoded(&gz, Some("gzip")).expect("decoded + parsed");
+        t.assert_eq("one action", &actions.len(), &1usize);
+        t.assert_eq("download method", &actions[0].method(), &Method::GET);
+    }
+
+    #[test]
+    fn test_parse_encoded_identity_passthrough() {
+        let t = test_report!("parse_lfs_batch_response_encoded passes through identity / None");
+        let raw = br#"{"objects":[{"actions":{"upload":{"href":"https://x/y"}}}]}"#;
+        let with_identity = parse_lfs_batch_response_encoded(raw, Some("identity"));
+        let with_none = parse_lfs_batch_response_encoded(raw, None);
+        t.assert_eq(
+            "identity yields 1 action",
+            &with_identity.unwrap().len(),
+            &1usize,
+        );
+        t.assert_eq("None yields 1 action", &with_none.unwrap().len(), &1usize);
+    }
+
+    #[test]
+    fn test_parse_encoded_unsupported_returns_none() {
+        let t = test_report!(
+            "Unsupported Content-Encoding (e.g. br) yields None instead of misparsing"
+        );
+        let raw = br#"{"objects":[]}"#;
+        t.assert_true(
+            "br rejected",
+            parse_lfs_batch_response_encoded(raw, Some("br")).is_none(),
+        );
+    }
+
+    #[test]
+    fn test_parse_encoded_corrupt_gzip_returns_none() {
+        let t = test_report!("Corrupt gzip body yields None (no panic)");
+        t.assert_true(
+            "garbage gzip rejected",
+            parse_lfs_batch_response_encoded(b"not gzip", Some("gzip")).is_none(),
         );
     }
 

@@ -784,7 +784,11 @@ impl TunnelHandler {
                     "LFS batch response exceeds inspection cap; skipping action whitelisting"
                 );
             } else {
-                self.whitelist_lfs_actions(&resp_body_bytes, allowed_ops, full_url);
+                let encoding = resp_parts
+                    .headers
+                    .get(hyper::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok());
+                self.whitelist_lfs_actions(&resp_body_bytes, encoding, allowed_ops, full_url);
             }
         }
 
@@ -800,9 +804,21 @@ impl TunnelHandler {
     /// into the dynamic whitelist. `allowed_ops` is the merged `lfs_operations`
     /// for the matched rule (e.g. `["upload"]` covers both upload and verify
     /// actions; `["download"]` covers download actions only).
-    fn whitelist_lfs_actions(&self, body: &[u8], allowed_ops: &[String], full_url: &str) {
-        let Some(actions) = crate::filter::lfs_response::parse_lfs_batch_response(body) else {
-            tracing::debug!(url = %full_url, "LFS batch response body did not parse as JSON");
+    fn whitelist_lfs_actions(
+        &self,
+        body: &[u8],
+        content_encoding: Option<&str>,
+        allowed_ops: &[String],
+        full_url: &str,
+    ) {
+        let Some(actions) =
+            crate::filter::lfs_response::parse_lfs_batch_response_encoded(body, content_encoding)
+        else {
+            tracing::debug!(
+                url = %full_url,
+                encoding = ?content_encoding,
+                "LFS batch response could not be decoded/parsed; skipping whitelisting"
+            );
             return;
         };
         let now = std::time::Instant::now();
