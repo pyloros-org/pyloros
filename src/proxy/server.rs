@@ -20,7 +20,7 @@ use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::filter::redirect_whitelist::RedirectWhitelist;
-use crate::filter::{CredentialEngine, FilterEngine};
+use crate::filter::{CredentialEngine, FilterEngine, GeneratedSecret};
 use crate::tls::{CertificateAuthority, MitmCertificateGenerator};
 use std::time::Duration;
 
@@ -87,6 +87,9 @@ pub struct ProxyServer {
     reload_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     /// Notified after each completed reload attempt (success or failure).
     reload_complete: Arc<tokio::sync::Notify>,
+    /// Generated secrets from local credentials (written to env file at startup).
+    #[allow(dead_code)]
+    generated_secrets: Vec<GeneratedSecret>,
 }
 
 impl ProxyServer {
@@ -111,7 +114,22 @@ impl ProxyServer {
         let filter_engine = Arc::new(FilterEngine::new(config.rules.clone())?);
 
         // Build credential engine
-        let credential_engine = Arc::new(CredentialEngine::new(config.credentials.clone())?);
+        let (credential_engine, generated_secrets) =
+            CredentialEngine::new(config.credentials.clone())?;
+        let credential_engine = Arc::new(credential_engine);
+
+        // Write secrets file if needed
+        if !generated_secrets.is_empty() {
+            let path = config
+                .proxy
+                .generated_secrets_file
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::config("generated local credentials require generated_secrets_file")
+                })?;
+            write_secrets_file(path, &generated_secrets)?;
+            tracing::info!(path = %path, count = generated_secrets.len(), "Wrote generated secrets file");
+        }
 
         // Resolve auth credentials at startup (expands ${ENV_VAR})
         let resolved_auth = config.resolved_auth()?;
@@ -146,6 +164,7 @@ impl ProxyServer {
             reload_tx: None,
             reload_rx: None,
             reload_complete: Arc::new(tokio::sync::Notify::new()),
+            generated_secrets,
         })
     }
 
@@ -178,6 +197,7 @@ impl ProxyServer {
             reload_tx: None,
             reload_rx: None,
             reload_complete: Arc::new(tokio::sync::Notify::new()),
+            generated_secrets: Vec::new(),
         }
     }
 
@@ -431,7 +451,7 @@ impl ProxyServer {
 
         // Compile new credential engine
         let new_creds = match CredentialEngine::new(new_config.credentials.clone()) {
-            Ok(c) => Arc::new(c),
+            Ok((c, _generated)) => Arc::new(c),
             Err(e) => {
                 tracing::error!(error = %e, "Config reload failed: credential compilation error");
                 self.reload_complete.notify_waiters();
@@ -582,6 +602,45 @@ impl ProxyServer {
     pub fn mitm_generator(&self) -> &Arc<MitmCertificateGenerator> {
         &self.mitm_generator
     }
+}
+
+/// Write generated secrets to a KEY=value env file with restricted permissions.
+fn write_secrets_file(path: &str, secrets: &[GeneratedSecret]) -> Result<()> {
+    use std::io::Write;
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Error::config(format!(
+                    "cannot create directory for secrets file '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        }
+    }
+    let mut file = std::fs::File::create(path).map_err(|e| {
+        Error::config(format!(
+            "cannot create secrets file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    for secret in secrets {
+        writeln!(file, "{}={}", secret.env_name, secret.value).map_err(|e| {
+            Error::config(format!(
+                "cannot write secrets file '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+    }
+    Ok(())
 }
 
 /// Bind a listener to a TCP address or Unix socket path.

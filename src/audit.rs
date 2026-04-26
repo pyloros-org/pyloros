@@ -32,6 +32,7 @@ pub enum AuditReason {
     LfsOperationNotAllowed,
     NonHttpsConnect,
     AuthFailed,
+    LocalCredentialMismatch,
     /// Request was allowed because its URL is in the short-lived redirect whitelist
     /// (i.e., an earlier rule-matched request returned a 3xx Location pointing here).
     RedirectWhitelisted,
@@ -303,6 +304,10 @@ mod tests {
             ),
             (AuditReason::NonHttpsConnect, "\"non_https_connect\""),
             (AuditReason::AuthFailed, "\"auth_failed\""),
+            (
+                AuditReason::LocalCredentialMismatch,
+                "\"local_credential_mismatch\"",
+            ),
         ];
         for (reason, expected) in reasons {
             let json = serde_json::to_string(&reason).unwrap();

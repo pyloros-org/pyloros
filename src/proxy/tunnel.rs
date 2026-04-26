@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use super::response::{blocked_response, error_response, git_blocked_push_response};
+use super::response::{
+    blocked_response, error_response, git_blocked_push_response, local_credential_mismatch_response,
+};
 use super::{RequestContext, RequestLogger};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
@@ -394,6 +396,34 @@ impl TunnelHandler {
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
                 }
 
+                // Verify local credentials (body already buffered)
+                if let Err(mismatch) = self.credential_engine.verify_local_with_body(
+                    &request_info,
+                    &parts.headers,
+                    &body_bytes,
+                ) {
+                    tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local credential mismatch");
+                    self.logger.emit_audit(AuditEntry {
+                        timestamp: crate::audit::now_iso8601(),
+                        event: AuditEvent::RequestBlocked,
+                        method: method.clone(),
+                        url: full_url.clone(),
+                        host: host.to_string(),
+                        scheme: "https".to_string(),
+                        protocol: "https".to_string(),
+                        decision: AuditDecision::Blocked,
+                        reason: AuditReason::LocalCredentialMismatch,
+                        credential: None,
+                        git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
+                    });
+                    return Ok(local_credential_mismatch_response(&method, &full_url));
+                }
+
                 // Allowed after branch check
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
@@ -481,6 +511,34 @@ impl TunnelHandler {
                     return Ok(blocked_response(&method, &full_url));
                 }
 
+                // Verify local credentials
+                if let Err(mismatch) = self.credential_engine.verify_local_with_body(
+                    &request_info,
+                    &parts.headers,
+                    &body_bytes,
+                ) {
+                    tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local credential mismatch");
+                    self.logger.emit_audit(AuditEntry {
+                        timestamp: crate::audit::now_iso8601(),
+                        event: AuditEvent::RequestBlocked,
+                        method: method.clone(),
+                        url: full_url.clone(),
+                        host: host.to_string(),
+                        scheme: "https".to_string(),
+                        protocol: "https".to_string(),
+                        decision: AuditDecision::Blocked,
+                        reason: AuditReason::LocalCredentialMismatch,
+                        credential: None,
+                        git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
+                    });
+                    return Ok(local_credential_mismatch_response(&method, &full_url));
+                }
+
                 // Allowed after LFS check
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
@@ -560,6 +618,33 @@ impl TunnelHandler {
             }
         };
 
+        // Verify local credentials (header-only check, before body is consumed)
+        if let Err(mismatch) = self
+            .credential_engine
+            .verify_local(&request_info, req.headers())
+        {
+            tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local credential mismatch");
+            self.logger.emit_audit(AuditEntry {
+                timestamp: crate::audit::now_iso8601(),
+                event: AuditEvent::RequestBlocked,
+                method: method.clone(),
+                url: full_url.clone(),
+                host: host.to_string(),
+                scheme: "https".to_string(),
+                protocol: "https".to_string(),
+                decision: AuditDecision::Blocked,
+                reason: AuditReason::LocalCredentialMismatch,
+                credential: None,
+                git: None,
+                request_body: None,
+                request_body_encoding: None,
+                response_body: None,
+                response_body_encoding: None,
+                body_truncated: None,
+            });
+            return Ok(local_credential_mismatch_response(&method, &full_url));
+        }
+
         // Forward the request to the actual server
         let connect_port = self.upstream_port_override.unwrap_or(port);
         let connect_host = self
@@ -583,9 +668,49 @@ impl TunnelHandler {
             .await
         } else if self.credential_engine.needs_body(&request_info) {
             // SigV4 credentials need the full body for signing.
+            let (mut parts, body) = req.into_parts();
+            let body_bytes = body
+                .collect()
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to buffer request body for SigV4 signing");
+                    e
+                })?
+                .to_bytes();
+
+            // Verify local SigV4 credentials BEFORE modifying headers.
+            // The signature was computed by the agent with the original headers,
+            // so we must verify before strip_hop_by_hop or host override.
+            if let Err(mismatch) = self.credential_engine.verify_local_with_body(
+                &request_info,
+                &parts.headers,
+                &body_bytes,
+            ) {
+                tracing::warn!(url = %full_url, cred_url = %mismatch.credential_url, "Local SigV4 credential mismatch");
+                self.logger.emit_audit(AuditEntry {
+                    timestamp: crate::audit::now_iso8601(),
+                    event: AuditEvent::RequestBlocked,
+                    method: method.clone(),
+                    url: full_url.clone(),
+                    host: host.to_string(),
+                    scheme: "https".to_string(),
+                    protocol: "https".to_string(),
+                    decision: AuditDecision::Blocked,
+                    reason: AuditReason::LocalCredentialMismatch,
+                    credential: None,
+                    git: None,
+                    request_body: None,
+                    request_body_encoding: None,
+                    response_body: None,
+                    response_body_encoding: None,
+                    body_truncated: None,
+                });
+                return Ok(local_credential_mismatch_response(&method, &full_url));
+            }
+
+            // Now modify headers for upstream forwarding.
             // Set the upstream Host header BEFORE signing so the signature covers
             // the final host value that the upstream server will see.
-            let (mut parts, body) = req.into_parts();
             super::strip_hop_by_hop_headers(&mut parts.headers);
             let upstream_host_value = if connect_port == 443 {
                 host.to_string()
@@ -595,14 +720,7 @@ impl TunnelHandler {
             if let Ok(hv) = hyper::header::HeaderValue::from_str(&upstream_host_value) {
                 parts.headers.insert(hyper::header::HOST, hv);
             }
-            let body_bytes = body
-                .collect()
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "Failed to buffer request body for SigV4 signing");
-                    e
-                })?
-                .to_bytes();
+
             self.credential_engine
                 .inject_with_body(&request_info, &mut parts.headers, &body_bytes);
             let full_body = Full::new(body_bytes).map_err(|e| match e {}).boxed();
