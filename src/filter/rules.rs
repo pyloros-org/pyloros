@@ -1,7 +1,7 @@
 //! Rule compilation and filter engine
 
+use super::dynamic_whitelist::{DynamicWhitelist, WhitelistSource};
 use super::matcher::{PatternMatcher, UrlPattern};
-use super::redirect_whitelist::RedirectWhitelist;
 use crate::config::Rule;
 use crate::error::Result;
 use std::sync::Arc;
@@ -423,6 +423,10 @@ pub enum FilterResult {
     AllowedByRedirect {
         origin_patterns: Arc<Vec<UrlPattern>>,
     },
+    /// Request is allowed because its (method, URL) was advertised as an action
+    /// in a recent successful LFS batch response. No origin patterns travel with
+    /// the entry — LFS actions don't chain like redirects do.
+    AllowedByLfsAction,
 }
 
 /// The filter engine that evaluates requests against rules
@@ -518,17 +522,29 @@ impl FilterEngine {
         None
     }
 
-    /// Like `check()` but consults the redirect whitelist first. If the request's
-    /// full URL is whitelisted (and unexpired), returns `AllowedByRedirect` carrying
-    /// the origin rule's redirect patterns.
-    pub fn check_with_redirect_whitelist(
+    /// Like `check()` but consults the dynamic whitelist first. If the request's
+    /// (method, full URL) is whitelisted (and unexpired), returns either
+    /// `AllowedByRedirect` (carrying the origin rule's redirect patterns) or
+    /// `AllowedByLfsAction`, depending on what populated the entry.
+    pub fn check_with_dynamic_whitelist(
         &self,
         request: &RequestInfo,
-        whitelist: &RedirectWhitelist,
+        whitelist: &DynamicWhitelist,
     ) -> FilterResult {
         let full_url = request.full_url();
-        if let Some(origin_patterns) = whitelist.get(&full_url) {
-            return FilterResult::AllowedByRedirect { origin_patterns };
+        let method = match request.method.parse::<hyper::http::Method>() {
+            Ok(m) => m,
+            Err(_) => return self.check(request),
+        };
+        if let Some(hit) = whitelist.get(&full_url, &method) {
+            return match hit.source {
+                WhitelistSource::Redirect => FilterResult::AllowedByRedirect {
+                    origin_patterns: hit
+                        .redirect_patterns
+                        .expect("redirect entry carries patterns"),
+                },
+                WhitelistSource::LfsAction => FilterResult::AllowedByLfsAction,
+            };
         }
         self.check(request)
     }
@@ -1503,15 +1519,15 @@ mod tests {
     #[test]
     fn test_check_with_redirect_whitelist_hit() {
         let t = test_report!(
-            "check_with_redirect_whitelist returns AllowedByRedirect on whitelist hit"
+            "check_with_dynamic_whitelist returns AllowedByRedirect on redirect-whitelist hit"
         );
         let engine = FilterEngine::empty();
-        let wl = RedirectWhitelist::new(std::time::Duration::from_secs(60), 10);
+        let wl = DynamicWhitelist::new(std::time::Duration::from_secs(60), 10);
         let patterns = Arc::new(vec![UrlPattern::new("*://*/*").unwrap()]);
-        wl.insert("https://cdn.example.com/file".to_string(), patterns);
+        wl.insert_redirect("https://cdn.example.com/file".to_string(), patterns);
 
         let req = RequestInfo::http("GET", "https", "cdn.example.com", None, "/file", None);
-        let result = engine.check_with_redirect_whitelist(&req, &wl);
+        let result = engine.check_with_dynamic_whitelist(&req, &wl);
         t.assert_true(
             "AllowedByRedirect",
             matches!(result, FilterResult::AllowedByRedirect { .. }),
@@ -1519,16 +1535,44 @@ mod tests {
     }
 
     #[test]
-    fn test_check_with_redirect_whitelist_miss_falls_through() {
+    fn test_check_with_dynamic_whitelist_lfs_action_hit() {
         let t = test_report!(
-            "check_with_redirect_whitelist falls through to check() on whitelist miss"
+            "check_with_dynamic_whitelist returns AllowedByLfsAction for method-pinned LFS hit"
         );
+        let engine = FilterEngine::empty();
+        let wl = DynamicWhitelist::new(std::time::Duration::from_secs(60), 10);
+        wl.insert_lfs_action(
+            "https://lfs.example.com/x/verify".to_string(),
+            hyper::http::Method::POST,
+            None,
+        );
+
+        let req = RequestInfo::http("POST", "https", "lfs.example.com", None, "/x/verify", None);
+        let result = engine.check_with_dynamic_whitelist(&req, &wl);
+        t.assert_true(
+            "AllowedByLfsAction",
+            matches!(result, FilterResult::AllowedByLfsAction),
+        );
+
+        let wrong_method =
+            RequestInfo::http("GET", "https", "lfs.example.com", None, "/x/verify", None);
+        let result2 = engine.check_with_dynamic_whitelist(&wrong_method, &wl);
+        t.assert_true(
+            "GET to verify URL is not allowed (method-pinned)",
+            matches!(result2, FilterResult::Blocked),
+        );
+    }
+
+    #[test]
+    fn test_check_with_redirect_whitelist_miss_falls_through() {
+        let t =
+            test_report!("check_with_dynamic_whitelist falls through to check() on whitelist miss");
         let engine = FilterEngine::new(vec![make_rule("GET", "https://a.example.com/*")]).unwrap();
-        let wl = RedirectWhitelist::new(std::time::Duration::from_secs(60), 10);
+        let wl = DynamicWhitelist::new(std::time::Duration::from_secs(60), 10);
 
         // Matching normal rule
         let req = RequestInfo::http("GET", "https", "a.example.com", None, "/x", None);
-        let result = engine.check_with_redirect_whitelist(&req, &wl);
+        let result = engine.check_with_dynamic_whitelist(&req, &wl);
         t.assert_true(
             "Allowed (via rule)",
             matches!(result, FilterResult::Allowed { .. }),
@@ -1536,7 +1580,7 @@ mod tests {
 
         // Not matching any rule and not in whitelist
         let req2 = RequestInfo::http("GET", "https", "other.example.com", None, "/x", None);
-        let result2 = engine.check_with_redirect_whitelist(&req2, &wl);
+        let result2 = engine.check_with_dynamic_whitelist(&req2, &wl);
         t.assert_true("Blocked", matches!(result2, FilterResult::Blocked));
     }
 }
