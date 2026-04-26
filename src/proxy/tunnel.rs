@@ -19,10 +19,10 @@ use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
 };
 use crate::error::{Error, Result};
+use crate::filter::dynamic_whitelist::{maybe_whitelist_redirect, DynamicWhitelist};
 use crate::filter::lfs;
 use crate::filter::matcher::UrlPattern;
 use crate::filter::pktline;
-use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{CredentialEngine, FilterEngine, FilterResult, RequestInfo};
 use crate::tls::MitmCertificateGenerator;
 
@@ -31,7 +31,7 @@ pub struct TunnelHandler {
     mitm_generator: Arc<MitmCertificateGenerator>,
     filter_engine: Arc<FilterEngine>,
     credential_engine: Arc<CredentialEngine>,
-    redirect_whitelist: Arc<RedirectWhitelist>,
+    dynamic_whitelist: Arc<DynamicWhitelist>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -44,13 +44,13 @@ impl TunnelHandler {
         mitm_generator: Arc<MitmCertificateGenerator>,
         filter_engine: Arc<FilterEngine>,
         credential_engine: Arc<CredentialEngine>,
-        redirect_whitelist: Arc<RedirectWhitelist>,
+        dynamic_whitelist: Arc<DynamicWhitelist>,
     ) -> Self {
         Self {
             mitm_generator,
             filter_engine,
             credential_engine,
-            redirect_whitelist,
+            dynamic_whitelist,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -134,7 +134,7 @@ impl TunnelHandler {
             location,
             request_url,
             patterns,
-            &self.redirect_whitelist,
+            &self.dynamic_whitelist,
         ) {
             tracing::info!(
                 from = %request_url,
@@ -251,7 +251,7 @@ impl TunnelHandler {
                 let handler = super::handler::ProxyHandler::new(
                     Arc::clone(&self_arc),
                     self_arc.filter_engine.clone(),
-                    self_arc.redirect_whitelist.clone(),
+                    self_arc.dynamic_whitelist.clone(),
                 )
                 .with_request_logging(
                     self_arc.logger.log_allowed_requests,
@@ -314,7 +314,7 @@ impl TunnelHandler {
         // Check filter, consulting the redirect whitelist for short-lived allowances.
         let filter_result = self
             .filter_engine
-            .check_with_redirect_whitelist(&request_info, &self.redirect_whitelist);
+            .check_with_dynamic_whitelist(&request_info, &self.dynamic_whitelist);
 
         let ctx = RequestContext {
             method: &method,
@@ -557,6 +557,15 @@ impl TunnelHandler {
                 self.logger
                     .log_allowed_with_reason(&allowed_ctx, AuditReason::RedirectWhitelisted);
                 Some(origin_patterns)
+            }
+            FilterResult::AllowedByLfsAction => {
+                let allowed_ctx = RequestContext {
+                    credential: self.audit_credential(&request_info),
+                    ..ctx
+                };
+                self.logger
+                    .log_allowed_with_reason(&allowed_ctx, AuditReason::LfsActionWhitelisted);
+                None
             }
         };
 

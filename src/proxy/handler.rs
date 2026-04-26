@@ -12,8 +12,8 @@ use super::response::{auth_required_response, blocked_response, error_response};
 use super::tunnel::TunnelHandler;
 use super::{RequestContext, RequestLogger};
 use crate::audit::{AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason};
+use crate::filter::dynamic_whitelist::{maybe_whitelist_redirect, DynamicWhitelist};
 use crate::filter::matcher::UrlPattern;
-use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{FilterEngine, FilterResult, RequestInfo};
 
 use base64::Engine;
@@ -22,7 +22,7 @@ use base64::Engine;
 pub struct ProxyHandler {
     tunnel_handler: Arc<TunnelHandler>,
     filter_engine: Arc<FilterEngine>,
-    redirect_whitelist: Arc<RedirectWhitelist>,
+    dynamic_whitelist: Arc<DynamicWhitelist>,
     auth: Option<(String, String)>,
     logger: RequestLogger,
     max_body_log_size: usize,
@@ -32,12 +32,12 @@ impl ProxyHandler {
     pub fn new(
         tunnel_handler: Arc<TunnelHandler>,
         filter_engine: Arc<FilterEngine>,
-        redirect_whitelist: Arc<RedirectWhitelist>,
+        dynamic_whitelist: Arc<DynamicWhitelist>,
     ) -> Self {
         Self {
             tunnel_handler,
             filter_engine,
-            redirect_whitelist,
+            dynamic_whitelist,
             auth: None,
             logger: RequestLogger::new(),
             max_body_log_size: 1_048_576,
@@ -251,7 +251,7 @@ impl ProxyHandler {
         // allow_redirects) or whitelisted-by-redirect (carrying origin patterns).
         let redirect_patterns: Option<Arc<Vec<UrlPattern>>> = match self
             .filter_engine
-            .check_with_redirect_whitelist(&request_info, &self.redirect_whitelist)
+            .check_with_dynamic_whitelist(&request_info, &self.dynamic_whitelist)
         {
             FilterResult::Blocked => {
                 if let Some(resp) = self.logger.log_blocked(&ctx) {
@@ -358,6 +358,13 @@ impl ProxyHandler {
                     .log_allowed_with_reason(&ctx, AuditReason::RedirectWhitelisted);
                 Some(origin_patterns)
             }
+            FilterResult::AllowedByLfsAction => {
+                // LFS batch responses are HTTPS-only, so reaching this arm via plain HTTP
+                // shouldn't normally happen. Honor the whitelist hit; no redirect inspection.
+                self.logger
+                    .log_allowed_with_reason(&ctx, AuditReason::LfsActionWhitelisted);
+                None
+            }
         };
 
         let upstream_port = port.unwrap_or(80);
@@ -374,7 +381,7 @@ impl ProxyHandler {
                         location,
                         &full_url,
                         patterns,
-                        &self.redirect_whitelist,
+                        &self.dynamic_whitelist,
                     ) {
                         tracing::info!(
                             from = %full_url,
