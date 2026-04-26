@@ -96,6 +96,16 @@ fn parse_commits(pack: &[u8]) -> Result<HashMap<[u8; 20], Vec<[u8; 20]>>, &'stat
     }
     let num_objects = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
 
+    // The smallest possible encoded object is one header byte plus six bytes
+    // of an empty zlib stream (7 bytes total). With a 12-byte pack header and
+    // 20-byte trailer, an honest pack with `n` objects must have at least
+    // `7n + 32` total bytes. Reject before allocating, so an attacker-supplied
+    // header can't trigger a multi-GB allocation.
+    let body_budget = pack.len().saturating_sub(12 + 20);
+    if num_objects.saturating_mul(7) > body_budget {
+        return Err("declared object count exceeds available body bytes");
+    }
+
     struct Entry {
         type_: u8,
         /// Decompressed bytes: full object for non-delta, delta instructions otherwise.
@@ -591,6 +601,26 @@ mod tests {
         let r = pack_contains_ancestry(b"not-a-pack", &[0u8; 20], &[1u8; 20]);
         t.assert_eq(
             "malformed -> Indeterminate",
+            &r,
+            &AncestryResult::Indeterminate,
+        );
+    }
+
+    #[test]
+    fn test_ancestry_huge_object_count_does_not_oom() {
+        // Found by fuzz: a pack header claiming u32::MAX objects in a tiny
+        // body would attempt a multi-GB Vec allocation. The parser must reject
+        // the header first.
+        let t = test_report!("huge declared object count -> Indeterminate, no allocation");
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&u32::MAX.to_be_bytes());
+        // Tiny body padding + trailer.
+        pack.extend_from_slice(&[0u8; 64]);
+        let r = pack_contains_ancestry(&pack, &[0u8; 20], &[1u8; 20]);
+        t.assert_eq(
+            "huge count -> Indeterminate",
             &r,
             &AncestryResult::Indeterminate,
         );
