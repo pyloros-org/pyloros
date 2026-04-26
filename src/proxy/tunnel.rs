@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use super::response::{blocked_response, error_response, git_blocked_push_response};
+use super::response::{
+    blocked_response, error_response, git_blocked_push_response, git_force_push_blocked_response,
+};
 use super::{RequestContext, RequestLogger};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
@@ -392,6 +394,59 @@ impl TunnelHandler {
                         body_truncated: None,
                     });
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
+                }
+
+                // Protected-branch (force-push / delete / non-FF) check
+                if !filter.protected.is_empty() {
+                    let upstream_cfg = super::protected_branch::UpstreamConfig {
+                        host_override: self.upstream_host_override.clone(),
+                        port_override: self.upstream_port_override,
+                        tls_config: self.upstream_tls_config.clone(),
+                    };
+                    let protected_blocked = super::protected_branch::check_violations(
+                        &body_bytes,
+                        filter,
+                        host,
+                        port,
+                        &path,
+                        &parts.headers,
+                        &upstream_cfg,
+                    )
+                    .await;
+                    if !protected_blocked.is_empty() {
+                        if self.logger.log_blocked_requests {
+                            tracing::warn!(
+                                method = %method,
+                                url = %full_url,
+                                blocked_refs = ?protected_blocked,
+                                "BLOCKED (protected branch: force-push/delete/non-FF)"
+                            );
+                        }
+                        self.logger.emit_audit(AuditEntry {
+                            timestamp: crate::audit::now_iso8601(),
+                            event: AuditEvent::RequestBlocked,
+                            method: method.clone(),
+                            url: full_url.clone(),
+                            host: host.to_string(),
+                            scheme: "https".to_string(),
+                            protocol: "https".to_string(),
+                            decision: AuditDecision::Blocked,
+                            reason: AuditReason::ForcePushProtected,
+                            credential: None,
+                            git: Some(AuditGitInfo {
+                                blocked_refs: protected_blocked.clone(),
+                            }),
+                            request_body: None,
+                            request_body_encoding: None,
+                            response_body: None,
+                            response_body_encoding: None,
+                            body_truncated: None,
+                        });
+                        return Ok(git_force_push_blocked_response(
+                            &body_bytes,
+                            &protected_blocked,
+                        ));
+                    }
                 }
 
                 // Allowed after branch check
@@ -883,7 +938,7 @@ fn rebuild_request_for_upstream<B>(
 }
 
 /// Forward a request with a BoxBody to the upstream server (supports h1 and h2 via ALPN).
-async fn forward_request_boxed(
+pub(super) async fn forward_request_boxed(
     mut req: Request<BoxBody<Bytes, hyper::Error>>,
     connect_host: String,
     port: u16,

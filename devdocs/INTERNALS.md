@@ -239,3 +239,85 @@ healthcheck probes to `http://127.0.0.1:8080/`), HTTP-level checks like `wget --
 fail. Instead, `nc -z 127.0.0.1 8080` performs a TCP port check — available via BusyBox
 in Alpine without extra packages.
 
+## Force-push detection
+
+`protected_branches` (see SPEC) requires fast-forward-only updates. Detection runs
+against the receive-pack body after the pkt-line ref commands: the remaining bytes
+are a git packfile, and we walk commit parents in that pack from `new-sha` toward
+`old-sha`. A true fast-forward pack always contains the chain of new commits linking
+back to `old-sha`; a forced/rewrite pack does not.
+
+### Why a hand-rolled pack parser (src/filter/pack.rs)
+
+The obvious choice was `gix` / `gix-pack`, but gitoxide pulls a very large dep tree
+(ICU, the whole object-database machinery, async glue) for what is — in our case —
+a small, read-only, in-memory task. The parser we need only has to:
+
+1. Read the pack header and per-object headers.
+2. Decompress zlib streams for commit objects.
+3. Resolve OFS_DELTA and REF_DELTA chains (since git frequently deltifies commits
+   against each other within its pack window).
+4. Compute object SHAs (SHA-1 via `ring`, already a dep).
+5. Extract `parent <sha>` lines from commit objects.
+
+That fits in one file (~500 LOC) plus `flate2` for zlib, which has a much smaller
+surface than the full gitoxide stack. If we ever need tree/blob inspection or index
+writing, revisit this tradeoff — `gix` is then the right call.
+
+### Thin-pack handling
+
+Git push packs are thin by default: base objects the server already has are omitted.
+For our check this means the commit object whose SHA is `old-sha` is usually NOT in
+the pushed pack. That is fine — a fast-forward pack still contains a commit `C`
+whose `parent` line is `old-sha`. Our BFS walks commits in the pack and reports
+`IsAncestor` as soon as any visited commit's parent list contains `old-sha`, even
+when `old-sha` itself is not resolvable as a pack object.
+
+REF_DELTA objects with bases outside the pack are unresolvable. If any commit delta
+chain hits such an external base, we return `Indeterminate`, which the caller treats
+as a block (fail closed). In practice commit deltification within a single push
+tends to stay inside the pack (OFS_DELTA); external REF_DELTA bases are uncommon
+for commits.
+
+### Why no index file
+
+`gix-pack` wants a `.idx` file to look up objects by SHA. We don't have one. Rather
+than build one, we do two linear passes: first, SHA-ify all non-delta objects and
+build an in-memory SHA → index map; second, iteratively resolve deltas whose bases
+(by offset or SHA) are already known. Iteration terminates because each pass either
+resolves at least one object or makes no progress (all remaining deltas have
+unresolvable external bases).
+
+### Upstream want/have fallback (src/filter/upstream_negotiate.rs)
+
+The pack walk alone produces false positives: if a fast-forward push carries zero
+or few new commits (because `new-sha` already exists on the server under another
+ref, or because an intermediate commit in the chain is server-known and the pack
+is thin), the walk has no edges to follow and reports `NotAncestor`. We can't
+distinguish that from a genuine force-push.
+
+So on `NotAncestor`/`Indeterminate` from the pack walk, the proxy issues its own
+`POST <repo>/git-upload-pack` to the upstream, using protocol v2 with
+`command=fetch` + `want=<new-sha>` + `have=<old-sha>` + `done`. The server is the
+authoritative source on its own commit graph and responds with:
+
+- `ACK <old-sha> ready` — `old-sha` is reachable from `new-sha`. Fast-forward.
+- `NAK` — no common ancestor. Force-push.
+- Anything else (transport error, `ERR unknown want`, unparseable response) —
+  fail closed: block.
+
+Credentials are copied from the client's `Authorization` header (same as the
+normal push forward). Host/port/TLS use the same overrides as the main proxy
+path, so tests can point the sidecar at a local test upstream.
+
+### Natural extension (not implemented)
+
+The same negotiation machinery generalizes to tree/content inspection: v2
+`command=fetch` with `want`/`have` returns a `packfile` section after
+`acknowledgments` containing the commits (and optionally trees, via `filter=...`)
+between the two SHAs. A future "ban binaries on protected branches" or "require
+signed commits" check could walk the pushed pack first, then fetch a completion
+pack for any missing range, and inspect trees/blobs across the combined object
+set. The pack parser already handles all object types via the same delta
+resolution. Not built yet — noted for future reference.
+

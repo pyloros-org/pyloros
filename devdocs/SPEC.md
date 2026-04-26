@@ -158,6 +158,33 @@ branches = ["!main"]
 
 See `INTERNALS.md` for implementation details (smart HTTP endpoint mapping, pkt-line inspection, compilation model).
 
+#### Force-push protection
+
+The optional `protected_branches` field names ref patterns (same syntax as `branches`) on which **force-push and deletion are forbidden**. Only valid on `git = "push"` or `git = "*"` rules.
+
+- Patterns match ref names the same way as `branches` (bare `feature/*` → `refs/heads/feature/*`, `refs/`-prefixed is literal).
+- Deny (`!`) prefix is not accepted for `protected_branches` — it is an allow-list of ref patterns to protect.
+- A ref matched by `protected_branches` is allowed through only if:
+  - it is a **new ref** (`old-sha = 000…0`), or
+  - it is a **fast-forward update**: `new-sha` is a descendant of `old-sha` via commits present in the pushed packfile.
+- **Deletions** of a protected ref (`new-sha = 000…0`) are always blocked.
+- **Non-fast-forward updates** (history rewrite, rewind) are always blocked. The proxy first walks commits in the pushed pack from `new-sha` toward parents. If `old-sha` is reached, the push is allowed without further checks.
+- If the pack walk cannot confirm fast-forward (thin pack omits the chain, pack is empty because `new-sha` already exists on the server, or the pack is otherwise unresolvable), the proxy issues a sidecar **git protocol v2 `want`/`have` negotiation** to the upstream server (`POST <repo>/git-upload-pack` with forwarded client credentials). The server responds with `ACK <old-sha> ready` when `old-sha` is reachable from `new-sha` in its commit graph — this is the authoritative ancestry check. On `ACK ready` the push is allowed; on `NAK` (no common ancestor) it is blocked; on any transport, auth, or parse failure the push is blocked (fail closed).
+- This two-stage design keeps the common path (new commits on a protected branch) fast — the pack walk resolves it without any upstream round-trip — while still correctly allowing legitimate edge cases like fast-forwarding to a commit that already exists under another ref.
+- Protected-branch checks layer on top of `branches`: a ref must first pass the `branches` allow/deny filter, then the protected check.
+- Blocked pushes return the same git `receive-pack` error response mechanism used for `branches`, with a per-ref message like `! [remote rejected] main -> main (force-push to protected ref denied by proxy policy)`.
+
+```toml
+# Allow any push to this repo, but forbid force/delete on main and release/*
+[[rules]]
+git = "push"
+url = "https://github.com/myorg/repo"
+branches = ["*"]
+protected_branches = ["main", "release/*"]
+```
+
+Plain HTTP is blocked for pushes to rules with `protected_branches` (body inspection requires HTTPS), same default-deny rule as `branches`.
+
 #### Git-LFS support
 
 Git-LFS uses a separate HTTP endpoint (`POST {repo}/info/lfs/objects/batch`) to negotiate large file transfers. Git rules automatically include this endpoint so that LFS operations work without additional manual rules.

@@ -781,6 +781,7 @@ pub fn rule(method: &str, url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -793,6 +794,7 @@ pub fn rule_with_redirects(method: &str, url: &str, redirects: &[&str]) -> pylor
         branches: None,
         allow_redirects: redirects.iter().map(|s| s.to_string()).collect(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -805,6 +807,7 @@ pub fn rule_with_body_log(method: &str, url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: true,
+        protected_branches: None,
     }
 }
 
@@ -817,6 +820,7 @@ pub fn ws_rule(url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -829,6 +833,7 @@ pub fn git_rule(git_op: &str, url: &str) -> pyloros::config::Rule {
         branches: None,
         allow_redirects: Vec::new(),
         log_body: false,
+        protected_branches: None,
     }
 }
 
@@ -839,6 +844,29 @@ pub fn git_rule_with_branches(git_op: &str, url: &str, branches: &[&str]) -> pyl
         websocket: false,
         git: Some(git_op.to_string()),
         branches: Some(branches.iter().map(|b| b.to_string()).collect()),
+        allow_redirects: Vec::new(),
+        log_body: false,
+        protected_branches: None,
+    }
+}
+
+pub fn git_rule_with_protected(
+    git_op: &str,
+    url: &str,
+    branches: &[&str],
+    protected: &[&str],
+) -> pyloros::config::Rule {
+    pyloros::config::Rule {
+        method: None,
+        url: url.to_string(),
+        websocket: false,
+        git: Some(git_op.to_string()),
+        branches: if branches.is_empty() {
+            None
+        } else {
+            Some(branches.iter().map(|b| b.to_string()).collect())
+        },
+        protected_branches: Some(protected.iter().map(|p| p.to_string()).collect()),
         allow_redirects: Vec::new(),
         log_body: false,
     }
@@ -987,6 +1015,16 @@ pub fn git_cgi_handler(
                 .unwrap_or("")
                 .to_string();
 
+            // Forward the Git-Protocol header so the backend can negotiate v2.
+            // git-http-backend reads the `GIT_PROTOCOL` env var (not
+            // `HTTP_GIT_PROTOCOL`) per its source.
+            let git_protocol = req
+                .headers()
+                .get("git-protocol")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
             let body_bytes = req.collect().await.unwrap().to_bytes();
 
             let mut cmd = std::process::Command::new(&backend_path);
@@ -1002,6 +1040,9 @@ pub fn git_cgi_handler(
                 .stderr(std::process::Stdio::piped());
             if !content_length.is_empty() {
                 cmd.env("CONTENT_LENGTH", &content_length);
+            }
+            if !git_protocol.is_empty() {
+                cmd.env("GIT_PROTOCOL", &git_protocol);
             }
 
             let mut child = cmd.spawn().expect("failed to spawn git http-backend");
