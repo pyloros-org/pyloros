@@ -3,6 +3,7 @@
 mod credentials;
 pub mod dynamic_whitelist;
 pub mod lfs;
+pub mod lfs_response;
 pub mod matcher;
 pub mod pktline;
 mod rules;
