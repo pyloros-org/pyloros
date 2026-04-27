@@ -163,3 +163,17 @@ If all proposed rules are already matched by the active ruleset, the approval au
 3. **Do denied approvals get remembered across requests?** We said "not crucial for v1." Leaving unbuilt but not precluded.
 
 4. **Bootstrapping the browser URL** — how does the user know to open `http://localhost:<forwarded-port>/`? Print setup instructions (including the `ssh -L` snippet) on proxy startup; document in README; maybe auto-open on first blocked request if running under a TTY.
+
+5. **Specificity collapses for closure-shaped requests.** Surfaced while testing `npm install`. The current contract pushes the agent to "request specific packages, not host wildcards" — fine for a top-level package, but a real install pulls a transitive closure (express ≈ 50 packages across 3+ layers). The agent ends up POSTing a 50-rule batch where every rule is structurally `GET https://registry.npmjs.org/<name>` + `/<name>/*`. The human approver cannot meaningfully verify whether each `<name>` is actually in express's closure vs. something the agent hallucinated or was tricked into adding (typosquats, a poisoned upstream metadata response, etc.) — the list is too long to scan and the names are unfamiliar. The "specificity" guardrail degrades to rubber-stamping. Same shape will appear for `cargo`, `pip`, `apt`, container pulls, anything closure-typed.
+
+   Possible directions, none implemented:
+
+   a. **Server-side closure resolution.** The approval payload becomes a single root spec (`npm:express@5`); the proxy/dashboard expands the closure itself by querying a trusted resolver (registry, lockfile generator, deps.dev) and presents the human with one decision: "approve the closure of express@5 as resolved at <timestamp>", with the full URL list available to inspect but not the unit of approval. Trust shifts from "agent told me these names" to "registry told me these names."
+
+   b. **Lockfile-anchored approval.** User commits `package-lock.json` / `Cargo.lock` / equivalent into the repo; the agent's request is "fetch the URLs in this lockfile, integrity-checked against its hashes." The approver verifies the lockfile once (or trusts the repo); the proxy enforces "URL must appear in the lockfile and content must match its hash." The human is not asked to verify package names at all.
+
+   c. **Bounded host-wide rules with post-hoc audit.** Allow `* https://registry.npmjs.org/*` as a single approval, but require structured logging of every package + version + hash actually fetched, surfaced as a post-install diff for the human to review. Trust boundary moves from "what URLs" to "what code ended up on disk."
+
+   d. **Schema-constrained batches.** Even without (a)-(c), the proxy could enforce that a single approval batch is "all rules must be `<scheme> <host>/<exactname>` or `<host>/<exactname>/*` for one host, ≤ N rules". This doesn't fix verifiability but caps blast radius: no smuggled second host, no path wildcards, bounded size.
+
+   (a) and (b) are the substantive fixes; (c) and (d) are mitigations. Pick before v2 of the approval flow ships, because the agent-side "enumerate + batch" workaround we have today actively trains the human to approve unreadable lists.
