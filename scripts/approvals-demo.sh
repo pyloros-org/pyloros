@@ -120,30 +120,42 @@ done
 DASHBOARD_URL="http://$DASH_BIND/"
 PROXY_URL="http://$PROXY_BIND"
 
-# Agent instructions, injected as an appended system prompt. Kept short
-# on purpose — the agent only needs the protocol, not editorial detail.
-SYSTEM_BLURB="$(cat <<'EOF'
-You are running behind pyloros, an HTTPS allowlist proxy. Outbound HTTP
-requests that don't match an active allow rule are blocked with HTTP 451
-("Unavailable For Legal Reasons"). A 451 from this proxy is NOT an error
-in the target server — it means YOU need permission first.
+# Build a clean workspace dir for the agent. Running claude inside the
+# pyloros repo gives it a lot of unrelated context (the source code,
+# CLAUDE.md with project conventions, lessons, etc.) that distorts the
+# demo. The empty dir + minimal CLAUDE.md keeps the session focused on
+# the proxy/approvals interaction.
+WORKSPACE="$TMPDIR_BASE/workspace"
+mkdir -p "$WORKSPACE"
+cat > "$WORKSPACE/CLAUDE.md" <<'EOF'
+# Working behind pyloros
 
-The proxy serves its own protocol spec at https://pyloros.internal/.
-Fetch it before you make your first approval request, and re-fetch it
-if you're unsure about the current rule shape or endpoint behavior — it
-is always up-to-date with the running pyloros build:
+You are running behind **pyloros**, an HTTPS allowlist proxy. Outbound HTTP
+requests that don't match an active allow rule are blocked with **HTTP 451**
+("Unavailable For Legal Reasons"). A 451 from this proxy is NOT an error in
+the target server — it means YOU need permission first.
 
-  curl https://pyloros.internal/
+The proxy serves its own up-to-date protocol spec at
+`https://pyloros.internal/` (only reachable through the proxy). Fetch it the
+first time you hit a 451, and re-fetch it whenever you're unsure about the
+current rule shape or endpoint behavior:
 
-Short version: when you hit a 451 (or expect to), POST to
-https://pyloros.internal/approvals with a JSON body containing the
-rule(s) you want, then long-poll
-https://pyloros.internal/approvals/{id}?wait=60s for the decision.
+```bash
+curl https://pyloros.internal/
+```
 
-(HTTP_PROXY/HTTPS_PROXY/SSL_CERT_FILE are already set in your
-environment, so a plain "curl https://pyloros.internal/" works.)
+Short version: when blocked, POST a JSON `{rules, reason, ...}` body to
+`https://pyloros.internal/approvals`, then long-poll
+`https://pyloros.internal/approvals/{id}?wait=60s` for the human's decision.
+The full spec served at `pyloros.internal` documents rule shapes (plain HTTP,
+`git=fetch`/`git=push`, etc.), responses, and rate limits.
+
+`HTTP_PROXY`, `HTTPS_PROXY`, `SSL_CERT_FILE`, and `NODE_EXTRA_CA_CERTS` are
+already set in this environment, so plain `curl https://...` works.
+
+This workspace is intentionally empty — feel free to create files here as
+you experiment.
 EOF
-)"
 
 cat <<EOF
 
@@ -156,6 +168,7 @@ cat <<EOF
   CA cert      $CA_CERT
   Sidecar      $SIDECAR
   Proxy log    $TMPDIR_BASE/proxy.log
+  Workspace    $WORKSPACE  (claude runs here; CLAUDE.md primes the agent)
 
   Pre-allowed: *.anthropic.com, *.statsig.com, statsigapi.net
   Everything else: blocked (451) until approved via the dashboard.
@@ -196,19 +209,21 @@ echo "Launching claude (Ctrl-D or /exit to quit)..." >&2
 echo >&2
 
 set +e
-HTTP_PROXY="$PROXY_URL" \
-HTTPS_PROXY="$PROXY_URL" \
-http_proxy="$PROXY_URL" \
-https_proxy="$PROXY_URL" \
-SSL_CERT_FILE="$CA_CERT" \
-CURL_CA_BUNDLE="$CA_CERT" \
-NODE_EXTRA_CA_CERTS="$CA_CERT" \
-REQUESTS_CA_BUNDLE="$CA_CERT" \
-NO_PROXY="api.anthropic.com,statsigapi.net,.anthropic.com,.statsig.com,localhost,127.0.0.1" \
-no_proxy="api.anthropic.com,statsigapi.net,.anthropic.com,.statsig.com,localhost,127.0.0.1" \
-    claude --dangerously-skip-permissions \
-           --append-system-prompt "$SYSTEM_BLURB" \
-           "${CLAUDE_ARGS[@]}"
+(
+    cd "$WORKSPACE" && \
+    HTTP_PROXY="$PROXY_URL" \
+    HTTPS_PROXY="$PROXY_URL" \
+    http_proxy="$PROXY_URL" \
+    https_proxy="$PROXY_URL" \
+    SSL_CERT_FILE="$CA_CERT" \
+    CURL_CA_BUNDLE="$CA_CERT" \
+    NODE_EXTRA_CA_CERTS="$CA_CERT" \
+    REQUESTS_CA_BUNDLE="$CA_CERT" \
+    NO_PROXY="api.anthropic.com,statsigapi.net,.anthropic.com,.statsig.com,localhost,127.0.0.1" \
+    no_proxy="api.anthropic.com,statsigapi.net,.anthropic.com,.statsig.com,localhost,127.0.0.1" \
+        claude --dangerously-skip-permissions \
+               "${CLAUDE_ARGS[@]}"
+)
 CLAUDE_RC=$?
 set -e
 
