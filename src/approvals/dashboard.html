@@ -122,7 +122,18 @@
         if (!('Notification' in window) || Notification.permission !== 'granted') return;
         const body = (a.rules || []).join('\n') + (a.reason ? `\n— ${a.reason}` : '');
         try {
-          new Notification('pyloros approval requested', { body });
+          // requireInteraction: keep the toast visible until the user
+          // dismisses it (Chrome/Edge honor this; Firefox/Safari often
+          // ignore it and use the system default duration).
+          const n = new Notification('pyloros approval requested', {
+            body,
+            tag: a.id,            // collapse duplicates if we re-emit
+            requireInteraction: true,
+          });
+          n.onclick = () => {
+            window.focus();
+            n.close();
+          };
         } catch (e) {
           console.warn('Notification failed', e);
         }
