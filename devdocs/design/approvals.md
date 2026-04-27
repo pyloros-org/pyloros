@@ -142,6 +142,22 @@ Agents don't always know whether a URL redirects. Proposal: the request can incl
 
 **In v1?** Probably not — useful but adds outbound fetch responsibility to the approval path, which has security implications (SSRF-adjacent). Defer until v1 is shipped and we see if it's actually needed.
 
+#### Why we can't just auto-follow redirects under the originating approval
+
+Tempting shortcut: when an approved request 3xx's, treat the `Location` as covered by the same approval (with hop/protocol caps). Argument is "if we trusted the origin, we trust where it points us." This is wrong in our threat model.
+
+The blocker is **agent-writable origins**. Any approved host where the agent can place content — S3 buckets, gists, the agent's own repo, a pastebin, a comment field that reflects input — is a self-served open redirect. The agent uploads a 302 (or `<meta http-equiv="refresh">`, or HTML+JS) and bounces to anywhere. A narrow approval like `PUT https://my-bucket.s3.amazonaws.com/*` then silently authorizes arbitrary egress. This isn't hypothetical: many real approvals are exactly write-capable origins.
+
+The same risk applies (less acutely) to **classic open-redirect vulns** on benign hosts (`approved.com/redirect?url=evil.com`).
+
+Per-hop approval (proxy intercepts the 3xx, creates a fresh pending approval for the redirect target with chain context) addresses this but is **not "no new UX"** as I initially claimed: today the proxy returns 451 immediately and the agent uses a separate approval API out-of-band. Per-hop intercept means either holding the client connection during human review (new behavior, breaks proxy/HTTP semantics for clients that aren't approval-aware) or returning 451 + trusting the client to re-request — which is what already happens for the first hop, so no proxy work is actually needed unless we want transparency for non-cooperating clients.
+
+If we add explicit redirect support, the safer shape is: the agent declares `follow_redirects: true|false` in the approval request, defaulting to `false` for write methods (`POST`/`PUT`/`PATCH`/`DELETE`) and surfacing the choice in the approval UI as a separately-visible bit. The human, not the proxy, decides whether redirect-following is safe for this origin.
+
+#### Rule-writing guidance (general)
+
+Open-redirect-as-egress generalizes beyond redirects: **any approved origin that reflects agent-controlled content can be used to launder requests through the approval boundary** (e.g. an approved API that returns agent-supplied URLs in JSON, which the agent then "follows" — same problem one indirection up). When writing or approving rules, the question is not just "do I trust this host" but "can the agent influence what this host serves back to it." Write-capable origins, reflective endpoints, and user-content surfaces deserve narrower scopes (specific paths, no redirect-following, read-only methods where possible) than read-only public APIs.
+
 ### I3 — Transitive dependency expansion for package managers
 
 Agents installing `npm install foo` know the top-level package but not the dep tree. Proposal: if the proposed rule looks like a package-registry URL (npm, PyPI, rubygems, crates.io, Go modules), pyloros queries the registry for the dep closure and offers the expanded set as additional proposed rules.
