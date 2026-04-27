@@ -31,14 +31,14 @@ async fn start_proxy_with_approvals(
     ca: &TestCa,
     upstream_port: u16,
 ) -> (TestProxy, tempfile::NamedTempFile) {
-    let sidecar = tempfile::NamedTempFile::new().unwrap();
-    let sidecar_path = sidecar.path().to_string_lossy().into_owned();
+    let rules_file = tempfile::NamedTempFile::new().unwrap();
+    let permanent_rules_path = rules_file.path().to_string_lossy().into_owned();
     let proxy = TestProxy::builder(ca, vec![], upstream_port)
-        .with_approvals(&sidecar_path)
+        .with_approvals(&permanent_rules_path)
         .report(t)
         .start()
         .await;
-    (proxy, sidecar)
+    (proxy, rules_file)
 }
 
 /// When the `[approvals]` section is absent from config, requests to
@@ -80,7 +80,7 @@ async fn test_agent_api_unknown_id_returns_404() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
     let resp = client
@@ -108,7 +108,7 @@ async fn test_post_approve_roundtrip_via_resolve_for_test() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().expect("approvals enabled");
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
@@ -169,7 +169,7 @@ async fn test_post_deny_with_message_returned() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().expect("approvals enabled");
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
@@ -220,7 +220,7 @@ async fn test_long_poll_wakes_on_resolution() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().expect("approvals enabled");
 
     // POST first.
@@ -285,7 +285,7 @@ async fn test_long_poll_times_out_returns_pending() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
     let id = client
@@ -329,7 +329,7 @@ async fn test_dashboard_get_root_returns_html() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let dashboard_addr = proxy.dashboard_addr.unwrap();
 
     let client = reqwest::Client::builder().build().unwrap();
@@ -363,7 +363,7 @@ async fn test_dashboard_decision_approves_and_wakes_long_poll() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let dashboard_addr = proxy.dashboard_addr.unwrap();
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
@@ -440,7 +440,7 @@ async fn test_dashboard_sse_streams_pending_and_resolved() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let dashboard_addr = proxy.dashboard_addr.unwrap();
     let manager = proxy.approvals.clone().unwrap();
 
@@ -517,7 +517,7 @@ async fn test_dashboard_decision_with_custom_rules_and_message() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let dashboard_addr = proxy.dashboard_addr.unwrap();
     let manager = proxy.approvals.clone().unwrap();
 
@@ -573,7 +573,7 @@ async fn test_approved_session_rule_unblocks_traffic() {
         .start()
         .await;
     // Proxy with NO base rules — everything is blocked until approved.
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
 
@@ -626,7 +626,7 @@ async fn test_approve_invalid_rule_rejected() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().unwrap();
 
     // Post a valid rule first so we have a pending approval to resolve.
@@ -675,12 +675,14 @@ async fn test_approve_invalid_rule_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 5: TTL + sidecar persistence.
+// Phase 5: TTL + permanent-rules-file persistence.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
-    let t = test_report!("Permanent approval writes sidecar and a new proxy loads it on startup");
+async fn test_permanent_approval_writes_permanent_rules_file_and_persists_across_restart() {
+    let t = test_report!(
+        "Permanent approval writes the permanent-rules file and a new proxy loads it on startup"
+    );
 
     let ca = TestCa::generate();
     let upstream = TestUpstream::builder(&ca, ok_handler("hello from upstream"))
@@ -688,17 +690,17 @@ async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
         .start()
         .await;
 
-    // Pick an explicit sidecar path so we can restart against the same file.
+    // Pick an explicit permanent-rules file path so we can restart against the same file.
     let dir = tempfile::tempdir().unwrap();
-    let sidecar_path = dir
+    let permanent_rules_path = dir
         .path()
         .join("approvals.toml")
         .to_string_lossy()
         .into_owned();
 
-    // Proxy #1 — approve with permanent lifetime; sidecar should be written.
+    // Proxy #1 — approve with permanent lifetime; the permanent-rules file should be written.
     let proxy1 = TestProxy::builder(&ca, vec![], upstream.port())
-        .with_approvals(&sidecar_path)
+        .with_approvals(&permanent_rules_path)
         .report(&t)
         .start()
         .await;
@@ -721,13 +723,13 @@ async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
         )
         .unwrap();
     t.assert_true(
-        "sidecar file exists",
-        std::path::Path::new(&sidecar_path).exists(),
+        "permanent-rules file exists",
+        std::path::Path::new(&permanent_rules_path).exists(),
     );
-    let sidecar_contents = std::fs::read_to_string(&sidecar_path).unwrap();
+    let rules_file_contents = std::fs::read_to_string(&permanent_rules_path).unwrap();
     t.assert_contains(
-        "sidecar has url",
-        sidecar_contents.as_str(),
+        "permanent-rules file has url",
+        rules_file_contents.as_str(),
         "https://localhost/*",
     );
     proxy1.shutdown();
@@ -735,11 +737,11 @@ async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
     // may race the proxy2 startup.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Proxy #2 — start a fresh proxy pointing at the same sidecar.
+    // Proxy #2 — start a fresh proxy pointing at the same permanent-rules file.
     // Its base rules are empty; the rule should be loaded from disk and
     // the request should succeed immediately.
     let proxy2 = TestProxy::builder(&ca, vec![], upstream.port())
-        .with_approvals(&sidecar_path)
+        .with_approvals(&permanent_rules_path)
         .report(&t)
         .start()
         .await;
@@ -760,7 +762,7 @@ async fn test_revoke_removes_active_rule() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().unwrap();
 
     let req = manager
@@ -801,8 +803,9 @@ async fn test_revoke_removes_active_rule() {
 }
 
 #[tokio::test]
-async fn test_permanent_revoke_rewrites_sidecar_empty() {
-    let t = test_report!("Revoking a permanent approval rewrites the sidecar without it");
+async fn test_permanent_revoke_rewrites_permanent_rules_file_empty() {
+    let t =
+        test_report!("Revoking a permanent approval rewrites the permanent-rules file without it");
 
     let ca = TestCa::generate();
     let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
@@ -810,14 +813,14 @@ async fn test_permanent_revoke_rewrites_sidecar_empty() {
         .start()
         .await;
     let dir = tempfile::tempdir().unwrap();
-    let sidecar_path = dir
+    let permanent_rules_path = dir
         .path()
         .join("approvals.toml")
         .to_string_lossy()
         .into_owned();
 
     let proxy = TestProxy::builder(&ca, vec![], upstream.port())
-        .with_approvals(&sidecar_path)
+        .with_approvals(&permanent_rules_path)
         .report(&t)
         .start()
         .await;
@@ -840,11 +843,11 @@ async fn test_permanent_revoke_rewrites_sidecar_empty() {
             },
         )
         .unwrap();
-    let before = std::fs::read_to_string(&sidecar_path).unwrap();
+    let before = std::fs::read_to_string(&permanent_rules_path).unwrap();
     t.assert_contains("before revoke: url", before.as_str(), "localhost/*");
 
     manager.revoke_approval(&req.id);
-    let after = std::fs::read_to_string(&sidecar_path).unwrap();
+    let after = std::fs::read_to_string(&permanent_rules_path).unwrap();
     t.assert_true("after revoke: url absent", !after.contains("localhost/*"));
 
     proxy.shutdown();
@@ -866,8 +869,8 @@ async fn test_dedup_auto_approves_subsumed_rule() {
         .await;
     // Start the proxy with a base rule that already covers api.foo.com.
     // The approval POST should be short-circuited.
-    let sidecar = tempfile::NamedTempFile::new().unwrap();
-    let sidecar_path = sidecar.path().to_string_lossy().into_owned();
+    let rules_file = tempfile::NamedTempFile::new().unwrap();
+    let permanent_rules_path = rules_file.path().to_string_lossy().into_owned();
     let proxy = TestProxy::builder(
         &ca,
         vec![pyloros::config::Rule {
@@ -881,7 +884,7 @@ async fn test_dedup_auto_approves_subsumed_rule() {
         }],
         upstream.port(),
     )
-    .with_approvals(&sidecar_path)
+    .with_approvals(&permanent_rules_path)
     .report(&t)
     .start()
     .await;
@@ -916,7 +919,7 @@ async fn test_rate_limit_returns_429() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
     let mut saw_429 = false;
@@ -948,7 +951,7 @@ async fn test_post_rejects_empty_rules() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
     let resp = client
@@ -975,7 +978,7 @@ async fn test_agent_instructions_served_at_root() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
     let resp = client.get("https://pyloros.internal/").await;
@@ -1010,7 +1013,7 @@ async fn test_blocked_response_links_to_instructions() {
         .report(&t, "unused")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
     let resp = client.get("https://blocked.example.com/anything").await;
@@ -1047,7 +1050,7 @@ async fn test_git_fetch_rule_roundtrip() {
         .report(&t, "git info/refs stub")
         .start()
         .await;
-    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().unwrap();
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);

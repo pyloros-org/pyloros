@@ -476,11 +476,11 @@ impl TestProxy {
         if let Some(size) = builder.max_body_log_size {
             config.logging.max_body_log_size = size;
         }
-        if let Some(ref sidecar) = builder.approvals_sidecar {
+        if let Some(ref path) = builder.approvals_permanent_rules {
             // Dashboard bind at 127.0.0.1:0 so the OS picks a port;
             // real addr is captured after bind below.
             config.approvals = Some(pyloros::config::ApprovalsConfig {
-                permanent_rules_file: sidecar.clone(),
+                permanent_rules_file: path.clone(),
                 dashboard_bind: "127.0.0.1:0".to_string(),
             });
         }
@@ -500,7 +500,7 @@ impl TestProxy {
         }
 
         let addr = server.bind().await.unwrap().tcp_addr();
-        let dashboard_addr = if builder.approvals_sidecar.is_some() {
+        let dashboard_addr = if builder.approvals_permanent_rules.is_some() {
             Some(
                 server
                     .bind_dashboard("127.0.0.1:0")
@@ -552,7 +552,7 @@ impl TestProxy {
             redirect_whitelist_ttl_secs: None,
             max_body_log_size: None,
             report: None,
-            approvals_sidecar: None,
+            approvals_permanent_rules: None,
         }
     }
 }
@@ -569,7 +569,7 @@ pub struct TestProxyBuilder<'a> {
     redirect_whitelist_ttl_secs: Option<u64>,
     max_body_log_size: Option<usize>,
     report: Option<&'a TestReport>,
-    approvals_sidecar: Option<String>,
+    approvals_permanent_rules: Option<String>,
 }
 
 impl<'a> TestProxyBuilder<'a> {
@@ -616,8 +616,8 @@ impl<'a> TestProxyBuilder<'a> {
     /// Enable the approvals feature with the given permanent-rules file path.
     /// The dashboard is bound to 127.0.0.1:0 (ephemeral); read the
     /// assigned port from `TestProxy::dashboard_addr` after start.
-    pub fn with_approvals(mut self, sidecar_path: &str) -> Self {
-        self.approvals_sidecar = Some(sidecar_path.to_string());
+    pub fn with_approvals(mut self, permanent_rules_path: &str) -> Self {
+        self.approvals_permanent_rules = Some(permanent_rules_path.to_string());
         self
     }
 
