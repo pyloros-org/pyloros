@@ -20,10 +20,15 @@ use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
 };
 use crate::error::{Error, Result};
+use crate::filter::dynamic_whitelist::{maybe_whitelist_redirect, DynamicWhitelist};
+
+/// Buffer cap for LFS batch response inspection. Responses larger than this
+/// are forwarded unchanged with no whitelisting. Real LFS batch responses are
+/// small (a few KiB to a few hundred KiB for big repos); 10 MiB is generous.
+const LFS_BATCH_RESPONSE_INSPECT_CAP_BYTES: usize = 10 * 1024 * 1024;
 use crate::filter::lfs;
 use crate::filter::matcher::UrlPattern;
 use crate::filter::pktline;
-use crate::filter::redirect_whitelist::{maybe_whitelist_redirect, RedirectWhitelist};
 use crate::filter::{CredentialEngine, FilterEngine, FilterResult, RequestInfo};
 use crate::tls::MitmCertificateGenerator;
 
@@ -37,7 +42,7 @@ pub struct TunnelHandler {
     mitm_generator: Arc<MitmCertificateGenerator>,
     filter_engine: Arc<FilterEngine>,
     credential_engine: Arc<CredentialEngine>,
-    redirect_whitelist: Arc<RedirectWhitelist>,
+    dynamic_whitelist: Arc<DynamicWhitelist>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -54,13 +59,13 @@ impl TunnelHandler {
         mitm_generator: Arc<MitmCertificateGenerator>,
         filter_engine: Arc<FilterEngine>,
         credential_engine: Arc<CredentialEngine>,
-        redirect_whitelist: Arc<RedirectWhitelist>,
+        dynamic_whitelist: Arc<DynamicWhitelist>,
     ) -> Self {
         Self {
             mitm_generator,
             filter_engine,
             credential_engine,
-            redirect_whitelist,
+            dynamic_whitelist,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -153,7 +158,7 @@ impl TunnelHandler {
             location,
             request_url,
             patterns,
-            &self.redirect_whitelist,
+            &self.dynamic_whitelist,
         ) {
             tracing::info!(
                 from = %request_url,
@@ -280,7 +285,7 @@ impl TunnelHandler {
                 let handler = super::handler::ProxyHandler::new(
                     Arc::clone(&self_arc),
                     self_arc.filter_engine.clone(),
-                    self_arc.redirect_whitelist.clone(),
+                    self_arc.dynamic_whitelist.clone(),
                 )
                 .with_request_logging(
                     self_arc.logger.log_allowed_requests,
@@ -343,7 +348,7 @@ impl TunnelHandler {
         // Check filter, consulting the redirect whitelist for short-lived allowances.
         let filter_result = self
             .filter_engine
-            .check_with_redirect_whitelist(&request_info, &self.redirect_whitelist);
+            .check_with_dynamic_whitelist(&request_info, &self.dynamic_whitelist);
 
         let ctx = RequestContext {
             method: &method,
@@ -517,24 +522,21 @@ impl TunnelHandler {
                 };
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
-                if log_body {
-                    return self
-                        .forward_buffered_with_body_log(
-                            parts,
-                            body_bytes,
-                            host,
-                            port,
-                            &method,
-                            &full_url,
-                            &allowed_ctx,
-                            rp,
-                        )
-                        .await;
+                if !log_body {
+                    self.logger.log_allowed(&allowed_ctx);
                 }
-
-                self.logger.log_allowed(&allowed_ctx);
                 return self
-                    .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
+                    .forward_buffered_with_lfs_inspection(
+                        parts,
+                        body_bytes,
+                        host,
+                        port,
+                        &method,
+                        &full_url,
+                        rp,
+                        allowed_ops,
+                        if log_body { Some(&allowed_ctx) } else { None },
+                    )
                     .await;
             }
             FilterResult::Allowed { log_body } => {
@@ -586,6 +588,15 @@ impl TunnelHandler {
                 self.logger
                     .log_allowed_with_reason(&allowed_ctx, AuditReason::RedirectWhitelisted);
                 Some(origin_patterns)
+            }
+            FilterResult::AllowedByLfsAction => {
+                let allowed_ctx = RequestContext {
+                    credential: self.audit_credential(&request_info),
+                    ..ctx
+                };
+                self.logger
+                    .log_allowed_with_reason(&allowed_ctx, AuditReason::LfsActionWhitelisted);
+                None
             }
         };
 
@@ -750,6 +761,124 @@ impl TunnelHandler {
         Ok(Response::from_parts(resp_parts, new_body))
     }
 
+    /// Forward a buffered LFS batch request, then inspect the response body
+    /// to extract advertised action URLs (download/upload/verify) and feed them
+    /// into the dynamic whitelist method-pinned and TTL-bounded.
+    ///
+    /// The response body is buffered into memory (capped for inspection at
+    /// `LFS_BATCH_RESPONSE_INSPECT_CAP_BYTES`); oversized responses are
+    /// forwarded unchanged with no whitelisting (warn-logged).
+    ///
+    /// When `body_log_ctx` is `Some`, also emits a body audit entry — this is
+    /// how the path stays unified for the `log_body && AllowedWithLfsCheck` case.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_buffered_with_lfs_inspection(
+        &self,
+        parts: hyper::http::request::Parts,
+        body_bytes: Bytes,
+        host: &str,
+        port: u16,
+        method: &str,
+        full_url: &str,
+        redirect_patterns: Option<Arc<Vec<UrlPattern>>>,
+        allowed_ops: &[String],
+        body_log_ctx: Option<&RequestContext<'_>>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        let req_body_snapshot = body_bytes.clone();
+        let resp = self
+            .forward_buffered(
+                parts,
+                body_bytes,
+                host,
+                port,
+                method,
+                full_url,
+                redirect_patterns,
+            )
+            .await?;
+
+        let (resp_parts, resp_body) = resp.into_parts();
+        let resp_body_bytes = resp_body
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+
+        if resp_parts.status.is_success() {
+            if resp_body_bytes.len() > LFS_BATCH_RESPONSE_INSPECT_CAP_BYTES {
+                tracing::warn!(
+                    method = %method,
+                    url = %full_url,
+                    size = resp_body_bytes.len(),
+                    "LFS batch response exceeds inspection cap; skipping action whitelisting"
+                );
+            } else {
+                let encoding = resp_parts
+                    .headers
+                    .get(hyper::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok());
+                self.whitelist_lfs_actions(&resp_body_bytes, encoding, allowed_ops, full_url);
+            }
+        }
+
+        if let Some(ctx) = body_log_ctx {
+            self.emit_body_audit(ctx, &req_body_snapshot, &resp_body_bytes);
+        }
+
+        let new_body = Full::new(resp_body_bytes).map_err(|e| match e {}).boxed();
+        Ok(Response::from_parts(resp_parts, new_body))
+    }
+
+    /// Parse an LFS batch response body and insert each in-scope action URL
+    /// into the dynamic whitelist. `allowed_ops` is the merged `lfs_operations`
+    /// for the matched rule (e.g. `["upload"]` covers both upload and verify
+    /// actions; `["download"]` covers download actions only).
+    fn whitelist_lfs_actions(
+        &self,
+        body: &[u8],
+        content_encoding: Option<&str>,
+        allowed_ops: &[String],
+        full_url: &str,
+    ) {
+        let Some(actions) =
+            crate::filter::lfs_response::parse_lfs_batch_response_encoded(body, content_encoding)
+        else {
+            tracing::debug!(
+                url = %full_url,
+                encoding = ?content_encoding,
+                "LFS batch response could not be decoded/parsed; skipping whitelisting"
+            );
+            return;
+        };
+        let now = std::time::Instant::now();
+        let mut inserted = 0usize;
+        for action in actions {
+            let in_scope = allowed_ops
+                .iter()
+                .any(|op| action.kind.covered_by(op.as_str()));
+            if !in_scope {
+                continue;
+            }
+            self.dynamic_whitelist.insert_lfs_action(
+                action.url.clone(),
+                action.method(),
+                action.ttl_from(now),
+            );
+            inserted += 1;
+            tracing::info!(
+                kind = ?action.kind,
+                url = %action.url,
+                "LFS action whitelisted from batch response"
+            );
+        }
+        if inserted == 0 {
+            tracing::debug!(
+                url = %full_url,
+                "LFS batch response had no actions in scope of allowed_ops"
+            );
+        }
+    }
+
     /// Rebuild a buffered request for upstream and forward it.
     /// Shared by branch-check and LFS-check arms.
     #[allow(clippy::too_many_arguments)]
@@ -841,6 +970,7 @@ async fn connect_upstream_tls(
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            config.key_log = Arc::new(rustls::KeyLogFile::new());
             Arc::new(config)
         }
     };
@@ -1008,6 +1138,7 @@ fn h1_only_tls_config(base: Option<&ClientConfig>) -> Arc<ClientConfig> {
         }
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.key_log = Arc::new(rustls::KeyLogFile::new());
     Arc::new(config)
 }
 

@@ -203,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_root_certificates(root_store)
                     .with_no_client_auth();
                 tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
                 server = server.with_upstream_tls(Arc::new(tls_config));
             }
 

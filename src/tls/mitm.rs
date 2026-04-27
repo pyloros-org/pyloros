@@ -3,7 +3,7 @@
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
+use rustls::{KeyLog, KeyLogFile, ServerConfig};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use crate::error::Result;
 pub struct MitmCertificateGenerator {
     ca: Arc<CertificateAuthority>,
     cache: CertificateCache,
+    key_log: Arc<dyn KeyLog>,
 }
 
 impl std::fmt::Debug for MitmCertificateGenerator {
@@ -31,6 +32,7 @@ impl MitmCertificateGenerator {
         Self {
             ca: Arc::new(ca),
             cache: CertificateCache::default(),
+            key_log: Arc::new(KeyLogFile::new()),
         }
     }
 
@@ -43,6 +45,7 @@ impl MitmCertificateGenerator {
         Self {
             ca: Arc::new(ca),
             cache: CertificateCache::new(cache_capacity, cache_ttl),
+            key_log: Arc::new(KeyLogFile::new()),
         }
     }
 
@@ -84,6 +87,7 @@ impl MitmCertificateGenerator {
             })?;
 
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.key_log = self.key_log.clone();
 
         Ok(config)
     }
@@ -110,6 +114,7 @@ impl MitmCertificateGenerator {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(resolver));
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.key_log = self.key_log.clone();
         config
     }
 }

@@ -145,8 +145,8 @@ impl RequestLogger {
     }
 
     /// Log and emit audit for an allowed request, with an explicit `reason`.
-    /// Used to distinguish redirect-whitelist allowances (`RedirectWhitelisted`)
-    /// from direct rule matches.
+    /// Used to distinguish dynamic-whitelist allowances (`RedirectWhitelisted`,
+    /// `LfsActionWhitelisted`) from direct rule matches.
     pub fn log_allowed_with_reason(&self, ctx: &RequestContext<'_>, reason: AuditReason) {
         if self.log_allowed_requests {
             match reason {
@@ -155,6 +155,14 @@ impl RequestLogger {
                         method = %ctx.method,
                         url = %ctx.url,
                         "ALLOWED (redirect whitelist){}",
+                        ctx.label
+                    );
+                }
+                AuditReason::LfsActionWhitelisted => {
+                    tracing::info!(
+                        method = %ctx.method,
+                        url = %ctx.url,
+                        "ALLOWED (LFS action whitelist){}",
                         ctx.label
                     );
                 }

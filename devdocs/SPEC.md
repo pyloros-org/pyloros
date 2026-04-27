@@ -168,7 +168,13 @@ Git-LFS uses a separate HTTP endpoint (`POST {repo}/info/lfs/objects/batch`) to 
 - The proxy inspects the JSON body of LFS batch requests to verify the `operation` field matches what the rule allows
 - **Branch restrictions do not apply** to LFS. LFS blobs are content-addressed; the actual ref update goes through `git-receive-pack` which is already branch-checked
 - **Plain HTTP is blocked** for LFS batch requests (same default-deny principle as branch checks — body inspection requires HTTPS)
-- **Transfer URLs**: LFS batch responses contain transfer URLs (often on external hosts like S3) for the actual object upload/download. These are **not** automatically allowed — users must add separate HTTP rules for the transfer hosts (e.g., `method = "GET", url = "https://github-cloud.s3.amazonaws.com/*"`)
+- **Transfer URLs (dynamic whitelisting)**: LFS batch responses contain transfer URLs (often on external hosts like `lfs.github.com` or `github-cloud.s3.amazonaws.com`) for the actual object upload/download and post-upload verify callbacks. The proxy parses the JSON body of successful batch responses and inserts each `objects[*].actions.{download,upload,verify}.href` into a short-lived dynamic whitelist, pinned to the action's HTTP method (`download`→GET, `upload`→PUT, `verify`→POST).
+  - Activation is automatic for any rule with `git = "fetch" | "push" | "*"`. Whitelisted actions are filtered by the rule's allowed LFS operations: a fetch-only rule whitelists `download` actions; a push-only rule whitelists `upload` and `verify`; `*` whitelists all three.
+  - TTL: per-action `expires_at` (RFC 3339) or `expires_in` (seconds) from the response is used when present, clamped to `[60s, 3600s]`. Otherwise falls back to the existing `proxy.redirect_whitelist_ttl_secs` setting (default 60s).
+  - Body size for inspection is capped at 10 MiB; oversized batch responses are forwarded unchanged with no whitelisting (warn-logged).
+  - `Content-Encoding: gzip`/`deflate` is decoded for parsing; the original (compressed) bytes are forwarded unchanged to the client. Other encodings (e.g. `br`, `zstd`) are not decoded — the response forwards through but no actions are whitelisted.
+  - Trust model is identical to redirect whitelisting: the upstream is MITM-inspected and authenticated, so we trust its instructions about where the client will go next.
+  - The whitelist is method-pinned: a leaked `verify` URL cannot be used for `GET` or `PUT`.
 
 #### Git-LFS Locks API
 
@@ -374,6 +380,9 @@ The proxy shuts down cleanly on both `SIGINT` (Ctrl+C) and `SIGTERM`. On receivi
 - Separate control over logging of allowed and blocked requests (e.g., log only blocked to reduce noise, or only allowed for auditing)
 - Error messages for failed upstream requests must include the request method and URL for diagnostics
 
+#### TLS Key Logging
+When the `SSLKEYLOGFILE` environment variable is set to a writable path, pyloros writes TLS session secrets in NSS Key Log Format for both legs of every MITM connection (client↔proxy and proxy↔upstream). Load the file into Wireshark (Preferences → Protocols → TLS → (Pre)-Master-Secret log filename) to decrypt captures. Unset by default; no configuration required. Intended for debugging — do not enable in production.
+
 ### Audit Log
 
 An optional structured audit log records every request decision as a JSON object per line (JSONL) in a dedicated file. This is separate from the human-readable tracing output and designed for compliance, SIEM integration, and post-hoc analysis.
@@ -393,7 +402,7 @@ Each audit entry contains:
 - `scheme` — `http` or `https`
 - `protocol` — `http` or `https` (transport-level)
 - `decision` — `allowed` or `blocked`
-- `reason` — why the decision was made: `rule_matched`, `no_matching_rule`, `body_inspection_requires_https`, `branch_restriction`, `lfs_operation_not_allowed`, `non_https_connect`, `auth_failed`
+- `reason` — why the decision was made: `rule_matched`, `no_matching_rule`, `body_inspection_requires_https`, `branch_restriction`, `lfs_operation_not_allowed`, `non_https_connect`, `auth_failed`, `redirect_whitelisted`, `lfs_action_whitelisted`
 - `credential` (optional) — `{ "type": "header"|"aws-sigv4", "url_pattern": "..." }` for injected credentials
 - `git` (optional) — `{ "blocked_refs": ["refs/heads/main"] }` when branch restrictions apply
 
