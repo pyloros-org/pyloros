@@ -16,6 +16,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::handler::ProxyHandler;
 use super::tunnel::TunnelHandler;
+use crate::approvals::{self, ApprovalManager};
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -76,6 +77,14 @@ pub struct ProxyServer {
     direct_https_listener: Option<BoundListener>,
     /// Optional direct HTTP listener (accepts plain HTTP, uses Host header for routing).
     direct_http_listener: Option<BoundListener>,
+    /// Optional dashboard listener (plain HTTP, dedicated address for approvals UI).
+    dashboard_listener: Option<BoundListener>,
+    /// Approvals manager when the `[approvals]` config section is present.
+    approvals: Option<Arc<ApprovalManager>>,
+    /// Receiver for the approvals rebuild channel (consumed by `serve`).
+    /// Paired with a sender attached to `ApprovalManager` at construction
+    /// time so resolve signals don't race the serve loop's startup.
+    approval_rebuild_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     upstream_port_override: Option<u16>,
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
@@ -128,6 +137,34 @@ impl ProxyServer {
             1024,
         ));
 
+        let approvals = config
+            .approvals
+            .as_ref()
+            .map(|ac| ApprovalManager::new(ac.clone()));
+
+        // Create the rebuild channel up front and attach the sender to the
+        // manager. This avoids a race where an early resolve() signals
+        // rebuild before serve()'s select loop is wired up, which would
+        // silently drop the rebuild.
+        let approval_rebuild_rx = if let Some(ref manager) = approvals {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            manager.attach_rebuild_tx(tx);
+            Some(rx)
+        } else {
+            None
+        };
+
+        // Build the initial FilterEngine from base rules ++ approval rules
+        // loaded from the permanent-rules file. Replaces the earlier `filter_engine`
+        // that used only config.rules.
+        let filter_engine = if let Some(ref manager) = approvals {
+            let mut combined = config.rules.clone();
+            combined.extend(manager.active_rules());
+            Arc::new(FilterEngine::new(combined)?)
+        } else {
+            filter_engine
+        };
+
         Ok(Self {
             config,
             filter_engine,
@@ -139,6 +176,9 @@ impl ProxyServer {
             listener: None,
             direct_https_listener: None,
             direct_http_listener: None,
+            dashboard_listener: None,
+            approvals,
+            approval_rebuild_rx,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -160,6 +200,10 @@ impl ProxyServer {
             Duration::from_secs(config.proxy.redirect_whitelist_ttl_secs),
             1024,
         ));
+        let approvals = config
+            .approvals
+            .as_ref()
+            .map(|ac| ApprovalManager::new(ac.clone()));
         Self {
             config,
             filter_engine,
@@ -171,6 +215,9 @@ impl ProxyServer {
             listener: None,
             direct_https_listener: None,
             direct_http_listener: None,
+            dashboard_listener: None,
+            approvals,
+            approval_rebuild_rx: None,
             upstream_port_override: None,
             upstream_host_override: None,
             upstream_tls_config: None,
@@ -249,6 +296,12 @@ impl ProxyServer {
             tracing::info!(address = %direct_addr, "Direct HTTP listener active");
         }
 
+        // Bind dashboard listener if approvals are enabled
+        if let Some(ref ac) = self.config.approvals.clone() {
+            let dashboard_addr = self.bind_dashboard(&ac.dashboard_bind).await?;
+            tracing::info!(address = %dashboard_addr, "Approvals dashboard listener active");
+        }
+
         self.serve(shutdown).await
     }
 
@@ -276,6 +329,14 @@ impl ProxyServer {
     pub async fn bind_direct_http(&mut self, bind_address: &str) -> Result<ListenAddress> {
         let (listener, addr) = bind_listener(bind_address).await?;
         self.direct_http_listener = Some(listener);
+        Ok(addr)
+    }
+
+    /// Bind the approvals dashboard listener to the given address.
+    /// The address can be a TCP socket address or a Unix socket path (containing '/').
+    pub async fn bind_dashboard(&mut self, bind_address: &str) -> Result<ListenAddress> {
+        let (listener, addr) = bind_listener(bind_address).await?;
+        self.dashboard_listener = Some(listener);
         Ok(addr)
     }
 
@@ -309,6 +370,14 @@ impl ProxyServer {
             spawn_direct_http_accept_loop(direct_listener, tunnel_handler_rx.clone());
         }
 
+        // Spawn dashboard listener if bound (independent of tunnel_handler; only
+        // needs the approvals manager).
+        if let Some(dashboard_listener) = self.dashboard_listener.take() {
+            if let Some(ref manager) = self.approvals {
+                spawn_dashboard_accept_loop(dashboard_listener, manager.clone());
+            }
+        }
+
         // Set up reload channel. We always create one so the select! branch blocks.
         // If an external trigger was set up via reload_trigger(), use that channel.
         // Otherwise create a fresh one.
@@ -316,6 +385,16 @@ impl ProxyServer {
             (self.reload_tx.take().unwrap(), rx)
         } else {
             tokio::sync::mpsc::channel(1)
+        };
+
+        // Approvals rebuild channel: ApprovalManager sends `()` when the
+        // active approval rules change. The sender was attached at
+        // construction time (in `new`) so early resolves don't race the
+        // serve loop's startup. If approvals are disabled, build a dummy
+        // receiver so the select! arm stays `Pending` forever.
+        let mut approval_rebuild_rx = match self.approval_rebuild_rx.take() {
+            Some(rx) => rx,
+            None => tokio::sync::mpsc::channel::<()>(1).1,
         };
 
         // Spawn file watcher and SIGHUP handler if config_path is set
@@ -337,6 +416,9 @@ impl ProxyServer {
                     }
                     Some(()) = reload_rx.recv() => {
                         self.apply_reload(&tunnel_handler_tx);
+                    }
+                    Some(()) = approval_rebuild_rx.recv() => {
+                        self.apply_approval_rebuild(&tunnel_handler_tx);
                     }
                     result = tcp_listener.accept() => {
                         let (stream, client_addr) = match result {
@@ -362,6 +444,9 @@ impl ProxyServer {
                     }
                     Some(()) = reload_rx.recv() => {
                         self.apply_reload(&tunnel_handler_tx);
+                    }
+                    Some(()) = approval_rebuild_rx.recv() => {
+                        self.apply_approval_rebuild(&tunnel_handler_tx);
                     }
                     result = unix_listener.accept() => {
                         let (stream, _addr) = match result {
@@ -540,6 +625,37 @@ impl ProxyServer {
         });
     }
 
+    /// Rebuild the effective FilterEngine from `config.rules ++ active_approval_rules`
+    /// and broadcast a new TunnelHandler. Called when an approval is granted
+    /// or expires. No-op if approvals are disabled (shouldn't happen — the
+    /// channel would never fire).
+    fn apply_approval_rebuild(
+        &mut self,
+        tunnel_handler_tx: &tokio::sync::watch::Sender<Arc<TunnelHandler>>,
+    ) {
+        let Some(ref manager) = self.approvals else {
+            return;
+        };
+
+        let mut combined = self.config.rules.clone();
+        combined.extend(manager.active_rules());
+
+        let new_filter = match FilterEngine::new(combined) {
+            Ok(f) => Arc::new(f),
+            Err(e) => {
+                tracing::error!(error = %e, "approval rebuild failed: rule compilation error");
+                return;
+            }
+        };
+
+        self.filter_engine = new_filter;
+        let _ = tunnel_handler_tx.send(Arc::new(self.make_tunnel_handler()));
+        tracing::info!(
+            rules = self.filter_engine.rule_count(),
+            "Approval rebuild applied"
+        );
+    }
+
     fn make_tunnel_handler(&self) -> TunnelHandler {
         let mut handler = TunnelHandler::new(
             self.mitm_generator.clone(),
@@ -565,7 +681,15 @@ impl ProxyServer {
         if let Some(ref logger) = self.audit_logger {
             handler = handler.with_audit_logger(logger.clone());
         }
+        if let Some(ref approvals) = self.approvals {
+            handler = handler.with_approvals(approvals.clone());
+        }
         handler
+    }
+
+    /// Accessor for tests that need to poke at the approvals manager directly.
+    pub fn approvals_manager(&self) -> Option<&Arc<ApprovalManager>> {
+        self.approvals.as_ref()
     }
 
     /// Get the bind address
@@ -849,4 +973,38 @@ fn spawn_sighup_handler(reload_tx: tokio::sync::mpsc::Sender<()>) {
             }
         }
     });
+}
+
+/// Spawn the dashboard accept loop. Each accepted connection serves the
+/// approvals dashboard (plain HTTP, no MITM, no proxy semantics).
+fn spawn_dashboard_accept_loop(listener: BoundListener, manager: Arc<ApprovalManager>) {
+    match listener {
+        BoundListener::Tcp(tcp_listener) => {
+            tokio::spawn(accept_loop_dashboard(tcp_listener, manager));
+        }
+        #[cfg(unix)]
+        BoundListener::Unix(unix_listener) => {
+            tokio::spawn(accept_loop_dashboard(unix_listener, manager));
+        }
+    }
+}
+
+async fn accept_loop_dashboard<L>(listener: L, manager: Arc<ApprovalManager>)
+where
+    L: DirectAccept,
+{
+    loop {
+        let (stream, client_addr) = match listener.accept_conn().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = %e, "Dashboard: failed to accept connection");
+                continue;
+            }
+        };
+        tracing::debug!(client = %client_addr, "Dashboard: new connection");
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            approvals::dashboard::serve_connection(manager, stream).await;
+        });
+    }
 }
