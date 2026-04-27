@@ -4,10 +4,22 @@ use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{Response, StatusCode};
 
-/// Create an HTTP 451 response for blocked requests
+/// Create an HTTP 451 response for blocked requests.
+///
+/// The body advertises the agent-API instructions endpoint so an agent
+/// inside the sandbox that hits an unexpected 451 has a discoverable
+/// path to the approvals protocol. The endpoint only resolves through
+/// the proxy and returns 404 when the approvals feature is disabled —
+/// pointing at it is harmless either way.
 pub fn blocked_response(method: &str, url: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = format!(
-        "Request blocked by proxy policy\n\nMethod: {}\nURL: {}\n",
+        "Request blocked by proxy policy\n\
+         \n\
+         Method: {}\n\
+         URL:    {}\n\
+         \n\
+         If you are an agent that can request runtime allowlist changes,\n\
+         see https://pyloros.internal/ (only reachable through this proxy).\n",
         method, url
     );
 
@@ -15,6 +27,7 @@ pub fn blocked_response(method: &str, url: &str) -> Response<BoxBody<Bytes, hype
         .status(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS) // 451
         .header("Content-Type", "text/plain")
         .header("X-Blocked-By", "pyloros")
+        .header("Link", "<https://pyloros.internal/>; rel=\"help\"")
         .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
         .unwrap()
 }

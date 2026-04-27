@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>pyloros approvals</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem; color: #222; max-width: 880px; }
+      h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+      .bar { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; }
+      .bar .status { color: #666; margin-left: auto; font-size: 0.9em; }
+      button { font: inherit; padding: .35rem .8rem; cursor: pointer; }
+      .empty { color: #888; padding: 1rem; border: 1px dashed #ccc; text-align: center; border-radius: 4px; }
+      .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; background: #fafafa; }
+      .card h2 { font-size: 1.05rem; margin: 0 0 .5rem; }
+      .rules { background: #fff; padding: .5rem .75rem; border-radius: 4px; border: 1px solid #eee; font-family: ui-monospace, monospace; font-size: .9em; margin-bottom: .5rem; }
+      .rules code { display: block; }
+      .reason { color: #555; margin-bottom: .5rem; font-style: italic; }
+      .triggered { color: #666; font-size: .85em; margin-bottom: .75rem; }
+      .controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+      .controls select, .controls textarea { font: inherit; padding: .3rem; }
+      .controls textarea { flex: 1; min-width: 220px; height: 2.2em; resize: vertical; }
+      .approve { background: #1b8f3a; color: #fff; border: 0; border-radius: 4px; }
+      .deny { background: #c13030; color: #fff; border: 0; border-radius: 4px; }
+      .resolved { opacity: 0.55; }
+      .resolved .controls { display: none; }
+      .tag { display: inline-block; padding: 0 .4rem; border-radius: 3px; font-size: .78em; vertical-align: middle; margin-left: .4rem; }
+      .tag.approved { background: #d5f0dd; color: #175f27; }
+      .tag.denied { background: #f5d5d5; color: #772020; }
+    </style>
+  </head>
+  <body>
+    <h1>pyloros approvals</h1>
+    <div class="bar">
+      <button id="notify-btn">Enable notifications</button>
+      <span class="status" id="stream-status">connecting…</span>
+    </div>
+    <div id="list"></div>
+
+    <script>
+      const list = document.getElementById('list');
+      const statusEl = document.getElementById('stream-status');
+      const notifyBtn = document.getElementById('notify-btn');
+      const approvals = new Map(); // id -> approval
+
+      function render() {
+        if (approvals.size === 0) {
+          list.innerHTML = '<div class="empty">No pending approvals.</div>';
+          return;
+        }
+        list.innerHTML = '';
+        for (const [id, a] of approvals) {
+          list.appendChild(renderCard(id, a));
+        }
+      }
+
+      function escapeHtml(s) {
+        return (s || '').replace(/[&<>"']/g, c => ({
+          '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+        }[c]));
+      }
+
+      // Format a Rule object the same way it reads in the TOML config:
+      //   {method, url}                  -> "GET https://api.foo.com/*"
+      //   {git, url}                     -> "git=fetch https://github.com/foo/bar.git"
+      //   {git, url, branches}           -> "git=push https://x   branches=[main, !release/*]"
+      // Extra flags (websocket, log_body, allow_redirects) are tacked on as
+      // suffixes so a glance reveals everything the rule says.
+      function formatRule(r) {
+        const parts = [];
+        if (r.git) {
+          parts.push(`git=${r.git}`);
+        } else if (r.method) {
+          parts.push(r.method);
+        } else {
+          parts.push('?');
+        }
+        parts.push(r.url || '');
+        const flags = [];
+        if (r.branches && r.branches.length) flags.push(`branches=[${r.branches.join(', ')}]`);
+        if (r.websocket) flags.push('websocket');
+        if (r.log_body) flags.push('log_body');
+        if (r.allow_redirects && r.allow_redirects.length) {
+          flags.push(`allow_redirects=[${r.allow_redirects.join(', ')}]`);
+        }
+        if (flags.length) parts.push('  ' + flags.join(' '));
+        return parts.join(' ');
+      }
+
+      function renderCard(id, a) {
+        const card = document.createElement('div');
+        const resolved = a.status && a.status !== 'pending';
+        card.className = 'card' + (resolved ? ' resolved' : '');
+        card.dataset.id = id;
+
+        const rules = (a.rules || [])
+          .map(r => `<code>${escapeHtml(formatRule(r))}</code>`)
+          .join('');
+        const reason = a.reason ? `<div class="reason">${escapeHtml(a.reason)}</div>` : '';
+        const triggered = a.triggered_by
+          ? `<div class="triggered">triggered by <code>${escapeHtml(a.triggered_by.method)} ${escapeHtml(a.triggered_by.url)}</code></div>`
+          : '';
+        // Default to "permanent": in steady-state projects nearly every
+        // approval is something the user wants every time. Honor the
+        // agent's suggested_ttl if it sent one.
+        const ttlDefault = a.suggested_ttl || 'permanent';
+        let tag = '';
+        if (a.status === 'approved') tag = '<span class="tag approved">approved</span>';
+        if (a.status === 'denied') tag = '<span class="tag denied">denied</span>';
+
+        card.innerHTML = `
+          <h2>${escapeHtml(id)}${tag}</h2>
+          <div class="rules">${rules}</div>
+          ${reason}
+          ${triggered}
+          <div class="controls">
+            <label>Lifetime:
+              <select>
+                <option value="session" ${ttlDefault==='session'?'selected':''}>session</option>
+                <option value="one_hour" ${ttlDefault==='one_hour'?'selected':''}>1 hour</option>
+                <option value="one_day" ${ttlDefault==='one_day'?'selected':''}>1 day</option>
+                <option value="permanent" ${ttlDefault==='permanent'?'selected':''}>permanent</option>
+              </select>
+            </label>
+            <textarea placeholder="Deny message (optional)"></textarea>
+            <button class="approve">Approve</button>
+            <button class="deny">Deny</button>
+          </div>
+        `;
+
+        const ttlSel = card.querySelector('select');
+        const msgEl = card.querySelector('textarea');
+        card.querySelector('.approve').addEventListener('click', () => {
+          decide(id, { action: 'approve', ttl: ttlSel.value });
+        });
+        card.querySelector('.deny').addEventListener('click', () => {
+          const m = msgEl.value.trim();
+          decide(id, { action: 'deny', message: m || null });
+        });
+        return card;
+      }
+
+      async function decide(id, body) {
+        const resp = await fetch(`/approvals/${encodeURIComponent(id)}/decision`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          alert(`Decision failed: ${resp.status} ${await resp.text()}`);
+        }
+      }
+
+      function maybeNotify(a) {
+        if (!('Notification' in window) || Notification.permission !== 'granted') return;
+        const body = (a.rules || []).map(formatRule).join('\n')
+          + (a.reason ? `\n— ${a.reason}` : '');
+        try {
+          // requireInteraction: keep the toast visible until the user
+          // dismisses it (Chrome/Edge honor this; Firefox/Safari often
+          // ignore it and use the system default duration).
+          const n = new Notification('pyloros approval requested', {
+            body,
+            tag: a.id,            // collapse duplicates if we re-emit
+            requireInteraction: true,
+          });
+          n.onclick = () => {
+            window.focus();
+            n.close();
+          };
+        } catch (e) {
+          console.warn('Notification failed', e);
+        }
+      }
+
+      notifyBtn.addEventListener('click', async () => {
+        if (!('Notification' in window)) {
+          notifyBtn.textContent = 'Notifications unsupported';
+          notifyBtn.disabled = true;
+          return;
+        }
+        const res = await Notification.requestPermission();
+        notifyBtn.textContent = res === 'granted' ? 'Notifications on' : `Notifications: ${res}`;
+        notifyBtn.disabled = true;
+        if (res === 'granted') {
+          try {
+            new Notification('pyloros notifications enabled', {
+              body: 'You will be notified when an approval is requested.',
+            });
+          } catch (e) {
+            console.warn('Test notification failed', e);
+          }
+        }
+      });
+      if ('Notification' in window && Notification.permission === 'granted') {
+        notifyBtn.textContent = 'Notifications on';
+        notifyBtn.disabled = true;
+      }
+
+      function connect() {
+        const es = new EventSource('/events');
+        es.onopen = () => { statusEl.textContent = 'connected'; };
+        es.onerror = () => { statusEl.textContent = 'disconnected — retrying'; };
+        es.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.event === 'snapshot') {
+            approvals.clear();
+            for (const a of msg.approvals) approvals.set(a.id, a);
+            render();
+          } else if (msg.event === 'pending') {
+            approvals.set(msg.approval.id, msg.approval);
+            render();
+            maybeNotify(msg.approval);
+          } else if (msg.event === 'resolved') {
+            const a = approvals.get(msg.id);
+            if (a) {
+              a.status = msg.status;
+              if (msg.rules_applied) a.rules_applied = msg.rules_applied;
+              if (msg.message) a.message = msg.message;
+              render();
+              // Drop resolved cards after a short delay so users can see the result.
+              setTimeout(() => { approvals.delete(msg.id); render(); }, 3000);
+            }
+          }
+        };
+      }
+      connect();
+    </script>
+  </body>
+</html>

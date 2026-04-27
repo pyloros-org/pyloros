@@ -168,7 +168,13 @@ Git-LFS uses a separate HTTP endpoint (`POST {repo}/info/lfs/objects/batch`) to 
 - The proxy inspects the JSON body of LFS batch requests to verify the `operation` field matches what the rule allows
 - **Branch restrictions do not apply** to LFS. LFS blobs are content-addressed; the actual ref update goes through `git-receive-pack` which is already branch-checked
 - **Plain HTTP is blocked** for LFS batch requests (same default-deny principle as branch checks — body inspection requires HTTPS)
-- **Transfer URLs**: LFS batch responses contain transfer URLs (often on external hosts like S3) for the actual object upload/download. These are **not** automatically allowed — users must add separate HTTP rules for the transfer hosts (e.g., `method = "GET", url = "https://github-cloud.s3.amazonaws.com/*"`)
+- **Transfer URLs (dynamic whitelisting)**: LFS batch responses contain transfer URLs (often on external hosts like `lfs.github.com` or `github-cloud.s3.amazonaws.com`) for the actual object upload/download and post-upload verify callbacks. The proxy parses the JSON body of successful batch responses and inserts each `objects[*].actions.{download,upload,verify}.href` into a short-lived dynamic whitelist, pinned to the action's HTTP method (`download`→GET, `upload`→PUT, `verify`→POST).
+  - Activation is automatic for any rule with `git = "fetch" | "push" | "*"`. Whitelisted actions are filtered by the rule's allowed LFS operations: a fetch-only rule whitelists `download` actions; a push-only rule whitelists `upload` and `verify`; `*` whitelists all three.
+  - TTL: per-action `expires_at` (RFC 3339) or `expires_in` (seconds) from the response is used when present, clamped to `[60s, 3600s]`. Otherwise falls back to the existing `proxy.redirect_whitelist_ttl_secs` setting (default 60s).
+  - Body size for inspection is capped at 10 MiB; oversized batch responses are forwarded unchanged with no whitelisting (warn-logged).
+  - `Content-Encoding: gzip`/`deflate` is decoded for parsing; the original (compressed) bytes are forwarded unchanged to the client. Other encodings (e.g. `br`, `zstd`) are not decoded — the response forwards through but no actions are whitelisted.
+  - Trust model is identical to redirect whitelisting: the upstream is MITM-inspected and authenticated, so we trust its instructions about where the client will go next.
+  - The whitelist is method-pinned: a leaked `verify` URL cannot be used for `GET` or `PUT`.
 
 #### Git-LFS Locks API
 
@@ -252,6 +258,77 @@ direct_http_bind = "0.0.0.0:80"  # optional, enables direct HTTP mode
 The same `/etc/hosts` / wildcard-DNS setup used for direct-HTTPS works for direct-HTTP: a single
 IP can carry both ports simultaneously.
 
+### Approvals
+
+Opt-in feature: a coding agent running inside the sandbox can request permission from the human
+to add allowlist rules at runtime. The human approves (with a lifetime) or denies (optionally
+with a message) via a browser dashboard. Approved rules enter the live ruleset without
+restarting the proxy.
+
+Enabled by adding an `[approvals]` section to the config:
+
+```toml
+[approvals]
+permanent_rules_file = "/path/to/approvals.toml"  # required: where permanent rules persist
+dashboard_bind = "127.0.0.1:7778"         # required: dashboard listener address
+```
+
+Without this section, the agent API returns 404 and no dashboard listener is bound.
+
+**Two endpoints:**
+
+- **Agent API at `https://pyloros.internal/`.** Served on the proxy's existing listeners (CONNECT
+  MITM or direct-HTTPS SNI). Only reachable through the proxy; the hostname does not resolve
+  externally. Endpoints:
+  - `POST /approvals` — body: `{rules, reason?, context?, suggested_ttl?}`. Returns `202` with
+    a pending id, or `200` with `status:"approved"` immediately if all proposed rules are
+    already covered by the current ruleset. Returns `429` on rate limit (60 POSTs/minute),
+    `400` on a malformed/inconsistent rule.
+  - `GET /approvals/{id}?wait=60s` — long-poll the decision. Returns
+    `{status, rules_applied?, ttl?, message?}`.
+
+  **Rules** are JSON objects with the same shape as a `[[rules]]` entry in the TOML config
+  (`{method, url, websocket?, git?, branches?, allow_redirects?, log_body?}`); for example
+  `{"method":"GET","url":"https://api.foo.com/*"}` for a plain HTTP rule, or
+  `{"git":"fetch","url":"https://github.com/foo/bar.git"}` for a git fetch (which expands to
+  the full smart-HTTP + LFS endpoint set, just like in the TOML config).
+
+- **Dashboard at `dashboard_bind`.** Its own dedicated listener, plain HTTP. Endpoints:
+  - `GET /` — HTML page listing pending approvals; fires browser notifications via the
+    Notification API when new approvals arrive.
+  - `GET /events` — Server-Sent Events stream of pending/resolved approval events.
+  - `POST /approvals/{id}/decision` — body: `{action, rules_applied?, ttl?, message?}`.
+
+**Lifetimes** (chosen at decision time): `session`, `1h`, `1d`, `permanent`. The dashboard form
+defaults to `permanent` — in steady-state projects nearly every approval is something the user
+will need every time, and forcing them to flip the dropdown for the common case is the wrong
+default. The agent's `suggested_ttl` overrides the form default if present. Permanent rules go
+to the configured `permanent_rules_file`; the main config is never modified. Deleting the permanent-rules file
+revokes all permanent rules.
+
+**Deduplication.** If the proposed rules are already covered by the active ruleset, the POST
+returns `200 approved` immediately, with no pending state and no dashboard notification.
+
+**Deny with message.** When denying, the human may include a free-text `message` which is
+returned to the agent in the long-poll response, giving the agent a chance to refine and
+re-request.
+
+**Security model:**
+
+- Agent API: the sandbox boundary is the trust boundary. Anything inside the sandbox that can
+  reach the proxy can request approvals. A per-minute rate limit mitigates approval-fatigue
+  attacks.
+- Dashboard: **bind isolation is the trust boundary.** The dashboard has no built-in
+  authentication. The user MUST bind `dashboard_bind` to an address the sandbox cannot reach.
+  In a typical docker-compose setup this means binding to a host loopback or external-only IP,
+  NOT to a network shared with the sandbox container. Plain HTTP is intentional: the dashboard
+  is meant to be reached over a loopback or SSH-tunneled connection, where `http://localhost`
+  is a secure context for browser APIs.
+
+**Non-goals for v1:** automatic redirect-chain probing, transitive package-dependency expansion
+for package-registry URLs, and deny-with-memory. These are documented in `devdocs/design/approvals.md`
+as future extensions.
+
 ### CLI
 
 subcommands:
@@ -328,7 +405,7 @@ Each audit entry contains:
 - `scheme` — `http` or `https`
 - `protocol` — `http` or `https` (transport-level)
 - `decision` — `allowed` or `blocked`
-- `reason` — why the decision was made: `rule_matched`, `no_matching_rule`, `body_inspection_requires_https`, `branch_restriction`, `lfs_operation_not_allowed`, `non_https_connect`, `auth_failed`
+- `reason` — why the decision was made: `rule_matched`, `no_matching_rule`, `body_inspection_requires_https`, `branch_restriction`, `lfs_operation_not_allowed`, `non_https_connect`, `auth_failed`, `redirect_whitelisted`, `lfs_action_whitelisted`
 - `credential` (optional) — `{ "type": "header"|"aws-sigv4", "url_pattern": "..." }` for injected credentials
 - `git` (optional) — `{ "blocked_refs": ["refs/heads/main"] }` when branch restrictions apply
 
