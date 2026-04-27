@@ -204,6 +204,70 @@ export SYSTEM_CERTIFICATE_PATH=/path/to/certs/ca.crt
 - `SYSTEM_CERTIFICATE_PATH` replaces (not supplements) the default cert paths. This is fine when all traffic goes through the proxy (which handles upstream TLS), but if the process also makes direct HTTPS connections you'll need a combined bundle.
 - The cert store is loaded once at process startup and cached globally. The env var must be set before the process starts.
 
+## Running an agent behind pyloros
+
+You can run a coding agent (Claude Code, Codex, your own scaffolding…) behind pyloros so that
+its outbound HTTP is filtered by your allowlist. Combined with the **approvals** feature, the
+agent can request new rules at runtime and you decide from a browser dashboard, instead of
+stopping the agent to edit config.
+
+### Quick demo
+
+The fastest way to try this is `scripts/approvals-demo.sh`, which launches an interactive
+Claude Code session behind a fresh pyloros instance with a demo CA and the approvals
+dashboard already running:
+
+```bash
+./scripts/approvals-demo.sh        # starts proxy + dashboard, launches `claude`
+./scripts/approvals-demo.sh --no-claude   # proxy + dashboard only; bring your own client
+```
+
+Open the dashboard URL it prints (default `http://127.0.0.1:7778/`) and click **Enable
+notifications**. When the agent requests something blocked, you get a desktop notification
+and a card to approve/deny.
+
+### Manual setup (any agent)
+
+1. **Generate a CA** and configure the agent's HTTP client to trust it. See
+   [Client Configuration](#client-configuration) above for the env vars (`HTTPS_PROXY`,
+   `NODE_EXTRA_CA_CERTS` for Node/Claude Code, etc.).
+
+2. **Enable approvals** in the proxy config. The `[approvals]` section is opt-in:
+
+   ```toml
+   [approvals]
+   sidecar_file   = "/path/to/approvals.toml"  # permanent rules persist here
+   dashboard_bind = "127.0.0.1:7778"           # dashboard listener (host-only!)
+   ```
+
+   The dashboard has no built-in authentication. Bind it to an address the agent's sandbox
+   cannot reach (typically loopback on the host, or a host-only IP in container deployments).
+   Bind isolation **is** the trust boundary.
+
+3. **Tell the agent how to behave behind the proxy.** When the agent's outbound request
+   matches no allow rule, pyloros returns **HTTP 451** with a `Link` header pointing at
+   `https://pyloros.internal/`. That URL serves the always-current agent-protocol spec
+   directly from the running proxy build:
+
+   ```bash
+   curl https://pyloros.internal/   # returns text/markdown with the protocol
+   ```
+
+   In the agent's system prompt (or rules file, or however your agent ingests durable
+   instructions), add a short bootstrap blurb pointing it at that URL. Example:
+
+   > You are running behind pyloros, an HTTPS allowlist proxy. Outbound requests not
+   > matching an allow rule return HTTP 451. The proxy serves its own protocol spec at
+   > `https://pyloros.internal/` — fetch it the first time you hit a 451 (and re-fetch if
+   > unsure about the rule shape). Short version: POST a JSON `{rules, reason}` body to
+   > `https://pyloros.internal/approvals` and long-poll
+   > `https://pyloros.internal/approvals/{id}?wait=60s` for the human's decision.
+
+   The full instructions ([source](src/approvals/agent_instructions.md)) cover endpoint
+   responses, rule shapes (plain HTTP, `git=fetch`/`git=push`, WebSocket, branch
+   restrictions), and guidance on writing good approval requests. Keeping the spec served
+   from the proxy means the agent always reads the version that matches the running build.
+
 ## Configuration
 
 Configuration uses TOML format. Pass it via `--config` or set values with CLI flags.

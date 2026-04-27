@@ -25,6 +25,12 @@ use super::types::{ApprovalError, ApprovalRequest, ApprovalStatus, Lifetime, Tri
 const MAX_LONG_POLL: Duration = Duration::from_secs(60);
 const DEFAULT_LONG_POLL: Duration = Duration::from_secs(30);
 
+/// Agent-facing protocol documentation. Served at `GET /` on
+/// `pyloros.internal` so an agent can always fetch the up-to-date
+/// spec for the running build instead of relying on stale prompt
+/// blurbs.
+const AGENT_INSTRUCTIONS: &str = include_str!("agent_instructions.md");
+
 /// Dispatch an agent-facing request to the appropriate handler.
 ///
 /// When the approvals feature is disabled (`manager` is `None`), returns 404
@@ -43,6 +49,7 @@ pub async fn serve(
     let path = req.uri().path().to_string();
 
     match (&method, path.as_str()) {
+        (&Method::GET, "/") => Ok(serve_instructions()),
         (&Method::POST, "/approvals") => Ok(handle_post(manager, engine.as_ref(), req).await),
         (&Method::GET, p) if p.starts_with("/approvals/") => {
             let id = p.trim_start_matches("/approvals/").to_string();
@@ -51,6 +58,18 @@ pub async fn serve(
         }
         _ => Ok(not_found()),
     }
+}
+
+fn serve_instructions() -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/markdown; charset=utf-8")
+        .body(
+            Full::new(Bytes::from_static(AGENT_INSTRUCTIONS.as_bytes()))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap()
 }
 
 #[derive(Deserialize)]

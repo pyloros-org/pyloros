@@ -963,6 +963,75 @@ async fn test_post_rejects_empty_rules() {
     upstream.shutdown();
 }
 
+/// `GET https://pyloros.internal/` should serve the agent-instructions
+/// markdown when approvals are enabled, so an agent can fetch the
+/// up-to-date protocol spec instead of relying on a stale prompt.
+#[tokio::test]
+async fn test_agent_instructions_served_at_root() {
+    let t = test_report!("GET pyloros.internal/ returns markdown agent instructions");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client.get("https://pyloros.internal/").await;
+    t.assert_eq("status", &resp.status().as_u16(), &200u16);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    t.assert_contains("Content-Type", ctype.as_str(), "text/markdown");
+    let body = resp.text().await.unwrap();
+    t.assert_contains("mentions 451", body.as_str(), "451");
+    t.assert_contains(
+        "documents POST endpoint",
+        body.as_str(),
+        "POST https://pyloros.internal/approvals",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+/// 451 responses should advertise the agent-instructions endpoint so
+/// an agent that hits a block has a discoverable path to the approvals
+/// protocol.
+#[tokio::test]
+async fn test_blocked_response_links_to_instructions() {
+    let t = test_report!("451 body and Link header point at https://pyloros.internal/");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client.get("https://blocked.example.com/anything").await;
+    t.assert_eq("status", &resp.status().as_u16(), &451u16);
+    let link = resp
+        .headers()
+        .get("link")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    t.assert_contains("Link header", link.as_str(), "https://pyloros.internal/");
+    let body = resp.text().await.unwrap();
+    t.assert_contains(
+        "body mentions instructions URL",
+        body.as_str(),
+        "https://pyloros.internal/",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
 /// A git=fetch rule submitted via the API should round-trip correctly:
 /// the proposal is preserved verbatim, and once approved it expands to
 /// the full smart-HTTP endpoint set so an actual `info/refs` request to

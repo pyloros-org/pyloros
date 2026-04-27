@@ -122,68 +122,26 @@ PROXY_URL="http://$PROXY_BIND"
 
 # Agent instructions, injected as an appended system prompt. Kept short
 # on purpose — the agent only needs the protocol, not editorial detail.
-SYSTEM_BLURB="$(cat <<EOF
+SYSTEM_BLURB="$(cat <<'EOF'
 You are running behind pyloros, an HTTPS allowlist proxy. Outbound HTTP
 requests that don't match an active allow rule are blocked with HTTP 451
 ("Unavailable For Legal Reasons"). A 451 from this proxy is NOT an error
 in the target server — it means YOU need permission first.
 
-When you hit a 451 (or want to do an outbound call you expect will be
-blocked), request approval from the human via the agent API. The API is
-only reachable through the proxy at the magic hostname pyloros.internal:
+The proxy serves its own protocol spec at https://pyloros.internal/.
+Fetch it before you make your first approval request, and re-fetch it
+if you're unsure about the current rule shape or endpoint behavior — it
+is always up-to-date with the running pyloros build:
 
-  POST https://pyloros.internal/approvals
-  Content-Type: application/json
-  {
-    "rules": [
-      {"method": "GET", "url": "https://api.example.com/*"}
-    ],
-    "reason": "short human-readable why",
-    "context": {"triggered_by": {"method": "GET", "url": "<the blocked URL>"}}
-  }
+  curl https://pyloros.internal/
 
-Each rule object uses the same fields as a [[rules]] entry in the
-pyloros TOML config. Common shapes:
+Short version: when you hit a 451 (or expect to), POST to
+https://pyloros.internal/approvals with a JSON body containing the
+rule(s) you want, then long-poll
+https://pyloros.internal/approvals/{id}?wait=60s for the decision.
 
-  {"method": "GET",  "url": "https://api.foo.com/*"}     plain HTTP rule
-  {"method": "*",    "url": "https://api.foo.com/*"}     any method
-  {"git":    "fetch","url": "https://github.com/foo/bar.git"}  git clone/fetch
-  {"git":    "push", "url": "https://github.com/foo/bar.git"}  git push
-  {"git":    "*",    "url": "https://github.com/foo/bar.git"}  fetch + push
-
-A git rule expands automatically to all the smart-HTTP endpoints the
-operation needs (info/refs, git-upload-pack/git-receive-pack, LFS), so
-you don't have to enumerate them yourself.
-
-Responses:
-  - 200 {"status":"approved", ...}  — already covered by an active rule;
-    proceed immediately. (Dedup short-circuit; no human round-trip.)
-  - 202 {"id":"apr_...","status":"pending", ...}  — waiting on human.
-  - 429  — rate limited (60 posts/minute). Back off, don't retry tightly.
-  - 400  — malformed JSON or invalid rule shape.
-
-For pending requests, long-poll the decision:
-
-  GET https://pyloros.internal/approvals/{id}?wait=60s
-
-Returns when the human approves or denies (or after the wait window).
-Possible terminal statuses:
-  - "approved" — rule(s) are now active in the proxy. Retry your request.
-  - "denied"   — may include a "message" field. Respect it; do NOT retry
-                 the same request or propose minor variants of the same rule.
-
-Guidelines:
-  - Ask for the narrowest rule that covers your task. The human is more
-    likely to approve {"method":"GET","url":"https://api.example.com/v1/weather/*"}
-    than {"method":"*","url":"https://*.example.com/*"}.
-  - Always include a "reason" — the human reads it before deciding.
-  - For git, prefer git=fetch over a method rule — it covers all the
-    smart-HTTP endpoints and is what the human probably wants to grant.
-  - If denied with a message, read it. Don't paper over it.
-
-Use Bash with curl plus --cacert "$CA_CERT" and -x "$PROXY_URL" to
-exercise the flow. (HTTP_PROXY/HTTPS_PROXY/SSL_CERT_FILE are already
-set in your environment, so plain "curl https://..." also works.)
+(HTTP_PROXY/HTTPS_PROXY/SSL_CERT_FILE are already set in your
+environment, so a plain "curl https://pyloros.internal/" works.)
 EOF
 )"
 
