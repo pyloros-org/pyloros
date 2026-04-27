@@ -79,8 +79,8 @@ DASH_BIND="127.0.0.1:7778"
 SIDECAR="$TMPDIR_BASE/approvals-sidecar.toml"
 CONFIG="$TMPDIR_BASE/config.toml"
 
-# Pre-allow Anthropic + Statsig hosts so Claude Code itself can talk to
-# its own backend. Everything else goes through the approvals flow.
+# Pre-allow Anthropic so Claude Code itself can talk to its own backend.
+# Everything else goes through the approvals flow.
 cat > "$CONFIG" <<EOF
 [proxy]
 bind_address = "$PROXY_BIND"
@@ -98,14 +98,6 @@ dashboard_bind = "$DASH_BIND"
 [[rules]]
 method = "*"
 url    = "https://*.anthropic.com/*"
-
-[[rules]]
-method = "*"
-url    = "https://statsigapi.net/*"
-
-[[rules]]
-method = "*"
-url    = "https://*.statsig.com/*"
 EOF
 
 "$PYLOROS" run --config "$CONFIG" 2>"$TMPDIR_BASE/proxy.log" &
@@ -170,7 +162,7 @@ cat <<EOF
   Proxy log    $TMPDIR_BASE/proxy.log
   Workspace    $WORKSPACE  (claude runs here; CLAUDE.md primes the agent)
 
-  Pre-allowed: *.anthropic.com, *.statsig.com, statsigapi.net
+  Pre-allowed: *.anthropic.com
   Everything else: blocked (451) until approved via the dashboard.
 
   When Claude needs network access for a tool call, it should hit a
@@ -219,8 +211,8 @@ set +e
     CURL_CA_BUNDLE="$CA_CERT" \
     NODE_EXTRA_CA_CERTS="$CA_CERT" \
     REQUESTS_CA_BUNDLE="$CA_CERT" \
-    NO_PROXY="api.anthropic.com,statsigapi.net,.anthropic.com,.statsig.com,localhost,127.0.0.1" \
-    no_proxy="api.anthropic.com,statsigapi.net,.anthropic.com,.statsig.com,localhost,127.0.0.1" \
+    NO_PROXY="api.anthropic.com,.anthropic.com,localhost,127.0.0.1" \
+    no_proxy="api.anthropic.com,.anthropic.com,localhost,127.0.0.1" \
         claude --dangerously-skip-permissions \
                "${CLAUDE_ARGS[@]}"
 )
