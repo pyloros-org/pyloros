@@ -50,14 +50,14 @@ pub enum Lifetime {
     OneHour,
     /// Active for 24 hours.
     OneDay,
-    /// Persisted to the sidecar file and active across restarts.
+    /// Persisted to the permanent-rules file and active across restarts.
     Permanent,
 }
 
 impl Lifetime {
     /// Duration for lifetimes that have a natural expiry, else `None`.
     /// Session and Permanent never expire in memory — Session is dropped
-    /// on process exit, Permanent is loaded from the sidecar on startup.
+    /// on process exit, Permanent is loaded from the permanent-rules file on startup.
     pub fn duration(self) -> Option<std::time::Duration> {
         match self {
             Lifetime::OneHour => Some(std::time::Duration::from_secs(3600)),
@@ -66,7 +66,7 @@ impl Lifetime {
         }
     }
 
-    /// Whether approvals with this lifetime should persist to the sidecar.
+    /// Whether approvals with this lifetime should persist to the permanent-rules file.
     pub fn is_permanent(self) -> bool {
         matches!(self, Lifetime::Permanent)
     }

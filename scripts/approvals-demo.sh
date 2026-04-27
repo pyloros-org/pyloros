@@ -10,7 +10,7 @@
 #
 # Options:
 #   --no-browser   Don't try to open the dashboard URL in a browser
-#   --keep         Keep the temp dir (CA, config, sidecar, proxy log) on exit
+#   --keep         Keep the temp dir (CA, config, permanent-rules file, proxy log) on exit
 #   --no-claude    Don't launch claude — just run the proxy + dashboard
 #                  (use raw curl from another terminal, like the old demo)
 #   -h, --help     Show this help
@@ -76,7 +76,7 @@ CA_KEY="$TMPDIR_BASE/ca.key"
 
 PROXY_BIND="127.0.0.1:7777"
 DASH_BIND="127.0.0.1:7778"
-SIDECAR="$TMPDIR_BASE/approvals-sidecar.toml"
+PERMANENT_RULES="$TMPDIR_BASE/approvals-permanent-rules.toml"
 CONFIG="$TMPDIR_BASE/config.toml"
 
 # Pre-allow Anthropic so Claude Code itself can talk to its own backend.
@@ -92,7 +92,7 @@ level = "info"
 log_requests = true
 
 [approvals]
-sidecar_file   = "$SIDECAR"
+permanent_rules_file   = "$PERMANENT_RULES"
 dashboard_bind = "$DASH_BIND"
 
 [[rules]]
@@ -158,7 +158,7 @@ cat <<EOF
   Proxy        $PROXY_URL
   Dashboard    $DASHBOARD_URL  (open in your browser)
   CA cert      $CA_CERT
-  Sidecar      $SIDECAR
+  Rules file   $PERMANENT_RULES  (permanent approvals persist here)
   Proxy log    $TMPDIR_BASE/proxy.log
   Workspace    $WORKSPACE  (claude runs here; CLAUDE.md primes the agent)
 

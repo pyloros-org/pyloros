@@ -236,7 +236,7 @@ and a card to approve/deny.
 
    ```toml
    [approvals]
-   sidecar_file   = "/path/to/approvals.toml"  # permanent rules persist here
+   permanent_rules_file   = "/path/to/approvals.toml"  # permanent rules persist here
    dashboard_bind = "127.0.0.1:7778"           # dashboard listener (host-only!)
    ```
 

@@ -155,7 +155,7 @@ impl ProxyServer {
         };
 
         // Build the initial FilterEngine from base rules ++ approval rules
-        // loaded from the sidecar. Replaces the earlier `filter_engine`
+        // loaded from the permanent-rules file. Replaces the earlier `filter_engine`
         // that used only config.rules.
         let filter_engine = if let Some(ref manager) = approvals {
             let mut combined = config.rules.clone();

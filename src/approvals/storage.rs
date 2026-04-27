@@ -25,7 +25,7 @@ struct SidecarIn {
     rules: Vec<Rule>,
 }
 
-/// Load permanent rules from the sidecar file. If the file does not
+/// Load permanent rules from the permanent-rules file. If the file does not
 /// exist, returns an empty vector — that's the normal startup case
 /// before the first permanent approval has been granted.
 pub fn load_permanent_rules(path: impl AsRef<Path>) -> Result<Vec<Rule>, ApprovalError> {
@@ -39,7 +39,7 @@ pub fn load_permanent_rules(path: impl AsRef<Path>) -> Result<Vec<Rule>, Approva
     Ok(loaded.rules)
 }
 
-/// Atomically rewrite the sidecar file to contain exactly `rules`. The
+/// Atomically rewrite the permanent-rules file to contain exactly `rules`. The
 /// caller holds the full in-memory list of permanent rules and passes it
 /// here; we overwrite rather than append so the file stays in sync with
 /// state (e.g. future revokes just re-write without the revoked rule).

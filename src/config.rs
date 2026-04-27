@@ -38,8 +38,8 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalsConfig {
-    /// Path to the sidecar TOML file where permanent approvals are persisted.
-    pub sidecar_file: String,
+    /// Path to the permanent-rules file TOML file where permanent approvals are persisted.
+    pub permanent_rules_file: String,
 
     /// Address to bind the dashboard listener (plain HTTP).
     /// MUST be an address the sandbox cannot reach — the dashboard has no

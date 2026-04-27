@@ -480,7 +480,7 @@ impl TestProxy {
             // Dashboard bind at 127.0.0.1:0 so the OS picks a port;
             // real addr is captured after bind below.
             config.approvals = Some(pyloros::config::ApprovalsConfig {
-                sidecar_file: sidecar.clone(),
+                permanent_rules_file: sidecar.clone(),
                 dashboard_bind: "127.0.0.1:0".to_string(),
             });
         }
@@ -613,7 +613,7 @@ impl<'a> TestProxyBuilder<'a> {
         self
     }
 
-    /// Enable the approvals feature with the given sidecar file path.
+    /// Enable the approvals feature with the given permanent-rules file path.
     /// The dashboard is bound to 127.0.0.1:0 (ephemeral); read the
     /// assigned port from `TestProxy::dashboard_addr` after start.
     pub fn with_approvals(mut self, sidecar_path: &str) -> Self {

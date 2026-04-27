@@ -269,7 +269,7 @@ Enabled by adding an `[approvals]` section to the config:
 
 ```toml
 [approvals]
-sidecar_file = "/path/to/approvals.toml"  # required: where permanent rules persist
+permanent_rules_file = "/path/to/approvals.toml"  # required: where permanent rules persist
 dashboard_bind = "127.0.0.1:7778"         # required: dashboard listener address
 ```
 
@@ -303,7 +303,7 @@ Without this section, the agent API returns 404 and no dashboard listener is bou
 defaults to `permanent` — in steady-state projects nearly every approval is something the user
 will need every time, and forcing them to flip the dropdown for the common case is the wrong
 default. The agent's `suggested_ttl` overrides the form default if present. Permanent rules go
-to the configured `sidecar_file`; the main config is never modified. Deleting the sidecar file
+to the configured `permanent_rules_file`; the main config is never modified. Deleting the permanent-rules file
 revokes all permanent rules.
 
 **Deduplication.** If the proposed rules are already covered by the active ruleset, the POST

@@ -75,12 +75,12 @@ struct PendingEntry {
 impl ApprovalManager {
     /// Construct a new manager from the user's `[approvals]` config.
     ///
-    /// Loads permanent rules from the sidecar file (if any) on startup so
+    /// Loads permanent rules from the permanent-rules file (if any) on startup so
     /// they're active from the first FilterEngine build.
     pub fn new(config: ApprovalsConfig) -> Arc<Self> {
         let (notifier, _) = broadcast::channel(NOTIFIER_CAPACITY);
         let mut state = State::default();
-        match super::storage::load_permanent_rules(&config.sidecar_file) {
+        match super::storage::load_permanent_rules(&config.permanent_rules_file) {
             Ok(rules) => {
                 for rule in rules {
                     state.active.push(ActiveApproval {
@@ -92,16 +92,16 @@ impl ApprovalManager {
                 if !state.active.is_empty() {
                     tracing::info!(
                         count = state.active.len(),
-                        path = %config.sidecar_file,
-                        "Loaded permanent approval rules from sidecar"
+                        path = %config.permanent_rules_file,
+                        "Loaded permanent approval rules from the permanent-rules file"
                     );
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    path = %config.sidecar_file,
-                    "Failed to load approvals sidecar; continuing with empty permanent set"
+                    path = %config.permanent_rules_file,
+                    "Failed to load approvals permanent-rules file; continuing with empty permanent set"
                 );
             }
         }
@@ -310,12 +310,12 @@ impl ApprovalManager {
 
         if let Some(snapshot) = permanent_snapshot {
             if let Err(e) =
-                super::storage::save_permanent_rules(&self.config.sidecar_file, &snapshot)
+                super::storage::save_permanent_rules(&self.config.permanent_rules_file, &snapshot)
             {
                 tracing::error!(
                     error = %e,
-                    path = %self.config.sidecar_file,
-                    "Failed to persist approvals sidecar"
+                    path = %self.config.permanent_rules_file,
+                    "Failed to persist approvals permanent-rules file"
                 );
             }
         }
@@ -335,7 +335,7 @@ impl ApprovalManager {
     }
 
     /// Revoke all rules from a previously approved approval. Removes them
-    /// from the active set, persists the sidecar if any were permanent,
+    /// from the active set, persists the permanent-rules file if any were permanent,
     /// and signals a rebuild. No-op if no rules match.
     pub fn revoke_approval(&self, approval_id: &str) {
         let (removed_any, permanent_snapshot) = {
@@ -363,7 +363,8 @@ impl ApprovalManager {
         };
 
         if let Some(snapshot) = permanent_snapshot {
-            let _ = super::storage::save_permanent_rules(&self.config.sidecar_file, &snapshot);
+            let _ =
+                super::storage::save_permanent_rules(&self.config.permanent_rules_file, &snapshot);
         }
 
         if removed_any {
