@@ -119,19 +119,33 @@
       }
 
       function maybeNotify(a) {
-        if (document.visibilityState === 'visible') return;
         if (!('Notification' in window) || Notification.permission !== 'granted') return;
         const body = (a.rules || []).join('\n') + (a.reason ? `\n— ${a.reason}` : '');
         try {
           new Notification('pyloros approval requested', { body });
-        } catch (_) { /* some platforms restrict */ }
+        } catch (e) {
+          console.warn('Notification failed', e);
+        }
       }
 
       notifyBtn.addEventListener('click', async () => {
-        if (!('Notification' in window)) return;
+        if (!('Notification' in window)) {
+          notifyBtn.textContent = 'Notifications unsupported';
+          notifyBtn.disabled = true;
+          return;
+        }
         const res = await Notification.requestPermission();
-        notifyBtn.textContent = res === 'granted' ? 'Notifications on' : 'Notifications denied';
+        notifyBtn.textContent = res === 'granted' ? 'Notifications on' : `Notifications: ${res}`;
         notifyBtn.disabled = true;
+        if (res === 'granted') {
+          try {
+            new Notification('pyloros notifications enabled', {
+              body: 'You will be notified when an approval is requested.',
+            });
+          } catch (e) {
+            console.warn('Test notification failed', e);
+          }
+        }
       });
       if ('Notification' in window && Notification.permission === 'granted') {
         notifyBtn.textContent = 'Notifications on';
