@@ -99,7 +99,10 @@
         const triggered = a.triggered_by
           ? `<div class="triggered">triggered by <code>${escapeHtml(a.triggered_by.method)} ${escapeHtml(a.triggered_by.url)}</code></div>`
           : '';
-        const ttlDefault = a.suggested_ttl || 'session';
+        // Default to "permanent": in steady-state projects nearly every
+        // approval is something the user wants every time. Honor the
+        // agent's suggested_ttl if it sent one.
+        const ttlDefault = a.suggested_ttl || 'permanent';
         let tag = '';
         if (a.status === 'approved') tag = '<span class="tag approved">approved</span>';
         if (a.status === 'denied') tag = '<span class="tag denied">denied</span>';

@@ -164,7 +164,7 @@ async fn serve_decision(
     let status = match decision.action {
         DecisionAction::Approve => ApprovalStatus::Approved {
             rules_applied: decision.rules_applied.unwrap_or(proposed_rules),
-            ttl: decision.ttl.unwrap_or(Lifetime::Session),
+            ttl: decision.ttl.unwrap_or(Lifetime::Permanent),
         },
         DecisionAction::Deny => ApprovalStatus::Denied {
             message: decision.message,

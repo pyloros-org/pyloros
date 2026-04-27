@@ -112,6 +112,11 @@ async fn handle_post(
     // Dedup (I4): if the proposed rules are already covered by the
     // active ruleset, short-circuit as approved — no pending entry,
     // no rate-limit consumption, no dashboard notification.
+    //
+    // The reported `ttl` is best-effort: we don't know which existing
+    // rule covered the probe, so we report `permanent` — the proposal
+    // is at least as durable as the active config, since an explicit
+    // human action would be required to remove the covering rule.
     if dedup::all_subsumed(engine, &parsed.rules, triggered_by.as_ref()) {
         let auto = ApprovalRequest {
             id: "apr_dedup".to_string(),
@@ -121,7 +126,7 @@ async fn handle_post(
             suggested_ttl: parsed.suggested_ttl,
             status: ApprovalStatus::Approved {
                 rules_applied: parsed.rules,
-                ttl: Lifetime::Session,
+                ttl: Lifetime::Permanent,
             },
         };
         tracing::debug!("approvals: auto-approved via dedup");

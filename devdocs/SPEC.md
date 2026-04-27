@@ -299,7 +299,10 @@ Without this section, the agent API returns 404 and no dashboard listener is bou
   - `GET /events` — Server-Sent Events stream of pending/resolved approval events.
   - `POST /approvals/{id}/decision` — body: `{action, rules_applied?, ttl?, message?}`.
 
-**Lifetimes** (chosen at decision time): `session`, `1h`, `1d`, `permanent`. Permanent rules go
+**Lifetimes** (chosen at decision time): `session`, `1h`, `1d`, `permanent`. The dashboard form
+defaults to `permanent` — in steady-state projects nearly every approval is something the user
+will need every time, and forcing them to flip the dropdown for the common case is the wrong
+default. The agent's `suggested_ttl` overrides the form default if present. Permanent rules go
 to the configured `sidecar_file`; the main config is never modified. Deleting the sidecar file
 revokes all permanent rules.
 
