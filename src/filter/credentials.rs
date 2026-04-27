@@ -1,6 +1,7 @@
 //! Credential injection engine
 
 use hyper::header::HeaderMap;
+use std::collections::HashMap;
 
 use super::matcher::UrlPattern;
 use crate::config::{
@@ -74,8 +75,16 @@ pub struct CredentialEngine {
 
 impl CredentialEngine {
     /// Create a new credential engine, resolving env vars and compiling URL patterns.
-    /// Returns the engine and any generated secrets that should be written to the env file.
-    pub fn new(credentials: Vec<Credential>) -> Result<(Self, Vec<GeneratedSecret>)> {
+    /// Returns the engine and the full set of generated secrets (the new file contents).
+    ///
+    /// `existing` maps env-var name → value from a previously written secrets file
+    /// (or an empty map if none). When a credential's env-var name appears in
+    /// `existing`, the value is reused so a proxy restart or reload doesn't
+    /// rotate local credentials that the sandbox is still using.
+    pub fn new(
+        credentials: Vec<Credential>,
+        existing: &HashMap<String, String>,
+    ) -> Result<(Self, Vec<GeneratedSecret>)> {
         let mut resolved = Vec::with_capacity(credentials.len());
         let mut generated_secrets = Vec::new();
         for cred in &credentials {
@@ -95,19 +104,20 @@ impl CredentialEngine {
                             ResolvedLocalHeader { value: local_value }
                         }
                         LocalHeaderConfig::Generated { env_name } => {
-                            let generated_value = generate_random_header_value();
                             let env = env_name
                                 .as_deref()
                                 .or_else(|| extract_env_var_name(value))
                                 .unwrap_or(header)
                                 .to_string();
+                            let value = existing
+                                .get(&env)
+                                .cloned()
+                                .unwrap_or_else(generate_random_header_value);
                             generated_secrets.push(GeneratedSecret {
                                 env_name: env,
-                                value: generated_value.clone(),
+                                value: value.clone(),
                             });
-                            ResolvedLocalHeader {
-                                value: generated_value,
-                            }
+                            ResolvedLocalHeader { value }
                         }
                     };
 
@@ -150,8 +160,6 @@ impl CredentialEngine {
                             access_key_id_env_name,
                             secret_access_key_env_name,
                         } => {
-                            let gen_akid = generate_fake_access_key_id();
-                            let gen_sak = generate_fake_secret_access_key();
                             let akid_env = access_key_id_env_name
                                 .as_deref()
                                 .unwrap_or("AWS_ACCESS_KEY_ID")
@@ -160,17 +168,25 @@ impl CredentialEngine {
                                 .as_deref()
                                 .unwrap_or("AWS_SECRET_ACCESS_KEY")
                                 .to_string();
+                            let akid = existing
+                                .get(&akid_env)
+                                .cloned()
+                                .unwrap_or_else(generate_fake_access_key_id);
+                            let sak = existing
+                                .get(&sak_env)
+                                .cloned()
+                                .unwrap_or_else(generate_fake_secret_access_key);
                             generated_secrets.push(GeneratedSecret {
                                 env_name: akid_env,
-                                value: gen_akid.clone(),
+                                value: akid.clone(),
                             });
                             generated_secrets.push(GeneratedSecret {
                                 env_name: sak_env,
-                                value: gen_sak.clone(),
+                                value: sak.clone(),
                             });
                             ResolvedLocalSigV4 {
-                                access_key_id: gen_akid,
-                                secret_access_key: gen_sak,
+                                access_key_id: akid,
+                                secret_access_key: sak,
                             }
                         }
                     };
@@ -499,11 +515,14 @@ mod tests {
     #[test]
     fn test_url_pattern_matching() {
         let t = test_report!("Credential matches request with wildcard URL");
-        let (engine, _) = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "secret123",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "secret123",
+            )],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/v1/data", None);
@@ -519,11 +538,14 @@ mod tests {
     #[test]
     fn test_header_overwrite() {
         let t = test_report!("Credential overwrites existing header");
-        let (engine, _) = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "real-secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
@@ -540,10 +562,13 @@ mod tests {
     #[test]
     fn test_multiple_credentials_different_headers() {
         let t = test_report!("Multiple credentials for different headers both injected");
-        let (engine, _) = CredentialEngine::new(vec![
-            make_credential("https://api.example.com/*", "x-api-key", "key123"),
-            make_credential("https://api.example.com/*", "authorization", "Bearer tok"),
-        ])
+        let (engine, _) = CredentialEngine::new(
+            vec![
+                make_credential("https://api.example.com/*", "x-api-key", "key123"),
+                make_credential("https://api.example.com/*", "authorization", "Bearer tok"),
+            ],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("POST", "https", "api.example.com", None, "/data", None);
@@ -564,10 +589,13 @@ mod tests {
     #[test]
     fn test_last_match_wins() {
         let t = test_report!("Last match wins for same header");
-        let (engine, _) = CredentialEngine::new(vec![
-            make_credential("https://*.example.com/*", "x-api-key", "first"),
-            make_credential("https://api.example.com/*", "x-api-key", "second"),
-        ])
+        let (engine, _) = CredentialEngine::new(
+            vec![
+                make_credential("https://*.example.com/*", "x-api-key", "first"),
+                make_credential("https://api.example.com/*", "x-api-key", "second"),
+            ],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
@@ -583,11 +611,14 @@ mod tests {
     #[test]
     fn test_no_match() {
         let t = test_report!("No match leaves headers unchanged");
-        let (engine, _) = CredentialEngine::new(vec![make_credential(
-            "https://other.example.com/*",
-            "x-api-key",
-            "secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://other.example.com/*",
+                "x-api-key",
+                "secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
@@ -599,11 +630,14 @@ mod tests {
     #[test]
     fn test_matched_credential_infos_match() {
         let t = test_report!("matched_credential_infos returns matching credentials");
-        let (engine, _) = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "secret123",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "secret123",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/v1/data", None);
         let infos = engine.matched_credential_infos(&ri);
@@ -619,11 +653,14 @@ mod tests {
     #[test]
     fn test_matched_credential_infos_no_match() {
         let t = test_report!("matched_credential_infos returns empty for non-matching request");
-        let (engine, _) = CredentialEngine::new(vec![make_credential(
-            "https://other.example.com/*",
-            "x-api-key",
-            "secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://other.example.com/*",
+                "x-api-key",
+                "secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
         let infos = engine.matched_credential_infos(&ri);
@@ -633,10 +670,13 @@ mod tests {
     #[test]
     fn test_credential_count() {
         let t = test_report!("credential_count returns correct count");
-        let (engine, _) = CredentialEngine::new(vec![
-            make_credential("https://a.com/*", "x-key", "a"),
-            make_credential("https://b.com/*", "x-key", "b"),
-        ])
+        let (engine, _) = CredentialEngine::new(
+            vec![
+                make_credential("https://a.com/*", "x-key", "a"),
+                make_credential("https://b.com/*", "x-key", "b"),
+            ],
+            &Default::default(),
+        )
         .unwrap();
         t.assert_eq("count", &engine.credential_count(), &2usize);
     }
@@ -646,11 +686,14 @@ mod tests {
     #[test]
     fn test_needs_body_false_for_header_credentials() {
         let t = test_report!("needs_body returns false when only Header credentials match");
-        let (engine, _) = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
         t.assert_true("needs_body is false", !engine.needs_body(&ri));
@@ -659,9 +702,11 @@ mod tests {
     #[test]
     fn test_needs_body_true_for_matching_sigv4() {
         let t = test_report!("needs_body returns true for matching AwsSigV4 credential");
-        let (engine, _) =
-            CredentialEngine::new(vec![make_sigv4_credential("https://*.amazonaws.com/*")])
-                .unwrap();
+        let (engine, _) = CredentialEngine::new(
+            vec![make_sigv4_credential("https://*.amazonaws.com/*")],
+            &Default::default(),
+        )
+        .unwrap();
         let matching_ri = RequestInfo::http(
             "GET",
             "https",
@@ -699,12 +744,15 @@ mod tests {
     #[test]
     fn test_verify_local_rejects_wrong_header_value() {
         let t = test_report!("verify_local rejects when header value doesn't match local");
-        let (engine, _) = CredentialEngine::new(vec![make_credential_with_local(
-            "https://api.example.com/*",
-            "x-api-key",
-            "real-secret",
-            "expected-local",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential_with_local(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+                "expected-local",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
         let mut headers = HeaderMap::new();
@@ -718,12 +766,15 @@ mod tests {
     #[test]
     fn test_verify_local_passes_matching_header_value() {
         let t = test_report!("verify_local passes when header value matches local");
-        let (engine, _) = CredentialEngine::new(vec![make_credential_with_local(
-            "https://api.example.com/*",
-            "x-api-key",
-            "real-secret",
-            "expected-local",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential_with_local(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+                "expected-local",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
         let mut headers = HeaderMap::new();
@@ -735,12 +786,15 @@ mod tests {
     #[test]
     fn test_verify_local_rejects_missing_header() {
         let t = test_report!("verify_local rejects when header is missing entirely");
-        let (engine, _) = CredentialEngine::new(vec![make_credential_with_local(
-            "https://api.example.com/*",
-            "x-api-key",
-            "real-secret",
-            "expected-local",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential_with_local(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+                "expected-local",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
         let headers = HeaderMap::new();

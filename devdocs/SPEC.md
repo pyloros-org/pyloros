@@ -509,7 +509,7 @@ Every credential entry must have a corresponding **local credential** — a subs
    - The proxy writes all generated values to `generated_secrets_file` (configured in `[proxy]`) in `KEY=value` format
    - Default env var names are inferred from the `${VAR}` references in the real credential fields (e.g., `value = "${ANTHROPIC_API_KEY}"` → env name `ANTHROPIC_API_KEY`)
    - Override with `local_env_name` (header) or `local_access_key_id_env_name`/`local_secret_access_key_env_name` (SigV4)
-   - The secrets file is written once at startup with 0600 permissions; generated values are stable across config reloads
+   - The secrets file is written with 0600 permissions; existing values are reused across proxy restarts and config reloads (matched by env-var name) so a long-lived sandbox keeps working without re-sourcing the file. Reloads also drop entries for credentials no longer in the config.
 
 **Verification rules:**
 - Header credentials: the request must carry the local value in the same header that will be replaced with the real value

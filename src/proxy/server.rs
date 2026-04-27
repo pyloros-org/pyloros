@@ -122,9 +122,16 @@ impl ProxyServer {
         // Build filter engine
         let filter_engine = Arc::new(FilterEngine::new(config.rules.clone())?);
 
+        // Read existing secrets file (if any) so a restart preserves local
+        // credentials the sandbox is still using.
+        let existing_secrets = match config.proxy.generated_secrets_file.as_ref() {
+            Some(path) => read_secrets_file(path)?,
+            None => std::collections::HashMap::new(),
+        };
+
         // Build credential engine
         let (credential_engine, generated_secrets) =
-            CredentialEngine::new(config.credentials.clone())?;
+            CredentialEngine::new(config.credentials.clone(), &existing_secrets)?;
         let credential_engine = Arc::new(credential_engine);
 
         // Write secrets file if needed
@@ -534,15 +541,46 @@ impl ProxyServer {
             }
         };
 
-        // Compile new credential engine
-        let new_creds = match CredentialEngine::new(new_config.credentials.clone()) {
-            Ok((c, _generated)) => Arc::new(c),
+        // Compile new credential engine, preserving any locals already in our
+        // file so existing sandboxes keep working.
+        let existing_secrets: std::collections::HashMap<String, String> = self
+            .generated_secrets
+            .iter()
+            .map(|s| (s.env_name.clone(), s.value.clone()))
+            .collect();
+        let (new_creds, new_generated) = match CredentialEngine::new(
+            new_config.credentials.clone(),
+            &existing_secrets,
+        ) {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::error!(error = %e, "Config reload failed: credential compilation error");
                 self.reload_complete.notify_waiters();
                 return;
             }
         };
+        let new_creds = Arc::new(new_creds);
+
+        // Rewrite secrets file so additions/removals from the new config are
+        // reflected on disk.
+        if !new_generated.is_empty() {
+            let path = match new_config.proxy.generated_secrets_file.as_ref() {
+                Some(p) => p,
+                None => {
+                    tracing::error!(
+                        "Config reload failed: generated local credentials require generated_secrets_file"
+                    );
+                    self.reload_complete.notify_waiters();
+                    return;
+                }
+            };
+            if let Err(e) = write_secrets_file(path, &new_generated) {
+                tracing::error!(error = %e, path = %path, "Config reload failed: cannot write secrets file");
+                self.reload_complete.notify_waiters();
+                return;
+            }
+            tracing::info!(path = %path, count = new_generated.len(), "Rewrote generated secrets file");
+        }
 
         // Re-resolve auth credentials
         let new_auth = match new_config.resolved_auth() {
@@ -582,6 +620,7 @@ impl ProxyServer {
         self.credential_engine = new_creds;
         self.resolved_auth = new_auth;
         self.config = new_config;
+        self.generated_secrets = new_generated;
 
         // Broadcast new tunnel handler to all listeners (proxy + direct HTTPS)
         let _ = tunnel_handler_tx.send(Arc::new(self.make_tunnel_handler()));
@@ -726,6 +765,35 @@ impl ProxyServer {
     pub fn mitm_generator(&self) -> &Arc<MitmCertificateGenerator> {
         &self.mitm_generator
     }
+}
+
+/// Read an existing generated secrets file into a map of env-var name → value.
+/// Returns an empty map when the file does not exist. Malformed lines are
+/// ignored so corruption can't permanently brick the proxy.
+fn read_secrets_file(path: &str) -> Result<std::collections::HashMap<String, String>> {
+    let p = std::path::Path::new(path);
+    let contents = match std::fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => {
+            return Err(Error::config(format!(
+                "cannot read secrets file '{}': {}",
+                p.display(),
+                e
+            )))
+        }
+    };
+    let mut map = std::collections::HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            map.insert(k.trim().to_string(), v.to_string());
+        }
+    }
+    Ok(map)
 }
 
 /// Write generated secrets to a KEY=value env file with restricted permissions.
