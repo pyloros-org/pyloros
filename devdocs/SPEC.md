@@ -276,9 +276,16 @@ Without this section, the agent API returns 404 and no dashboard listener is bou
   externally. Endpoints:
   - `POST /approvals` — body: `{rules, reason?, context?, suggested_ttl?}`. Returns `202` with
     a pending id, or `200` with `status:"approved"` immediately if all proposed rules are
-    already covered by the current ruleset. Returns `429` on rate limit (60 POSTs/minute).
+    already covered by the current ruleset. Returns `429` on rate limit (60 POSTs/minute),
+    `400` on a malformed/inconsistent rule.
   - `GET /approvals/{id}?wait=60s` — long-poll the decision. Returns
     `{status, rules_applied?, ttl?, message?}`.
+
+  **Rules** are JSON objects with the same shape as a `[[rules]]` entry in the TOML config
+  (`{method, url, websocket?, git?, branches?, allow_redirects?, log_body?}`); for example
+  `{"method":"GET","url":"https://api.foo.com/*"}` for a plain HTTP rule, or
+  `{"git":"fetch","url":"https://github.com/foo/bar.git"}` for a git fetch (which expands to
+  the full smart-HTTP + LFS endpoint set, just like in the TOML config).
 
 - **Dashboard at `dashboard_bind`.** Its own dedicated listener, plain HTTP. Endpoints:
   - `GET /` — HTML page listing pending approvals; fires browser notifications via the

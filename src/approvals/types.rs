@@ -2,14 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::Rule;
+
 /// An approval request submitted by an agent inside the sandbox.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalRequest {
     /// Stable identifier assigned by the manager (e.g. `apr_...`).
     pub id: String,
 
-    /// Proposed rule(s) in short-form config syntax, e.g. `GET https://api.foo.com/*`.
-    pub rules: Vec<String>,
+    /// Proposed rule(s) in the same JSON shape as the TOML config `[[rules]]`
+    /// table (e.g. `{"method":"GET","url":"https://api.foo.com/*"}` or
+    /// `{"git":"fetch","url":"https://github.com/foo/bar.git"}`).
+    pub rules: Vec<Rule>,
 
     /// Free-text reason shown to the user in the dashboard.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,7 +78,7 @@ impl Lifetime {
 pub enum ApprovalStatus {
     Pending,
     Approved {
-        rules_applied: Vec<String>,
+        rules_applied: Vec<Rule>,
         ttl: Lifetime,
     },
     Denied {
@@ -88,7 +92,7 @@ pub struct ApprovalDecision {
     pub action: DecisionAction,
     /// If present, overrides the agent's proposed rules (user may edit).
     #[serde(default)]
-    pub rules_applied: Option<Vec<String>>,
+    pub rules_applied: Option<Vec<Rule>>,
     #[serde(default)]
     pub ttl: Option<Lifetime>,
     #[serde(default)]

@@ -13,6 +13,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
 
+use crate::config::Rule;
 use crate::filter::FilterEngine;
 
 use super::dedup;
@@ -55,7 +56,7 @@ pub async fn serve(
 #[derive(Deserialize)]
 struct PostBody {
     #[serde(default)]
-    rules: Vec<String>,
+    rules: Vec<Rule>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
@@ -124,6 +125,7 @@ async fn handle_post(
                     .boxed(),
             )
             .unwrap(),
+        Err(ApprovalError::InvalidRule(msg)) => bad_request(&format!("invalid rule: {}", msg)),
         Err(e) => bad_request(&e.to_string()),
     }
 }

@@ -339,48 +339,82 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Parse a rule from its short-form string representation.
-    ///
-    /// Examples:
-    /// - `"GET https://api.foo.com/*"`
-    /// - `"POST https://api.foo.com/v1/*"`
-    /// - `"* https://api.foo.com/*"` (any method)
-    ///
-    /// Used by the approvals feature where agents submit rule strings
-    /// rather than full TOML. Git-style rules (`git=fetch …`) are not
-    /// supported in v1 of the approvals feature — an agent that needs
-    /// one should ask the user to add it to the main config.
-    pub fn parse_shortform(s: &str) -> Result<Rule> {
-        let trimmed = s.trim();
-        let (method, url) = trimmed.split_once(char::is_whitespace).ok_or_else(|| {
-            Error::config(format!(
-                "approval rule must be 'METHOD URL' (got {:?})",
-                trimmed
-            ))
-        })?;
-        let method = method.trim();
-        let url = url.trim();
-        if method.is_empty() || url.is_empty() {
-            return Err(Error::config(format!(
-                "approval rule must be 'METHOD URL' (got {:?})",
-                trimmed
-            )));
+    /// Validate this rule for internal consistency. Used both during
+    /// TOML parsing (via `Config::validate_rule`) and on rules submitted
+    /// to the approvals API, where a Rule may arrive deserialized from
+    /// JSON without a surrounding [[rules]] index.
+    pub fn validate(&self) -> Result<()> {
+        match (&self.method, &self.git) {
+            (Some(_), Some(_)) => {
+                return Err(Error::config(
+                    "cannot have both `method` and `git` — use one or the other",
+                ));
+            }
+            (None, None) => {
+                return Err(Error::config("must have either `method` or `git`"));
+            }
+            _ => {}
         }
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(Error::config(format!(
-                "approval rule URL must start with http:// or https:// (got {:?})",
-                url
-            )));
+
+        if self.websocket && self.git.is_some() {
+            return Err(Error::config(
+                "`websocket` and `git` are mutually exclusive",
+            ));
         }
-        Ok(Rule {
-            method: Some(method.to_string()),
-            url: url.to_string(),
-            websocket: false,
-            git: None,
-            branches: None,
-            allow_redirects: Vec::new(),
-            log_body: false,
-        })
+
+        if let Some(ref git) = self.git {
+            match git.as_str() {
+                "fetch" | "push" | "*" => {}
+                other => {
+                    return Err(Error::config(format!(
+                        "invalid `git` value {:?} — must be \"fetch\", \"push\", or \"*\"",
+                        other
+                    )));
+                }
+            }
+            if self.branches.is_some() && git == "fetch" {
+                return Err(Error::config(
+                    "`branches` is only valid with `git = \"push\"` or `git = \"*\"`",
+                ));
+            }
+        }
+
+        if self.branches.is_some() && self.git.is_none() {
+            return Err(Error::config("`branches` is only valid on git rules"));
+        }
+
+        // Validate redirect URL patterns. Bare "*" is a shorthand for "any URL"
+        // and does not need to parse as a UrlPattern.
+        {
+            use crate::filter::matcher::UrlPattern;
+            for (j, pattern) in self.allow_redirects.iter().enumerate() {
+                if pattern == "*" {
+                    continue;
+                }
+                UrlPattern::new(pattern).map_err(|e| {
+                    Error::config(format!(
+                        "allow_redirects pattern #{} ({:?}) invalid: {}",
+                        j + 1,
+                        pattern,
+                        e
+                    ))
+                })?;
+            }
+        }
+
+        // Validate branch patterns: bare "!" (empty after prefix strip) is an error
+        if let Some(ref branches) = self.branches {
+            for (j, pattern) in branches.iter().enumerate() {
+                if pattern == "!" {
+                    return Err(Error::config(format!(
+                        "branch pattern #{} is bare `!` (empty pattern after prefix strip)",
+                        j + 1
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -419,80 +453,11 @@ impl Config {
         Ok(config)
     }
 
-    /// Validate a single rule for consistency
+    /// Validate a single rule for consistency, prefixing any error with
+    /// the rule's [[rules]] index.
     fn validate_rule(index: usize, rule: &Rule) -> Result<()> {
-        let ctx = |msg: &str| Error::config(format!("Rule #{}: {}", index + 1, msg));
-
-        match (&rule.method, &rule.git) {
-            (Some(_), Some(_)) => {
-                return Err(ctx(
-                    "cannot have both `method` and `git` — use one or the other",
-                ));
-            }
-            (None, None) => {
-                return Err(ctx("must have either `method` or `git`"));
-            }
-            _ => {}
-        }
-
-        if rule.websocket && rule.git.is_some() {
-            return Err(ctx("`websocket` and `git` are mutually exclusive"));
-        }
-
-        if let Some(ref git) = rule.git {
-            match git.as_str() {
-                "fetch" | "push" | "*" => {}
-                other => {
-                    return Err(ctx(&format!(
-                        "invalid `git` value {:?} — must be \"fetch\", \"push\", or \"*\"",
-                        other
-                    )));
-                }
-            }
-
-            if rule.branches.is_some() && git == "fetch" {
-                return Err(ctx(
-                    "`branches` is only valid with `git = \"push\"` or `git = \"*\"`",
-                ));
-            }
-        }
-
-        if rule.branches.is_some() && rule.git.is_none() {
-            return Err(ctx("`branches` is only valid on git rules"));
-        }
-
-        // Validate redirect URL patterns. Bare "*" is a shorthand for "any URL"
-        // and does not need to parse as a UrlPattern.
-        {
-            use crate::filter::matcher::UrlPattern;
-            for (j, pattern) in rule.allow_redirects.iter().enumerate() {
-                if pattern == "*" {
-                    continue;
-                }
-                UrlPattern::new(pattern).map_err(|e| {
-                    ctx(&format!(
-                        "allow_redirects pattern #{} ({:?}) invalid: {}",
-                        j + 1,
-                        pattern,
-                        e
-                    ))
-                })?;
-            }
-        }
-
-        // Validate branch patterns: bare "!" (empty after prefix strip) is an error
-        if let Some(ref branches) = rule.branches {
-            for (j, pattern) in branches.iter().enumerate() {
-                if pattern == "!" {
-                    return Err(ctx(&format!(
-                        "branch pattern #{} is bare `!` (empty pattern after prefix strip)",
-                        j + 1
-                    )));
-                }
-            }
-        }
-
-        Ok(())
+        rule.validate()
+            .map_err(|e| Error::config(format!("Rule #{}: {}", index + 1, e)))
     }
 
     /// Validate a single credential entry

@@ -135,17 +135,32 @@ only reachable through the proxy at the magic hostname pyloros.internal:
   POST https://pyloros.internal/approvals
   Content-Type: application/json
   {
-    "rules": ["GET https://api.example.com/*"],
+    "rules": [
+      {"method": "GET", "url": "https://api.example.com/*"}
+    ],
     "reason": "short human-readable why",
     "context": {"triggered_by": {"method": "GET", "url": "<the blocked URL>"}}
   }
+
+Each rule object uses the same fields as a [[rules]] entry in the
+pyloros TOML config. Common shapes:
+
+  {"method": "GET",  "url": "https://api.foo.com/*"}     plain HTTP rule
+  {"method": "*",    "url": "https://api.foo.com/*"}     any method
+  {"git":    "fetch","url": "https://github.com/foo/bar.git"}  git clone/fetch
+  {"git":    "push", "url": "https://github.com/foo/bar.git"}  git push
+  {"git":    "*",    "url": "https://github.com/foo/bar.git"}  fetch + push
+
+A git rule expands automatically to all the smart-HTTP endpoints the
+operation needs (info/refs, git-upload-pack/git-receive-pack, LFS), so
+you don't have to enumerate them yourself.
 
 Responses:
   - 200 {"status":"approved", ...}  — already covered by an active rule;
     proceed immediately. (Dedup short-circuit; no human round-trip.)
   - 202 {"id":"apr_...","status":"pending", ...}  — waiting on human.
   - 429  — rate limited (60 posts/minute). Back off, don't retry tightly.
-  - 400  — malformed (e.g. empty rules).
+  - 400  — malformed JSON or invalid rule shape.
 
 For pending requests, long-poll the decision:
 
@@ -157,19 +172,13 @@ Possible terminal statuses:
   - "denied"   — may include a "message" field. Respect it; do NOT retry
                  the same request or propose minor variants of the same rule.
 
-Rule shorthand: "METHOD URL" with "*" wildcards in path and "*" as method
-wildcard. Examples:
-  "GET https://api.foo.com/*"
-  "POST https://api.foo.com/v1/*"
-  "* https://api.foo.com/*"
-
 Guidelines:
   - Ask for the narrowest rule that covers your task. The human is more
-    likely to approve "GET https://api.example.com/v1/weather/*" than
-    "* https://*.example.com/*".
+    likely to approve {"method":"GET","url":"https://api.example.com/v1/weather/*"}
+    than {"method":"*","url":"https://*.example.com/*"}.
   - Always include a "reason" — the human reads it before deciding.
-  - One approval may be all you need: many endpoints under one host are
-    typically covered by a single "https://host/*" rule.
+  - For git, prefer git=fetch over a method rule — it covers all the
+    smart-HTTP endpoints and is what the human probably wants to grant.
   - If denied with a message, read it. Don't paper over it.
 
 Use Bash with curl plus --cacert "$CA_CERT" and -x "$PROXY_URL" to

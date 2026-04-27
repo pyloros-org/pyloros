@@ -59,13 +59,42 @@
         }[c]));
       }
 
+      // Format a Rule object the same way it reads in the TOML config:
+      //   {method, url}                  -> "GET https://api.foo.com/*"
+      //   {git, url}                     -> "git=fetch https://github.com/foo/bar.git"
+      //   {git, url, branches}           -> "git=push https://x   branches=[main, !release/*]"
+      // Extra flags (websocket, log_body, allow_redirects) are tacked on as
+      // suffixes so a glance reveals everything the rule says.
+      function formatRule(r) {
+        const parts = [];
+        if (r.git) {
+          parts.push(`git=${r.git}`);
+        } else if (r.method) {
+          parts.push(r.method);
+        } else {
+          parts.push('?');
+        }
+        parts.push(r.url || '');
+        const flags = [];
+        if (r.branches && r.branches.length) flags.push(`branches=[${r.branches.join(', ')}]`);
+        if (r.websocket) flags.push('websocket');
+        if (r.log_body) flags.push('log_body');
+        if (r.allow_redirects && r.allow_redirects.length) {
+          flags.push(`allow_redirects=[${r.allow_redirects.join(', ')}]`);
+        }
+        if (flags.length) parts.push('  ' + flags.join(' '));
+        return parts.join(' ');
+      }
+
       function renderCard(id, a) {
         const card = document.createElement('div');
         const resolved = a.status && a.status !== 'pending';
         card.className = 'card' + (resolved ? ' resolved' : '');
         card.dataset.id = id;
 
-        const rules = (a.rules || []).map(r => `<code>${escapeHtml(r)}</code>`).join('');
+        const rules = (a.rules || [])
+          .map(r => `<code>${escapeHtml(formatRule(r))}</code>`)
+          .join('');
         const reason = a.reason ? `<div class="reason">${escapeHtml(a.reason)}</div>` : '';
         const triggered = a.triggered_by
           ? `<div class="triggered">triggered by <code>${escapeHtml(a.triggered_by.method)} ${escapeHtml(a.triggered_by.url)}</code></div>`
@@ -120,7 +149,8 @@
 
       function maybeNotify(a) {
         if (!('Notification' in window) || Notification.permission !== 'granted') return;
-        const body = (a.rules || []).join('\n') + (a.reason ? `\n— ${a.reason}` : '');
+        const body = (a.rules || []).map(formatRule).join('\n')
+          + (a.reason ? `\n— ${a.reason}` : '');
         try {
           // requireInteraction: keep the toast visible until the user
           // dismisses it (Chrome/Edge honor this; Firefox/Safari often

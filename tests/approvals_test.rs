@@ -2,7 +2,26 @@ mod common;
 
 use common::{ok_handler, ReportingClient, TestCa, TestProxy, TestUpstream};
 use pyloros::approvals::{ApprovalStatus, Lifetime};
+use pyloros::config::Rule;
 use serde_json::json;
+
+/// Build a method Rule for tests. Mirrors the JSON shape the API now accepts.
+fn method_rule(method: &str, url: &str) -> Rule {
+    Rule {
+        method: Some(method.to_string()),
+        url: url.to_string(),
+        websocket: false,
+        git: None,
+        branches: None,
+        allow_redirects: Vec::new(),
+        log_body: false,
+    }
+}
+
+/// JSON form of `method_rule` for use inside `json!(...)` POST bodies.
+fn method_rule_json(method: &str, url: &str) -> serde_json::Value {
+    json!({"method": method, "url": url})
+}
 
 /// Test-only: start a proxy with approvals enabled and return both its
 /// address and an `Arc<ApprovalManager>` handle so tests can poke at
@@ -94,7 +113,7 @@ async fn test_post_approve_roundtrip_via_resolve_for_test() {
 
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
     let post_body = json!({
-        "rules": ["GET https://api.foo.com/*"],
+        "rules": [method_rule_json("GET", "https://api.foo.com/*")],
         "reason": "need weather data"
     })
     .to_string();
@@ -106,7 +125,7 @@ async fn test_post_approve_roundtrip_via_resolve_for_test() {
     let id = submitted["id"].as_str().expect("id present").to_string();
 
     // Resolve out-of-band (as the dashboard will in Phase 3).
-    let rules = vec!["GET https://api.foo.com/*".to_string()];
+    let rules = vec![method_rule("GET", "https://api.foo.com/*")];
     manager
         .resolve(
             &id,
@@ -127,9 +146,14 @@ async fn test_post_approve_roundtrip_via_resolve_for_test() {
     let got: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     t.assert_eq("status", &got["status"].as_str().unwrap(), &"approved");
     t.assert_eq(
-        "rules_applied",
-        &got["rules_applied"][0].as_str().unwrap(),
-        &"GET https://api.foo.com/*",
+        "rules_applied[0].method",
+        &got["rules_applied"][0]["method"].as_str().unwrap(),
+        &"GET",
+    );
+    t.assert_eq(
+        "rules_applied[0].url",
+        &got["rules_applied"][0]["url"].as_str().unwrap(),
+        &"https://api.foo.com/*",
     );
 
     proxy.shutdown();
@@ -152,7 +176,7 @@ async fn test_post_deny_with_message_returned() {
     let resp = client
         .post_with_body(
             "https://pyloros.internal/approvals",
-            json!({"rules": ["GET https://api.foo.com/*"]}).to_string(),
+            json!({"rules": [method_rule_json("GET", "https://api.foo.com/*")]}).to_string(),
         )
         .await;
     let id = serde_json::from_str::<serde_json::Value>(&resp.text().await.unwrap()).unwrap()["id"]
@@ -204,7 +228,7 @@ async fn test_long_poll_wakes_on_resolution() {
     let id = client
         .post_with_body(
             "https://pyloros.internal/approvals",
-            json!({"rules": ["GET https://x/*"]}).to_string(),
+            json!({"rules": [method_rule_json("GET", "https://x/*")]}).to_string(),
         )
         .await
         .text()
@@ -224,7 +248,7 @@ async fn test_long_poll_wakes_on_resolution() {
             .resolve(
                 &id_for_resolver,
                 ApprovalStatus::Approved {
-                    rules_applied: vec!["GET https://x/*".to_string()],
+                    rules_applied: vec![method_rule("GET", "https://x/*")],
                     ttl: Lifetime::Session,
                 },
             )
@@ -267,7 +291,7 @@ async fn test_long_poll_times_out_returns_pending() {
     let id = client
         .post_with_body(
             "https://pyloros.internal/approvals",
-            json!({"rules": ["GET https://x/*"]}).to_string(),
+            json!({"rules": [method_rule_json("GET", "https://x/*")]}).to_string(),
         )
         .await
         .text()
@@ -347,7 +371,7 @@ async fn test_dashboard_decision_approves_and_wakes_long_poll() {
         &client
             .post_with_body(
                 "https://pyloros.internal/approvals",
-                json!({"rules": ["GET https://api.foo.com/*"]}).to_string(),
+                json!({"rules": [method_rule_json("GET", "https://api.foo.com/*")]}).to_string(),
             )
             .await
             .text()
@@ -393,9 +417,14 @@ async fn test_dashboard_decision_approves_and_wakes_long_poll() {
     t.assert_eq("status", &got["status"].as_str().unwrap(), &"approved");
     t.assert_eq("ttl", &got["ttl"].as_str().unwrap(), &"one_hour");
     t.assert_eq(
-        "rules_applied defaulted to proposed",
-        &got["rules_applied"][0].as_str().unwrap(),
-        &"GET https://api.foo.com/*",
+        "rules_applied defaulted to proposed (method)",
+        &got["rules_applied"][0]["method"].as_str().unwrap(),
+        &"GET",
+    );
+    t.assert_eq(
+        "rules_applied defaulted to proposed (url)",
+        &got["rules_applied"][0]["url"].as_str().unwrap(),
+        &"https://api.foo.com/*",
     );
 
     proxy.shutdown();
@@ -443,7 +472,7 @@ async fn test_dashboard_sse_streams_pending_and_resolved() {
     // Post a new approval; a Pending event must arrive on the stream.
     let req = manager
         .post(
-            vec!["GET https://api.foo.com/*".to_string()],
+            vec![method_rule("GET", "https://api.foo.com/*")],
             Some("because".to_string()),
             None,
             None,
@@ -463,7 +492,7 @@ async fn test_dashboard_sse_streams_pending_and_resolved() {
         .resolve(
             &id,
             ApprovalStatus::Approved {
-                rules_applied: vec!["GET https://api.foo.com/*".to_string()],
+                rules_applied: vec![method_rule("GET", "https://api.foo.com/*")],
                 ttl: Lifetime::Session,
             },
         )
@@ -493,7 +522,12 @@ async fn test_dashboard_decision_with_custom_rules_and_message() {
     let manager = proxy.approvals.clone().unwrap();
 
     let req = manager
-        .post(vec!["GET https://broad/*".to_string()], None, None, None)
+        .post(
+            vec![method_rule("GET", "https://broad/*")],
+            None,
+            None,
+            None,
+        )
         .unwrap();
 
     let dashboard = reqwest::Client::builder().build().unwrap();
@@ -551,7 +585,7 @@ async fn test_approved_session_rule_unblocks_traffic() {
     let manager = proxy.approvals.clone().unwrap();
     let req = manager
         .post(
-            vec!["GET https://localhost/*".to_string()],
+            vec![method_rule("GET", "https://localhost/*")],
             None,
             None,
             None,
@@ -561,7 +595,7 @@ async fn test_approved_session_rule_unblocks_traffic() {
         .resolve(
             &req.id,
             ApprovalStatus::Approved {
-                rules_applied: vec!["GET https://localhost/*".to_string()],
+                rules_applied: vec![method_rule("GET", "https://localhost/*")],
                 ttl: Lifetime::Session,
             },
         )
@@ -585,7 +619,7 @@ async fn test_approved_session_rule_unblocks_traffic() {
 
 #[tokio::test]
 async fn test_approve_invalid_rule_rejected() {
-    let t = test_report!("Approving with an unparseable rule string fails cleanly");
+    let t = test_report!("Approving with an inconsistent Rule (no method, no git) fails cleanly");
 
     let ca = TestCa::generate();
     let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
@@ -595,15 +629,33 @@ async fn test_approve_invalid_rule_rejected() {
     let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
     let manager = proxy.approvals.clone().unwrap();
 
+    // Post a valid rule first so we have a pending approval to resolve.
     let req = manager
-        .post(vec!["this is not a rule".to_string()], None, None, None)
+        .post(
+            vec![method_rule("GET", "https://api.foo.com/*")],
+            None,
+            None,
+            None,
+        )
         .unwrap();
+
+    // Construct an invalid rule: neither `method` nor `git` set —
+    // Rule::validate rejects this.
+    let invalid = Rule {
+        method: None,
+        url: "https://api.foo.com/*".to_string(),
+        websocket: false,
+        git: None,
+        branches: None,
+        allow_redirects: Vec::new(),
+        log_body: false,
+    };
 
     let err = manager
         .resolve(
             &req.id,
             ApprovalStatus::Approved {
-                rules_applied: vec!["this is not a rule".to_string()],
+                rules_applied: vec![invalid],
                 ttl: Lifetime::Session,
             },
         )
@@ -653,7 +705,7 @@ async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
     let manager = proxy1.approvals.clone().unwrap();
     let req = manager
         .post(
-            vec!["GET https://localhost/*".to_string()],
+            vec![method_rule("GET", "https://localhost/*")],
             None,
             None,
             None,
@@ -663,7 +715,7 @@ async fn test_permanent_approval_writes_sidecar_and_persists_across_restart() {
         .resolve(
             &req.id,
             ApprovalStatus::Approved {
-                rules_applied: vec!["GET https://localhost/*".to_string()],
+                rules_applied: vec![method_rule("GET", "https://localhost/*")],
                 ttl: Lifetime::Permanent,
             },
         )
@@ -713,7 +765,7 @@ async fn test_revoke_removes_active_rule() {
 
     let req = manager
         .post(
-            vec!["GET https://localhost/*".to_string()],
+            vec![method_rule("GET", "https://localhost/*")],
             None,
             None,
             None,
@@ -723,7 +775,7 @@ async fn test_revoke_removes_active_rule() {
         .resolve(
             &req.id,
             ApprovalStatus::Approved {
-                rules_applied: vec!["GET https://localhost/*".to_string()],
+                rules_applied: vec![method_rule("GET", "https://localhost/*")],
                 ttl: Lifetime::Session,
             },
         )
@@ -773,7 +825,7 @@ async fn test_permanent_revoke_rewrites_sidecar_empty() {
 
     let req = manager
         .post(
-            vec!["GET https://localhost/*".to_string()],
+            vec![method_rule("GET", "https://localhost/*")],
             None,
             None,
             None,
@@ -783,7 +835,7 @@ async fn test_permanent_revoke_rewrites_sidecar_empty() {
         .resolve(
             &req.id,
             ApprovalStatus::Approved {
-                rules_applied: vec!["GET https://localhost/*".to_string()],
+                rules_applied: vec![method_rule("GET", "https://localhost/*")],
                 ttl: Lifetime::Permanent,
             },
         )
@@ -839,7 +891,8 @@ async fn test_dedup_auto_approves_subsumed_rule() {
     let resp = client
         .post_with_body(
             "https://pyloros.internal/approvals",
-            json!({"rules": ["GET https://api.foo.com/v1/weather"]}).to_string(),
+            json!({"rules": [method_rule_json("GET", "https://api.foo.com/v1/weather")]})
+                .to_string(),
         )
         .await;
     t.assert_eq("status", &resp.status().as_u16(), &200u16);
@@ -871,7 +924,8 @@ async fn test_rate_limit_returns_429() {
         let resp = client
             .post_with_body(
                 "https://pyloros.internal/approvals",
-                json!({"rules": [format!("GET https://api.foo.com/{}", i)]}).to_string(),
+                json!({"rules": [method_rule_json("GET", &format!("https://api.foo.com/{}", i))]})
+                    .to_string(),
             )
             .await;
         if resp.status().as_u16() == 429 {
@@ -904,6 +958,83 @@ async fn test_post_rejects_empty_rules() {
         )
         .await;
     t.assert_eq("status", &resp.status().as_u16(), &400u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+/// A git=fetch rule submitted via the API should round-trip correctly:
+/// the proposal is preserved verbatim, and once approved it expands to
+/// the full smart-HTTP endpoint set so an actual `info/refs` request to
+/// the upstream goes through.
+#[tokio::test]
+async fn test_git_fetch_rule_roundtrip() {
+    let t = test_report!("Approving a git=fetch rule unblocks /info/refs?service=git-upload-pack");
+
+    let ca = TestCa::generate();
+    // Upstream serves a stub /info/refs response — we only care that the
+    // proxy lets the request reach upstream after approval.
+    let upstream = TestUpstream::builder(&ca, ok_handler("001e# service=git-upload-pack\n0000"))
+        .report(&t, "git info/refs stub")
+        .start()
+        .await;
+    let (proxy, _sidecar) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let manager = proxy.approvals.clone().unwrap();
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+
+    // Pre-approval: even info/refs is blocked.
+    let resp = client
+        .get("https://localhost/repo/info/refs?service=git-upload-pack")
+        .await;
+    t.assert_eq("pre-approval status", &resp.status().as_u16(), &451u16);
+
+    // POST the git=fetch rule via the agent API.
+    let post_body = json!({
+        "rules": [{"git": "fetch", "url": "https://localhost/repo"}],
+        "reason": "clone the upstream repo"
+    })
+    .to_string();
+    let resp = client
+        .post_with_body("https://pyloros.internal/approvals", post_body)
+        .await;
+    t.assert_eq("POST status", &resp.status().as_u16(), &202u16);
+    let posted: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let id = posted["id"].as_str().unwrap().to_string();
+    t.assert_eq(
+        "rules[0].git preserved",
+        &posted["rules"][0]["git"].as_str().unwrap(),
+        &"fetch",
+    );
+
+    // Resolve as approved (session lifetime).
+    manager
+        .resolve(
+            &id,
+            ApprovalStatus::Approved {
+                rules_applied: vec![Rule {
+                    method: None,
+                    url: "https://localhost/repo".to_string(),
+                    websocket: false,
+                    git: Some("fetch".to_string()),
+                    branches: None,
+                    allow_redirects: Vec::new(),
+                    log_body: false,
+                }],
+                ttl: Lifetime::Session,
+            },
+        )
+        .unwrap();
+
+    // Let the rebuild signal propagate.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Post-approval: the smart-HTTP info/refs endpoint is now allowed.
+    let client2 = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client2
+        .get("https://localhost/repo/info/refs?service=git-upload-pack")
+        .await;
+    t.assert_eq("post-approval info/refs", &resp.status().as_u16(), &200u16);
 
     proxy.shutdown();
     upstream.shutdown();

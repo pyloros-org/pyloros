@@ -147,11 +147,18 @@ impl ApprovalManager {
     /// (60 POSTs/minute per manager); exceeding returns `RateLimited`.
     pub fn post(
         &self,
-        rules: Vec<String>,
+        rules: Vec<Rule>,
         reason: Option<String>,
         triggered_by: Option<TriggeredBy>,
         suggested_ttl: Option<Lifetime>,
     ) -> Result<ApprovalRequest, ApprovalError> {
+        // Validate each rule before consuming a rate-limit slot — a
+        // malformed proposal shouldn't burn quota.
+        for rule in &rules {
+            rule.validate()
+                .map_err(|e| ApprovalError::InvalidRule(format!("{}", e)))?;
+        }
+
         // Rate limit check. Prune entries older than the window, then
         // compare against the cap.
         {
@@ -229,11 +236,11 @@ impl ApprovalManager {
     /// Resolve an approval with the given final status. Used by the
     /// dashboard decision endpoint and the test-only helper.
     ///
-    /// On approve, parses the `rules_applied` strings into `Rule`s and
-    /// appends them to the active set, then signals the server to rebuild
-    /// the effective FilterEngine. If any rule fails to parse, the whole
-    /// resolve is rejected with `InvalidRule` and the approval stays
-    /// pending (so the user can edit and retry from the dashboard).
+    /// On approve, validates `rules_applied` and appends them to the
+    /// active set, then signals the server to rebuild the effective
+    /// FilterEngine. If any rule fails validation, the whole resolve is
+    /// rejected with `InvalidRule` and the approval stays pending (so
+    /// the user can edit and retry from the dashboard).
     pub fn resolve(
         self: &Arc<Self>,
         id: &str,
@@ -245,19 +252,16 @@ impl ApprovalManager {
             ));
         }
 
-        // Parse-before-lock: if the rules don't parse, we want to error
-        // out *without* mutating state, so the user can retry from the
-        // dashboard.
+        // Validate-before-lock: if the rules don't pass validation we
+        // want to error out *without* mutating state, so the user can
+        // retry from the dashboard.
         let parsed_rules: Vec<Rule> = match &status {
             ApprovalStatus::Approved { rules_applied, .. } => {
-                let mut out = Vec::with_capacity(rules_applied.len());
                 for r in rules_applied {
-                    out.push(
-                        Rule::parse_shortform(r)
-                            .map_err(|e| ApprovalError::InvalidRule(format!("{}: {}", r, e)))?,
-                    );
+                    r.validate()
+                        .map_err(|e| ApprovalError::InvalidRule(format!("{}", e)))?;
                 }
-                out
+                rules_applied.clone()
             }
             _ => Vec::new(),
         };
