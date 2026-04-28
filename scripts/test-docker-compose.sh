@@ -274,21 +274,32 @@ else
     echo "$OUTPUT" | tail -10 | sed 's/^/    /'
 fi
 
-# --- Config reload tests ---
+# --- Config reload test ---
 # The proxy is supposed to detect edits to its config file and reload rules
-# without a restart. With docker bind-mounted config files, inotify on the
-# parent directory inside the container does not see host-side renames, so we
-# test both editor patterns (atomic rename via mv, and in-place truncate+write).
+# without a restart. We exercise the in-place-rewrite editor pattern (write
+# truncates the existing inode), which is what the proxy can actually
+# observe across a docker single-file bind-mount.
+#
+# Atomic-rename saves (vim default, `mv -f new old`) cannot be tested here:
+# docker bind-mounts a single file by inode at mount time, so a host-side
+# rename detaches the bind-mount from the new content — the container keeps
+# reading the original (orphaned) inode. To support live reload across all
+# editor save patterns, users should bind-mount the *directory* containing
+# config.toml instead of the single file. See devdocs/lessons/.
 
-# Helper: wait until $1 returns 0, up to ~10s. Returns the last exit code.
-wait_for() {
-    local i=0
-    while (( i < 20 )); do
-        if "$@"; then return 0; fi
+# wait_for_uuid_allowed: polls the sandbox for up to ~30s waiting for the
+# httpbin.org/uuid request to return 200. Returns 0 on success, non-zero on
+# timeout. Each `docker compose exec` takes a few hundred ms, so we cap by
+# attempt count rather than by wallclock seconds.
+wait_for_uuid_allowed() {
+    local i
+    for (( i = 0; i < 60; i++ )); do
+        local code
+        code=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>/dev/null || true)
+        if [[ "$code" == "200" ]]; then return 0; fi
         sleep 0.5
-        i=$((i + 1))
     done
-    "$@"
+    return 1
 }
 
 # Sanity: httpbin.org/uuid is currently blocked (only /robots.txt is allowed)
@@ -303,60 +314,28 @@ else
     fail "Expected 451 before reload, got '$HTTP_CODE'"
 fi
 
-# Test 10: Atomic-rename edit (typical editor save) triggers reload
-echo "Test 10: Config reload after atomic-rename edit (mv tmp config)"
-TMP_CFG="${CONFIG_FILE}.new"
-cp "$CONFIG_FILE" "$TMP_CFG"
-cat >> "$TMP_CFG" <<'EOF'
+# Test 10: In-place rewrite (truncate+write) triggers reload
+echo "Test 10: Config reload after in-place rewrite"
+# `cat >` truncates and rewrites the existing inode — the container's
+# bind-mounted file sees the new contents.
+cat >> "$CONFIG_FILE" <<'EOF'
 
 [[rules]]
 method = "GET"
 url = "https://httpbin.org/uuid"
 EOF
-mv -f "$TMP_CFG" "$CONFIG_FILE"
 
 set +e
-wait_for bash -c 'HTTP_CODE=$(docker compose -f "'"$COMPOSE_FILE"'" exec -T sandbox curl -so /dev/null -w "%{http_code}" https://httpbin.org/uuid 2>/dev/null); [[ "$HTTP_CODE" == "200" ]]'
+wait_for_uuid_allowed
 RELOAD_RC=$?
 HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
 set -e
 if [[ $RELOAD_RC -eq 0 && "$HTTP_CODE" == "200" ]]; then
-    pass "Atomic-rename edit triggered reload (httpbin.org/uuid now 200)"
+    pass "In-place rewrite triggered reload (httpbin.org/uuid now 200)"
 else
-    fail "Atomic-rename edit did not trigger reload (final HTTP=$HTTP_CODE)"
-    echo "    --- proxy logs (last 20 lines) ---"
-    dc logs --tail=20 proxy 2>&1 | sed 's/^/    /' || true
-fi
-
-# Test 11: In-place rewrite (truncate+write) triggers reload
-echo "Test 11: Config reload after in-place rewrite"
-# Remove the rule we just added so we can re-add it and observe a reload.
-# Use python or awk to strip the trailing rule block we appended.
-# Simpler: rewrite the file from the original example plus a different rule.
-cp "$PROJECT_DIR/examples/docker-compose/config.toml" "$CONFIG_FILE.original"
-# Truncate-write in place (no rename): cat > replaces contents but keeps inode.
-cat "$CONFIG_FILE.original" > "$CONFIG_FILE"
-cat >> "$CONFIG_FILE" <<'EOF'
-
-[[rules]]
-method = "GET"
-url = "https://httpbin.org/anything"
-EOF
-rm -f "$CONFIG_FILE.original"
-
-set +e
-wait_for bash -c 'HTTP_CODE=$(docker compose -f "'"$COMPOSE_FILE"'" exec -T sandbox curl -so /dev/null -w "%{http_code}" https://httpbin.org/anything 2>/dev/null); [[ "$HTTP_CODE" == "200" ]]'
-RELOAD_RC=$?
-HTTP_CODE2=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/anything 2>&1)
-# After this rewrite, /uuid is no longer in the rules — should be back to 451.
-HTTP_CODE_UUID=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
-set -e
-if [[ $RELOAD_RC -eq 0 && "$HTTP_CODE2" == "200" && "$HTTP_CODE_UUID" == "451" ]]; then
-    pass "In-place rewrite triggered reload (httpbin.org/anything=200, /uuid=451)"
-else
-    fail "In-place rewrite reload failed (anything=$HTTP_CODE2, uuid=$HTTP_CODE_UUID)"
-    echo "    --- proxy logs (last 20 lines) ---"
-    dc logs --tail=20 proxy 2>&1 | sed 's/^/    /' || true
+    fail "In-place rewrite did not trigger reload (final HTTP=$HTTP_CODE, wait_rc=$RELOAD_RC)"
+    echo "    --- proxy logs (last 30 lines) ---"
+    dc logs --tail=30 proxy 2>&1 | sed 's/^/    /' || true
 fi
 
 # Summary

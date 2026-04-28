@@ -400,6 +400,7 @@ impl ProxyServer {
         // Spawn file watcher and SIGHUP handler if config_path is set
         if let Some(ref config_path) = self.config_path {
             spawn_file_watcher(config_path.clone(), reload_tx.clone());
+            spawn_file_poller(config_path.clone(), reload_tx.clone());
             #[cfg(unix)]
             spawn_sighup_handler(reload_tx.clone());
         }
@@ -954,6 +955,49 @@ fn spawn_file_watcher(config_path: PathBuf, reload_tx: tokio::sync::mpsc::Sender
                     tracing::warn!(error = %e, "Config file watcher error");
                 }
                 Err(_) => break, // watcher dropped
+            }
+        }
+    });
+}
+
+/// Spawn a background thread that polls the config file's contents and
+/// triggers a reload when they change.
+///
+/// Why polling exists alongside the inotify-based watcher: when the config
+/// file is bind-mounted from the host into a container (the typical Docker
+/// Compose deployment), inotify on the parent directory inside the container
+/// does not see host-side edits — neither atomic-rename saves nor in-place
+/// rewrites propagate as events on the container's parent dir, so the
+/// inotify watcher never fires. Polling closes that gap. It runs every
+/// ~2 seconds, hashes the file's contents, and fires a reload when the hash
+/// changes. Redundant fires (when inotify also sees the change) are
+/// harmless — the reload path is idempotent and the receiver debounces.
+fn spawn_file_poller(config_path: PathBuf, reload_tx: tokio::sync::mpsc::Sender<()>) {
+    use std::hash::{Hash, Hasher};
+    std::thread::spawn(move || {
+        let interval = std::time::Duration::from_secs(2);
+        let signature = |p: &std::path::Path| -> Option<u64> {
+            let bytes = std::fs::read(p).ok()?;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            Some(hasher.finish())
+        };
+        let mut last = signature(&config_path);
+        loop {
+            std::thread::sleep(interval);
+            let cur = signature(&config_path);
+            if let Some(cur_sig) = cur {
+                if last != Some(cur_sig) {
+                    if last.is_some() {
+                        tracing::debug!(
+                            "Config file change detected via polling, triggering reload"
+                        );
+                        if reload_tx.blocking_send(()).is_err() {
+                            break; // server shut down
+                        }
+                    }
+                    last = Some(cur_sig);
+                }
             }
         }
     });
