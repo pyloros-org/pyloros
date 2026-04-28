@@ -83,6 +83,11 @@ async fn test_restart_preserves_generated_sigv4_local_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let secrets_path = dir.path().join("secrets.env");
 
+    // Set real-credential env vars; the local env-var names default to
+    // these via inference from the ${VAR} placeholders.
+    std::env::set_var("RESTART_AWS_AKID", "AKIAREAL_FOR_TEST");
+    std::env::set_var("RESTART_AWS_SAK", "REAL_SECRET_FOR_TEST");
+
     let config_toml = build_config(
         &ca,
         &secrets_path,
@@ -90,8 +95,8 @@ async fn test_restart_preserves_generated_sigv4_local_credentials() {
 [[credentials]]
 type = "aws-sigv4"
 url = "https://*.amazonaws.com/*"
-access_key_id = "AKIAREAL"
-secret_access_key = "REALSECRET"
+access_key_id = "${RESTART_AWS_AKID}"
+secret_access_key = "${RESTART_AWS_SAK}"
 local_generated = true
 "#,
     );
@@ -99,20 +104,20 @@ local_generated = true
     let config = pyloros::Config::parse(&config_toml).unwrap();
     let _s1 = pyloros::ProxyServer::new(config).unwrap();
     let first = read_secrets_file(&secrets_path);
-    let akid = first["AWS_ACCESS_KEY_ID"].clone();
-    let sak = first["AWS_SECRET_ACCESS_KEY"].clone();
+    let akid = first["RESTART_AWS_AKID"].clone();
+    let sak = first["RESTART_AWS_SAK"].clone();
 
     let config2 = pyloros::Config::parse(&config_toml).unwrap();
     let _s2 = pyloros::ProxyServer::new(config2).unwrap();
     let second = read_secrets_file(&secrets_path);
     t.assert_eq(
         "AKID preserved",
-        &second["AWS_ACCESS_KEY_ID"].as_str(),
+        &second["RESTART_AWS_AKID"].as_str(),
         &akid.as_str(),
     );
     t.assert_eq(
         "SAK preserved",
-        &second["AWS_SECRET_ACCESS_KEY"].as_str(),
+        &second["RESTART_AWS_SAK"].as_str(),
         &sak.as_str(),
     );
 }

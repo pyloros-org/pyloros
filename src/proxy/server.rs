@@ -797,6 +797,10 @@ fn read_secrets_file(path: &str) -> Result<std::collections::HashMap<String, Str
 }
 
 /// Write generated secrets to a KEY=value env file with restricted permissions.
+///
+/// On Unix the file is opened with mode 0o600 atomically (no chmod-after-create
+/// window in which a third party could read the file). On non-Unix platforms
+/// permissions are not set explicitly.
 fn write_secrets_file(path: &str, secrets: &[GeneratedSecret]) -> Result<()> {
     use std::io::Write;
     let path = std::path::Path::new(path);
@@ -811,7 +815,20 @@ fn write_secrets_file(path: &str, secrets: &[GeneratedSecret]) -> Result<()> {
             })?;
         }
     }
-    let mut file = std::fs::File::create(path).map_err(|e| {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+        // If the file already exists with broader permissions, OpenOptions::mode
+        // is a no-op for the existing file — fix it explicitly.
+        if path.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    let mut file = opts.open(path).map_err(|e| {
         Error::config(format!(
             "cannot create secrets file '{}': {}",
             path.display(),
@@ -826,11 +843,6 @@ fn write_secrets_file(path: &str, secrets: &[GeneratedSecret]) -> Result<()> {
                 e
             ))
         })?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
     }
     Ok(())
 }

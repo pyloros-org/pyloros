@@ -507,13 +507,16 @@ Every credential entry must have a corresponding **local credential** — a subs
 2. **Generated** — the proxy generates a random local credential at startup and writes it to a secrets env file:
    - `local_generated = true` on any credential type
    - The proxy writes all generated values to `generated_secrets_file` (configured in `[proxy]`) in `KEY=value` format
-   - Default env var names are inferred from the `${VAR}` references in the real credential fields (e.g., `value = "${ANTHROPIC_API_KEY}"` → env name `ANTHROPIC_API_KEY`)
+   - Default env var names are inferred from the `${VAR}` reference in the real credential field (e.g., `value = "${ANTHROPIC_API_KEY}"` → env name `ANTHROPIC_API_KEY`). When the real field is a literal (no `${VAR}`), config validation requires the explicit `local_env_name` / `local_access_key_id_env_name` / `local_secret_access_key_env_name` field — there is **no** fallback to header names or AWS env-var names, since header names are not valid POSIX identifiers and the inferred name is part of the contract with the sandbox.
    - Override with `local_env_name` (header) or `local_access_key_id_env_name`/`local_secret_access_key_env_name` (SigV4)
-   - The secrets file is written with 0600 permissions; existing values are reused across proxy restarts and config reloads (matched by env-var name) so a long-lived sandbox keeps working without re-sourcing the file. Reloads also drop entries for credentials no longer in the config.
+   - The secrets file is written atomically with 0600 permissions (Unix); existing values are reused across proxy restarts and config reloads (matched by env-var name) so a long-lived sandbox keeps working without re-sourcing the file. Reloads also drop entries for credentials no longer in the config.
+
+**Value templates:** the real `value` (header) and `access_key_id` / `secret_access_key` (SigV4) fields accept at most one `${VAR}` placeholder, in the form `prefix${VAR}suffix`. Multiple placeholders are rejected — the proxy needs the literal prefix/suffix to verify the agent's header.
 
 **Verification rules:**
-- Header credentials: the request must carry the local value in the same header that will be replaced with the real value
+- Header credentials: when the real value is `prefix${VAR}suffix`, the incoming header must start with `prefix`, end with `suffix`, and the middle must equal the local secret. For `value = "Bearer ${TOKEN}"`, the agent sends `Authorization: Bearer <local-token>` and the proxy strips the `Bearer ` prefix before comparing. For literal real values (no `${VAR}`), the entire header value must match the local secret exactly.
 - SigV4 credentials: the proxy performs full SigV4 signature verification using the local `access_key_id` and `secret_access_key`, ensuring the agent actually possesses the local secret key (not just the key ID)
+- On mismatch the audit entry includes the failing credential's `type` and `url_pattern` so operators can identify which rule the sandbox failed against.
 
 **Generated value formats:**
 - Header: 32-byte random hex string (64 characters)

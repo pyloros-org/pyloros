@@ -524,5 +524,58 @@ async fn test_aws_sts_through_proxy() {
         return;
     }
 
-    t.action("SKIP: test requires manual setup");
+    let ca = TestCa::generate();
+    let real_key = std::env::var("AWS_ACCESS_KEY_ID").unwrap();
+    let real_secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap();
+
+    // No upstream override — connect to real AWS endpoints.
+    let mut config = pyloros::Config::minimal(
+        "127.0.0.1:0".to_string(),
+        ca.cert_path.clone(),
+        ca.key_path.clone(),
+    );
+    config.rules = vec![rule("*", "https://*.amazonaws.com/*")];
+    config.credentials = vec![aws_cred(
+        "https://*.amazonaws.com/*",
+        &real_key,
+        &real_secret,
+        std::env::var("AWS_SESSION_TOKEN").ok().as_deref(),
+    )];
+
+    let mut server = pyloros::ProxyServer::new(config).unwrap();
+    let addr = server.bind().await.unwrap().tcp_addr();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = server.serve(shutdown_rx).await;
+    });
+    t.setup(format!("Proxy at {}", addr));
+
+    // Run aws sts get-caller-identity. The agent uses the LOCAL keys; the
+    // proxy verifies SigV4 with those, then re-signs with the real keys.
+    let output = std::process::Command::new("aws")
+        .args(["sts", "get-caller-identity"])
+        .env("HTTPS_PROXY", format!("http://{}", addr))
+        .env("AWS_CA_BUNDLE", &ca.cert_path)
+        .env("AWS_ACCESS_KEY_ID", LOCAL_KEY_ID)
+        .env("AWS_SECRET_ACCESS_KEY", LOCAL_SECRET)
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .env_remove("AWS_SESSION_TOKEN")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    t.output("stdout", &stdout);
+    t.output("stderr", &stderr);
+
+    assert!(
+        output.status.success(),
+        "aws sts get-caller-identity failed (exit code {:?}):\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    t.assert_contains("output has Account", &stdout, "Account");
+
+    let _ = shutdown_tx.send(());
 }

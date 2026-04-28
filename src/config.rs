@@ -712,6 +712,99 @@ fn extract_host_from_url(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
+/// A credential value template with at most one `${VAR}` substitution.
+///
+/// Credentials carry a substitute "local" credential that the agent presents
+/// to the proxy; the proxy verifies it against what the agent sent and then
+/// rewrites the request with the real credential. To verify an incoming
+/// header that the agent has constructed itself (e.g. `Authorization: Bearer
+/// <token>`), we need to know the literal prefix/suffix around the variable
+/// so we can isolate the secret portion. Hence at-most-one variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialTemplate {
+    /// No `${VAR}` substitution — value is taken as-is.
+    Literal(String),
+    /// `prefix${var_name}suffix` form. `prefix` and `suffix` may be empty.
+    Variable {
+        prefix: String,
+        var_name: String,
+        suffix: String,
+    },
+}
+
+impl CredentialTemplate {
+    /// The env-var name when this template has a variable, else `None`.
+    pub fn var_name(&self) -> Option<&str> {
+        match self {
+            CredentialTemplate::Variable { var_name, .. } => Some(var_name),
+            CredentialTemplate::Literal(_) => None,
+        }
+    }
+
+    /// Resolve to the final string by substituting the env var (if any).
+    pub fn resolve(&self) -> Result<String> {
+        match self {
+            CredentialTemplate::Literal(s) => Ok(s.clone()),
+            CredentialTemplate::Variable {
+                prefix,
+                var_name,
+                suffix,
+            } => {
+                let v = std::env::var(var_name).map_err(|_| {
+                    Error::config(format!(
+                        "environment variable '{}' is not set (required by credential)",
+                        var_name
+                    ))
+                })?;
+                Ok(format!("{}{}{}", prefix, v, suffix))
+            }
+        }
+    }
+}
+
+/// Parse a credential value into a `CredentialTemplate`.
+///
+/// Allows zero or one `${VAR}` placeholder. Returns an error for unbalanced
+/// braces, empty variable names, or multiple placeholders.
+pub fn parse_credential_template(value: &str) -> Result<CredentialTemplate> {
+    let mut occurrences: Vec<(usize, usize, String)> = Vec::new();
+    let mut idx = 0;
+    while let Some(rel) = value[idx..].find("${") {
+        let start = idx + rel;
+        let after = &value[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| Error::config("unclosed ${...} in credential value"))?;
+        let var_name = &after[..end];
+        if var_name.is_empty() {
+            return Err(Error::config(
+                "empty variable name in ${} placeholder of credential value",
+            ));
+        }
+        if var_name.contains('$') || var_name.contains('{') {
+            return Err(Error::config(
+                "nested ${...} placeholders not supported in credential value",
+            ));
+        }
+        occurrences.push((start, start + 2 + end, var_name.to_string()));
+        idx = start + 2 + end + 1;
+    }
+    match occurrences.len() {
+        0 => Ok(CredentialTemplate::Literal(value.to_string())),
+        1 => {
+            let (start, end, var_name) = occurrences.into_iter().next().unwrap();
+            Ok(CredentialTemplate::Variable {
+                prefix: value[..start].to_string(),
+                var_name,
+                suffix: value[end + 1..].to_string(),
+            })
+        }
+        _ => Err(Error::config(
+            "credential value must contain at most one ${VAR} placeholder",
+        )),
+    }
+}
+
 /// Extract the env var name from a simple `${VAR}` placeholder.
 /// Returns None if the string is not a simple `${VAR}` pattern.
 pub fn extract_env_var_name(value: &str) -> Option<&str> {
@@ -1683,6 +1776,79 @@ local_generated = true
         t.assert_eq("empty", &extract_env_var_name("${}"), &None);
         t.assert_eq("nested braces", &extract_env_var_name("${A{B}}"), &None);
         t.assert_eq("plain string", &extract_env_var_name("just-a-value"), &None);
+    }
+
+    // --- Credential template parsing tests ---
+
+    #[test]
+    fn test_parse_credential_template_simple_var() {
+        let t = test_report!("parse_credential_template parses bare ${VAR}");
+        let parsed = parse_credential_template("${TOKEN}").unwrap();
+        t.assert_eq(
+            "Variable form",
+            &parsed,
+            &CredentialTemplate::Variable {
+                prefix: String::new(),
+                var_name: "TOKEN".to_string(),
+                suffix: String::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_parse_credential_template_prefix_suffix() {
+        let t = test_report!("parse_credential_template captures prefix and suffix");
+        let parsed = parse_credential_template("Bearer ${TOKEN}!").unwrap();
+        t.assert_eq(
+            "Variable with prefix/suffix",
+            &parsed,
+            &CredentialTemplate::Variable {
+                prefix: "Bearer ".to_string(),
+                var_name: "TOKEN".to_string(),
+                suffix: "!".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_parse_credential_template_literal() {
+        let t = test_report!("parse_credential_template returns Literal for plain string");
+        let parsed = parse_credential_template("plain-value").unwrap();
+        t.assert_eq(
+            "Literal",
+            &parsed,
+            &CredentialTemplate::Literal("plain-value".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parse_credential_template_rejects_multiple_vars() {
+        let err = parse_credential_template("${A}-${B}").unwrap_err();
+        assert!(
+            format!("{}", err).contains("at most one"),
+            "expected 'at most one' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_credential_template_rejects_unclosed() {
+        let err = parse_credential_template("Bearer ${TOKEN").unwrap_err();
+        assert!(
+            format!("{}", err).contains("unclosed"),
+            "expected 'unclosed' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_credential_template_rejects_empty_var() {
+        let err = parse_credential_template("${}").unwrap_err();
+        assert!(
+            format!("{}", err).contains("empty"),
+            "expected 'empty' error, got: {}",
+            err
+        );
     }
 
     // --- Random generation tests ---

@@ -5,16 +5,23 @@ use std::collections::HashMap;
 
 use super::matcher::UrlPattern;
 use crate::config::{
-    extract_env_var_name, generate_fake_access_key_id, generate_fake_secret_access_key,
-    generate_random_header_value, resolve_credential_value, Credential, LocalHeaderConfig,
-    LocalSigV4Config,
+    generate_fake_access_key_id, generate_fake_secret_access_key, generate_random_header_value,
+    parse_credential_template, resolve_credential_value, Credential, CredentialTemplate,
+    LocalHeaderConfig, LocalSigV4Config,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::filter::RequestInfo;
 
 /// Resolved local credential for header type.
+///
+/// The agent constructs the header itself, substituting its env var into the
+/// template the operator put in `value` (e.g. `Bearer ${TOKEN}`). To verify,
+/// the proxy isolates the variable portion of the incoming header by stripping
+/// the literal `prefix` and `suffix`, then compares the middle to `value`.
 pub struct ResolvedLocalHeader {
+    pub prefix: String,
     pub value: String,
+    pub suffix: String,
 }
 
 /// Resolved local credential for SigV4 type.
@@ -68,6 +75,20 @@ impl ResolvedCredential {
     }
 }
 
+/// Match a header value against a resolved local credential, isolating the
+/// variable portion of `actual` by stripping the literal prefix and suffix
+/// before comparing the middle to the resolved local secret.
+fn header_matches_local(actual: &str, local: &ResolvedLocalHeader) -> bool {
+    if !actual.starts_with(local.prefix.as_str()) || !actual.ends_with(local.suffix.as_str()) {
+        return false;
+    }
+    if actual.len() < local.prefix.len() + local.suffix.len() {
+        return false;
+    }
+    let middle = &actual[local.prefix.len()..actual.len() - local.suffix.len()];
+    middle == local.value
+}
+
 /// Engine that matches requests and injects credentials into headers.
 pub struct CredentialEngine {
     credentials: Vec<ResolvedCredential>,
@@ -95,20 +116,37 @@ impl CredentialEngine {
                     value,
                     local,
                 } => {
-                    let resolved_value = resolve_credential_value(value)?;
+                    let template = parse_credential_template(value)?;
+                    let resolved_value = template.resolve()?;
                     let url_pattern = UrlPattern::new(url)?;
+
+                    let (prefix, suffix) = match &template {
+                        CredentialTemplate::Variable { prefix, suffix, .. } => {
+                            (prefix.clone(), suffix.clone())
+                        }
+                        CredentialTemplate::Literal(_) => (String::new(), String::new()),
+                    };
 
                     let resolved_local = match local {
                         LocalHeaderConfig::Value(v) => {
                             let local_value = resolve_credential_value(v)?;
-                            ResolvedLocalHeader { value: local_value }
+                            ResolvedLocalHeader {
+                                prefix,
+                                value: local_value,
+                                suffix,
+                            }
                         }
                         LocalHeaderConfig::Generated { env_name } => {
-                            let env = env_name
-                                .as_deref()
-                                .or_else(|| extract_env_var_name(value))
-                                .unwrap_or(header)
-                                .to_string();
+                            let env = match env_name.as_deref() {
+                                Some(n) => n.to_string(),
+                                None => template
+                                    .var_name()
+                                    .ok_or_else(|| Error::config(format!(
+                                        "header credential at {} with local_generated requires local_env_name when `value` has no ${{VAR}} placeholder",
+                                        url
+                                    )))?
+                                    .to_string(),
+                            };
                             let value = existing
                                 .get(&env)
                                 .cloned()
@@ -117,7 +155,11 @@ impl CredentialEngine {
                                 env_name: env,
                                 value: value.clone(),
                             });
-                            ResolvedLocalHeader { value }
+                            ResolvedLocalHeader {
+                                prefix,
+                                value,
+                                suffix,
+                            }
                         }
                     };
 
@@ -136,8 +178,10 @@ impl CredentialEngine {
                     session_token,
                     local,
                 } => {
-                    let access_key_id = resolve_credential_value(access_key_id)?;
-                    let secret_access_key = resolve_credential_value(secret_access_key)?;
+                    let akid_template = parse_credential_template(access_key_id)?;
+                    let sak_template = parse_credential_template(secret_access_key)?;
+                    let resolved_akid = akid_template.resolve()?;
+                    let resolved_sak = sak_template.resolve()?;
                     let session_token = session_token
                         .as_deref()
                         .map(resolve_credential_value)
@@ -160,14 +204,26 @@ impl CredentialEngine {
                             access_key_id_env_name,
                             secret_access_key_env_name,
                         } => {
-                            let akid_env = access_key_id_env_name
-                                .as_deref()
-                                .unwrap_or("AWS_ACCESS_KEY_ID")
-                                .to_string();
-                            let sak_env = secret_access_key_env_name
-                                .as_deref()
-                                .unwrap_or("AWS_SECRET_ACCESS_KEY")
-                                .to_string();
+                            let akid_env = match access_key_id_env_name.as_deref() {
+                                Some(n) => n.to_string(),
+                                None => akid_template
+                                    .var_name()
+                                    .ok_or_else(|| Error::config(format!(
+                                        "aws-sigv4 credential at {} with local_generated requires local_access_key_id_env_name when `access_key_id` has no ${{VAR}} placeholder",
+                                        url
+                                    )))?
+                                    .to_string(),
+                            };
+                            let sak_env = match secret_access_key_env_name.as_deref() {
+                                Some(n) => n.to_string(),
+                                None => sak_template
+                                    .var_name()
+                                    .ok_or_else(|| Error::config(format!(
+                                        "aws-sigv4 credential at {} with local_generated requires local_secret_access_key_env_name when `secret_access_key` has no ${{VAR}} placeholder",
+                                        url
+                                    )))?
+                                    .to_string(),
+                            };
                             let akid = existing
                                 .get(&akid_env)
                                 .cloned()
@@ -194,8 +250,8 @@ impl CredentialEngine {
                     resolved.push(ResolvedCredential::AwsSigV4 {
                         url_pattern,
                         url_display: url.clone(),
-                        access_key_id,
-                        secret_access_key,
+                        access_key_id: resolved_akid,
+                        secret_access_key: resolved_sak,
                         session_token,
                         local: resolved_local,
                     });
@@ -398,8 +454,11 @@ impl CredentialEngine {
                 ..
             } = cred
             {
-                let actual = headers.get(header.as_str()).and_then(|v| v.to_str().ok());
-                if actual != Some(&local.value) {
+                let actual = headers
+                    .get(header.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if !header_matches_local(actual, local) {
                     return Err(LocalCredentialMismatch {
                         credential_url: url_display.clone(),
                         credential_type: "header".to_string(),
@@ -428,8 +487,11 @@ impl CredentialEngine {
                     url_display,
                     ..
                 } => {
-                    let actual = headers.get(header.as_str()).and_then(|v| v.to_str().ok());
-                    if actual != Some(&local.value) {
+                    let actual = headers
+                        .get(header.as_str())
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if !header_matches_local(actual, local) {
                         return Err(LocalCredentialMismatch {
                             credential_url: url_display.clone(),
                             credential_type: "header".to_string(),

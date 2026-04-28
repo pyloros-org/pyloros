@@ -106,6 +106,138 @@ async fn test_credential_authorization_bearer() {
     upstream.shutdown();
 }
 
+/// When `value = "Bearer ${TOKEN}"`, the proxy parses out the literal "Bearer "
+/// prefix during verification: the sandbox is expected to send
+/// `Authorization: Bearer <local-token>`, NOT a bare local-token.
+#[tokio::test]
+async fn test_bearer_template_verifies_against_prefixed_header() {
+    let t = test_report!("Bearer ${TOKEN} template strips prefix on verify");
+    std::env::set_var("CREDTEST_REAL_TOKEN", "real-bearer-token");
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, echo_handler())
+        .report(&t, "echo")
+        .start()
+        .await;
+    let proxy = TestProxy::builder(&ca, vec![rule("*", "https://localhost/*")], upstream.port())
+        .credentials(vec![Credential::Header {
+            url: "https://localhost/*".to_string(),
+            header: "authorization".to_string(),
+            value: "Bearer ${CREDTEST_REAL_TOKEN}".to_string(),
+            local: LocalHeaderConfig::Value("local-token".to_string()),
+        }])
+        .report(&t)
+        .start()
+        .await;
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+
+    // Sandbox sends "Bearer local-token" (the standard format with its own
+    // env-var substituted). Proxy strips "Bearer ", checks middle == "local-token",
+    // then forwards "Bearer real-bearer-token".
+    let resp = client
+        .get_with_header(
+            "https://localhost/test",
+            "authorization",
+            "Bearer local-token",
+        )
+        .await;
+    t.assert_eq("status", &resp.status().as_u16(), &200u16);
+    let body = resp.text().await.unwrap();
+    t.assert_contains(
+        "real bearer token forwarded",
+        &body,
+        "authorization: Bearer real-bearer-token",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+/// A bare token without the "Bearer " prefix must NOT verify, because the
+/// real value template includes the prefix and the sandbox is expected to
+/// match that shape.
+#[tokio::test]
+async fn test_bearer_template_rejects_bare_token() {
+    let t = test_report!("Bearer ${TOKEN} rejects bare-token header");
+    std::env::set_var("CREDTEST_REAL_TOKEN_2", "real-token-2");
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, echo_handler())
+        .report(&t, "echo")
+        .start()
+        .await;
+    let proxy = TestProxy::builder(&ca, vec![rule("*", "https://localhost/*")], upstream.port())
+        .credentials(vec![Credential::Header {
+            url: "https://localhost/*".to_string(),
+            header: "authorization".to_string(),
+            value: "Bearer ${CREDTEST_REAL_TOKEN_2}".to_string(),
+            local: LocalHeaderConfig::Value("local-token".to_string()),
+        }])
+        .report(&t)
+        .start()
+        .await;
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+
+    // No "Bearer " prefix → must reject.
+    let resp = client
+        .get_with_header("https://localhost/test", "authorization", "local-token")
+        .await;
+    t.assert_eq("status", &resp.status().as_u16(), &403u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+/// `local_generated = true` with a literal `value` (no ${VAR}) is rejected
+/// at config time: there is no env-var name to infer, and the agent has no
+/// substitution slot to use the generated secret.
+#[test]
+fn test_local_generated_with_literal_value_is_rejected() {
+    let t = test_report!("local_generated requires ${VAR} in value or explicit local_env_name");
+    let toml = r#"
+[proxy]
+generated_secrets_file = "/tmp/x.env"
+
+[[credentials]]
+url = "https://example.com/*"
+header = "x-api-key"
+value = "literal-no-template"
+local_generated = true
+"#;
+    let cfg = pyloros::Config::parse(toml).unwrap();
+    let err = match pyloros::CredentialEngine::new(cfg.credentials, &Default::default()) {
+        Ok(_) => panic!("expected config error"),
+        Err(e) => e,
+    };
+    let msg = format!("{}", err);
+    t.assert_contains("error mentions local_env_name", &msg, "local_env_name");
+}
+
+/// `local_generated = true` with a literal `value` plus explicit
+/// `local_env_name` is allowed (operator opted in).
+#[test]
+fn test_local_generated_with_literal_value_and_explicit_env_name() {
+    let t = test_report!("local_generated accepts literal value when local_env_name is given");
+    let toml = r#"
+[proxy]
+generated_secrets_file = "/tmp/x.env"
+
+[[credentials]]
+url = "https://example.com/*"
+header = "x-api-key"
+value = "literal-no-template"
+local_generated = true
+local_env_name = "EXPLICIT_LOCAL_NAME"
+"#;
+    let cfg = pyloros::Config::parse(toml).unwrap();
+    let (_engine, generated) =
+        pyloros::CredentialEngine::new(cfg.credentials, &Default::default()).unwrap();
+    t.assert_eq("one secret generated", &generated.len(), &1usize);
+    t.assert_eq(
+        "env_name from explicit field",
+        &generated[0].env_name.as_str(),
+        &"EXPLICIT_LOCAL_NAME",
+    );
+}
+
 #[tokio::test]
 async fn test_no_injection_for_non_matching_url() {
     let t = test_report!("No injection for non-matching URL");

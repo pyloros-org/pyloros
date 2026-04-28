@@ -292,6 +292,73 @@ async fn test_audit_log_credential_info() {
     upstream.shutdown();
 }
 
+/// On a local-credential mismatch the audit entry must identify which
+/// credential rule the sandbox failed to satisfy — operators need this to
+/// debug without grepping through every credential block.
+#[tokio::test]
+async fn test_audit_log_local_credential_mismatch_includes_credential() {
+    let t = test_report!("Audit log includes credential info on local mismatch (403)");
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("hello"))
+        .report(&t, "returns 'hello'")
+        .start()
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit_path_str = audit_path.to_str().unwrap();
+
+    let cred = pyloros::config::Credential::Header {
+        url: "https://localhost/*".to_string(),
+        header: "x-api-key".to_string(),
+        value: "real-secret".to_string(),
+        local: pyloros::config::LocalHeaderConfig::Value("expected-local".to_string()),
+    };
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![rule("GET", "https://localhost/*")],
+        upstream.port(),
+    )
+    .credentials(vec![cred])
+    .audit_log(audit_path_str)
+    .report(&t)
+    .start()
+    .await;
+
+    let client = test_client(proxy.addr(), &ca);
+    t.action("GET `https://localhost/api` with WRONG local credential");
+    let resp = client
+        .get("https://localhost/api")
+        .header("x-api-key", "wrong-value")
+        .send()
+        .await
+        .unwrap();
+    t.assert_eq("status", &resp.status().as_u16(), &403u16);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let entries = read_audit_entries(audit_path_str);
+    let mismatch = entries
+        .iter()
+        .find(|e| e["reason"].as_str() == Some("local_credential_mismatch"))
+        .expect("expected a local_credential_mismatch entry");
+    t.assert_true("has credential", mismatch["credential"].is_object());
+    t.assert_eq(
+        "credential type",
+        &mismatch["credential"]["type"].as_str().unwrap(),
+        &"header",
+    );
+    t.assert_eq(
+        "credential url_pattern",
+        &mismatch["credential"]["url_pattern"].as_str().unwrap(),
+        &"https://localhost/*",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
 #[tokio::test]
 async fn test_audit_log_disabled_by_default() {
     let t = test_report!("Audit log file not created when disabled");
