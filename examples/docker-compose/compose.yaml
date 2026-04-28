@@ -51,7 +51,7 @@ services:
   proxy:
     image: ${PROXY_IMAGE:-ghcr.io/pyloros-org/pyloros:latest}
     volumes:
-      - ./config.toml:/etc/pyloros/config.toml:ro
+      - ${CONFIG_FILE:-./config.toml}:/etc/pyloros/config.toml:ro
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.crt:/etc/pyloros/ca.crt:ro
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.key:/etc/pyloros/ca.key:ro
     command:

@@ -86,9 +86,15 @@ CA_DIR="$(mktemp -d)"
 echo "Generating CA certificate..."
 "$BINARY" generate-ca --out "$CA_DIR" >/dev/null
 
+# Copy the example config to a tempfile so the config-reload test can mutate
+# it without touching the checked-in file. The compose file bind-mounts
+# $CONFIG_FILE (default ./config.toml) into the container.
+CONFIG_FILE="$(mktemp --suffix=.toml)"
+cp "$PROJECT_DIR/examples/docker-compose/config.toml" "$CONFIG_FILE"
+
 # Use a unique project name for isolation
 COMPOSE_PROJECT_NAME="pyloros-compose-test-$$"
-export COMPOSE_PROJECT_NAME PROXY_IMAGE CA_DIR SANDBOX_IMAGE
+export COMPOSE_PROJECT_NAME PROXY_IMAGE CA_DIR SANDBOX_IMAGE CONFIG_FILE
 
 # Compose helper — runs compose with our file and project name
 dc() {
@@ -102,6 +108,7 @@ cleanup() {
     echo "Cleaning up..."
     dc down --volumes --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$CA_DIR"
+    rm -f "$CONFIG_FILE"
     docker rmi "$PROXY_IMAGE" >/dev/null 2>&1 || true
     exit "$exit_code"
 }
@@ -265,6 +272,91 @@ else
     fail "Direct HTTPS git clone failed (exit=$EXIT_CODE)"
     echo "    Output (last 10 lines):"
     echo "$OUTPUT" | tail -10 | sed 's/^/    /'
+fi
+
+# --- Config reload tests ---
+# The proxy is supposed to detect edits to its config file and reload rules
+# without a restart. With docker bind-mounted config files, inotify on the
+# parent directory inside the container does not see host-side renames, so we
+# test both editor patterns (atomic rename via mv, and in-place truncate+write).
+
+# Helper: wait until $1 returns 0, up to ~10s. Returns the last exit code.
+wait_for() {
+    local i=0
+    while (( i < 20 )); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    "$@"
+}
+
+# Sanity: httpbin.org/uuid is currently blocked (only /robots.txt is allowed)
+echo ""
+echo "Test 9: Pre-reload, httpbin.org/uuid is blocked (HTTP 451)"
+set +e
+HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
+set -e
+if [[ "$HTTP_CODE" == "451" ]]; then
+    pass "httpbin.org/uuid blocked before reload"
+else
+    fail "Expected 451 before reload, got '$HTTP_CODE'"
+fi
+
+# Test 10: Atomic-rename edit (typical editor save) triggers reload
+echo "Test 10: Config reload after atomic-rename edit (mv tmp config)"
+TMP_CFG="${CONFIG_FILE}.new"
+cp "$CONFIG_FILE" "$TMP_CFG"
+cat >> "$TMP_CFG" <<'EOF'
+
+[[rules]]
+method = "GET"
+url = "https://httpbin.org/uuid"
+EOF
+mv -f "$TMP_CFG" "$CONFIG_FILE"
+
+set +e
+wait_for bash -c 'HTTP_CODE=$(docker compose -f "'"$COMPOSE_FILE"'" exec -T sandbox curl -so /dev/null -w "%{http_code}" https://httpbin.org/uuid 2>/dev/null); [[ "$HTTP_CODE" == "200" ]]'
+RELOAD_RC=$?
+HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
+set -e
+if [[ $RELOAD_RC -eq 0 && "$HTTP_CODE" == "200" ]]; then
+    pass "Atomic-rename edit triggered reload (httpbin.org/uuid now 200)"
+else
+    fail "Atomic-rename edit did not trigger reload (final HTTP=$HTTP_CODE)"
+    echo "    --- proxy logs (last 20 lines) ---"
+    dc logs --tail=20 proxy 2>&1 | sed 's/^/    /' || true
+fi
+
+# Test 11: In-place rewrite (truncate+write) triggers reload
+echo "Test 11: Config reload after in-place rewrite"
+# Remove the rule we just added so we can re-add it and observe a reload.
+# Use python or awk to strip the trailing rule block we appended.
+# Simpler: rewrite the file from the original example plus a different rule.
+cp "$PROJECT_DIR/examples/docker-compose/config.toml" "$CONFIG_FILE.original"
+# Truncate-write in place (no rename): cat > replaces contents but keeps inode.
+cat "$CONFIG_FILE.original" > "$CONFIG_FILE"
+cat >> "$CONFIG_FILE" <<'EOF'
+
+[[rules]]
+method = "GET"
+url = "https://httpbin.org/anything"
+EOF
+rm -f "$CONFIG_FILE.original"
+
+set +e
+wait_for bash -c 'HTTP_CODE=$(docker compose -f "'"$COMPOSE_FILE"'" exec -T sandbox curl -so /dev/null -w "%{http_code}" https://httpbin.org/anything 2>/dev/null); [[ "$HTTP_CODE" == "200" ]]'
+RELOAD_RC=$?
+HTTP_CODE2=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/anything 2>&1)
+# After this rewrite, /uuid is no longer in the rules — should be back to 451.
+HTTP_CODE_UUID=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
+set -e
+if [[ $RELOAD_RC -eq 0 && "$HTTP_CODE2" == "200" && "$HTTP_CODE_UUID" == "451" ]]; then
+    pass "In-place rewrite triggered reload (httpbin.org/anything=200, /uuid=451)"
+else
+    fail "In-place rewrite reload failed (anything=$HTTP_CODE2, uuid=$HTTP_CODE_UUID)"
+    echo "    --- proxy logs (last 20 lines) ---"
+    dc logs --tail=20 proxy 2>&1 | sed 's/^/    /' || true
 fi
 
 # Summary
