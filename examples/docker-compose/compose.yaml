@@ -51,13 +51,21 @@ services:
   proxy:
     image: ${PROXY_IMAGE:-ghcr.io/pyloros-org/pyloros:latest}
     volumes:
-      - ./config.toml:/etc/pyloros/config.toml:ro
+      # The config is bind-mounted as a *directory*, not as a single file.
+      # This makes live config reload work for every common editor save
+      # pattern: in-place rewrites (cat >, truncate+write) and atomic-rename
+      # saves (vim default, `mv -f new old`) both propagate to the
+      # container, and inotify on the parent directory inside the container
+      # observes them (the mount is the host directory itself, same inode).
+      # Single-file bind-mounts are inode-bound and break on atomic rename;
+      # see devdocs/lessons/inotify-docker-bind-mount.md.
+      - ${CONFIG_DIR:-./conf}:/etc/pyloros/conf:ro
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.crt:/etc/pyloros/ca.crt:ro
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.key:/etc/pyloros/ca.key:ro
     command:
       - run
       - --config
-      - /etc/pyloros/config.toml
+      - /etc/pyloros/conf/config.toml
       - --ca-cert
       - /etc/pyloros/ca.crt
       - --ca-key
