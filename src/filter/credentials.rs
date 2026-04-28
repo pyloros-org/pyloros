@@ -1,11 +1,40 @@
 //! Credential injection engine
 
 use hyper::header::HeaderMap;
+use std::collections::HashMap;
 
 use super::matcher::UrlPattern;
-use crate::config::{resolve_credential_value, Credential};
-use crate::error::Result;
+use crate::config::{
+    generate_fake_access_key_id, generate_fake_secret_access_key, generate_random_header_value,
+    parse_credential_template, resolve_credential_value, Credential, CredentialTemplate,
+    LocalHeaderConfig, LocalSigV4Config,
+};
+use crate::error::{Error, Result};
 use crate::filter::RequestInfo;
+
+/// Resolved local credential for header type.
+///
+/// The agent constructs the header itself, substituting its env var into the
+/// template the operator put in `value` (e.g. `Bearer ${TOKEN}`). To verify,
+/// the proxy isolates the variable portion of the incoming header by stripping
+/// the literal `prefix` and `suffix`, then compares the middle to `value`.
+pub struct ResolvedLocalHeader {
+    pub prefix: String,
+    pub value: String,
+    pub suffix: String,
+}
+
+/// Resolved local credential for SigV4 type.
+pub struct ResolvedLocalSigV4 {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// A generated secret to be written to the secrets env file.
+pub struct GeneratedSecret {
+    pub env_name: String,
+    pub value: String,
+}
 
 /// A resolved credential ready for matching and injection.
 pub enum ResolvedCredential {
@@ -14,6 +43,7 @@ pub enum ResolvedCredential {
         url_display: String,
         header: String,
         value: String,
+        local: ResolvedLocalHeader,
     },
     AwsSigV4 {
         url_pattern: UrlPattern,
@@ -21,7 +51,14 @@ pub enum ResolvedCredential {
         access_key_id: String,
         secret_access_key: String,
         session_token: Option<String>,
+        local: ResolvedLocalSigV4,
     },
+}
+
+/// Error type for local credential verification failures.
+pub struct LocalCredentialMismatch {
+    pub credential_url: String,
+    pub credential_type: String,
 }
 
 impl ResolvedCredential {
@@ -38,6 +75,20 @@ impl ResolvedCredential {
     }
 }
 
+/// Match a header value against a resolved local credential, isolating the
+/// variable portion of `actual` by stripping the literal prefix and suffix
+/// before comparing the middle to the resolved local secret.
+fn header_matches_local(actual: &str, local: &ResolvedLocalHeader) -> bool {
+    if !actual.starts_with(local.prefix.as_str()) || !actual.ends_with(local.suffix.as_str()) {
+        return false;
+    }
+    if actual.len() < local.prefix.len() + local.suffix.len() {
+        return false;
+    }
+    let middle = &actual[local.prefix.len()..actual.len() - local.suffix.len()];
+    middle == local.value
+}
+
 /// Engine that matches requests and injects credentials into headers.
 pub struct CredentialEngine {
     credentials: Vec<ResolvedCredential>,
@@ -45,18 +96,79 @@ pub struct CredentialEngine {
 
 impl CredentialEngine {
     /// Create a new credential engine, resolving env vars and compiling URL patterns.
-    pub fn new(credentials: Vec<Credential>) -> Result<Self> {
+    /// Returns the engine and the full set of generated secrets (the new file contents).
+    ///
+    /// `existing` maps env-var name → value from a previously written secrets file
+    /// (or an empty map if none). When a credential's env-var name appears in
+    /// `existing`, the value is reused so a proxy restart or reload doesn't
+    /// rotate local credentials that the sandbox is still using.
+    pub fn new(
+        credentials: Vec<Credential>,
+        existing: &HashMap<String, String>,
+    ) -> Result<(Self, Vec<GeneratedSecret>)> {
         let mut resolved = Vec::with_capacity(credentials.len());
+        let mut generated_secrets = Vec::new();
         for cred in &credentials {
             match cred {
-                Credential::Header { url, header, value } => {
-                    let value = resolve_credential_value(value)?;
+                Credential::Header {
+                    url,
+                    header,
+                    value,
+                    local,
+                } => {
+                    let template = parse_credential_template(value)?;
+                    let resolved_value = template.resolve()?;
                     let url_pattern = UrlPattern::new(url)?;
+
+                    let (prefix, suffix) = match &template {
+                        CredentialTemplate::Variable { prefix, suffix, .. } => {
+                            (prefix.clone(), suffix.clone())
+                        }
+                        CredentialTemplate::Literal(_) => (String::new(), String::new()),
+                    };
+
+                    let resolved_local = match local {
+                        LocalHeaderConfig::Value(v) => {
+                            let local_value = resolve_credential_value(v)?;
+                            ResolvedLocalHeader {
+                                prefix,
+                                value: local_value,
+                                suffix,
+                            }
+                        }
+                        LocalHeaderConfig::Generated { env_name } => {
+                            let env = match env_name.as_deref() {
+                                Some(n) => n.to_string(),
+                                None => template
+                                    .var_name()
+                                    .ok_or_else(|| Error::config(format!(
+                                        "header credential at {} with local_generated requires local_env_name when `value` has no ${{VAR}} placeholder",
+                                        url
+                                    )))?
+                                    .to_string(),
+                            };
+                            let value = existing
+                                .get(&env)
+                                .cloned()
+                                .unwrap_or_else(generate_random_header_value);
+                            generated_secrets.push(GeneratedSecret {
+                                env_name: env,
+                                value: value.clone(),
+                            });
+                            ResolvedLocalHeader {
+                                prefix,
+                                value,
+                                suffix,
+                            }
+                        }
+                    };
+
                     resolved.push(ResolvedCredential::Header {
                         url_pattern,
                         url_display: url.clone(),
                         header: header.to_lowercase(),
-                        value,
+                        value: resolved_value,
+                        local: resolved_local,
                     });
                 }
                 Credential::AwsSigV4 {
@@ -64,27 +176,94 @@ impl CredentialEngine {
                     access_key_id,
                     secret_access_key,
                     session_token,
+                    local,
                 } => {
-                    let access_key_id = resolve_credential_value(access_key_id)?;
-                    let secret_access_key = resolve_credential_value(secret_access_key)?;
+                    let akid_template = parse_credential_template(access_key_id)?;
+                    let sak_template = parse_credential_template(secret_access_key)?;
+                    let resolved_akid = akid_template.resolve()?;
+                    let resolved_sak = sak_template.resolve()?;
                     let session_token = session_token
                         .as_deref()
                         .map(resolve_credential_value)
                         .transpose()?;
                     let url_pattern = UrlPattern::new(url)?;
+
+                    let resolved_local = match local {
+                        LocalSigV4Config::Explicit {
+                            access_key_id: local_akid,
+                            secret_access_key: local_sak,
+                        } => {
+                            let akid = resolve_credential_value(local_akid)?;
+                            let sak = resolve_credential_value(local_sak)?;
+                            ResolvedLocalSigV4 {
+                                access_key_id: akid,
+                                secret_access_key: sak,
+                            }
+                        }
+                        LocalSigV4Config::Generated {
+                            access_key_id_env_name,
+                            secret_access_key_env_name,
+                        } => {
+                            let akid_env = match access_key_id_env_name.as_deref() {
+                                Some(n) => n.to_string(),
+                                None => akid_template
+                                    .var_name()
+                                    .ok_or_else(|| Error::config(format!(
+                                        "aws-sigv4 credential at {} with local_generated requires local_access_key_id_env_name when `access_key_id` has no ${{VAR}} placeholder",
+                                        url
+                                    )))?
+                                    .to_string(),
+                            };
+                            let sak_env = match secret_access_key_env_name.as_deref() {
+                                Some(n) => n.to_string(),
+                                None => sak_template
+                                    .var_name()
+                                    .ok_or_else(|| Error::config(format!(
+                                        "aws-sigv4 credential at {} with local_generated requires local_secret_access_key_env_name when `secret_access_key` has no ${{VAR}} placeholder",
+                                        url
+                                    )))?
+                                    .to_string(),
+                            };
+                            let akid = existing
+                                .get(&akid_env)
+                                .cloned()
+                                .unwrap_or_else(generate_fake_access_key_id);
+                            let sak = existing
+                                .get(&sak_env)
+                                .cloned()
+                                .unwrap_or_else(generate_fake_secret_access_key);
+                            generated_secrets.push(GeneratedSecret {
+                                env_name: akid_env,
+                                value: akid.clone(),
+                            });
+                            generated_secrets.push(GeneratedSecret {
+                                env_name: sak_env,
+                                value: sak.clone(),
+                            });
+                            ResolvedLocalSigV4 {
+                                access_key_id: akid,
+                                secret_access_key: sak,
+                            }
+                        }
+                    };
+
                     resolved.push(ResolvedCredential::AwsSigV4 {
                         url_pattern,
                         url_display: url.clone(),
-                        access_key_id,
-                        secret_access_key,
+                        access_key_id: resolved_akid,
+                        secret_access_key: resolved_sak,
                         session_token,
+                        local: resolved_local,
                     });
                 }
             }
         }
-        Ok(Self {
-            credentials: resolved,
-        })
+        Ok((
+            Self {
+                credentials: resolved,
+            },
+            generated_secrets,
+        ))
     }
 
     /// Inject matching header credentials into the request headers.
@@ -247,13 +426,124 @@ impl CredentialEngine {
                     header,
                     ..
                 } => {
-                    format!("header={} url={}", header, url_display)
+                    format!("header={} url={} (local: configured)", header, url_display)
                 }
                 ResolvedCredential::AwsSigV4 { url_display, .. } => {
-                    format!("aws-sigv4 url={}", url_display)
+                    format!("aws-sigv4 url={} (local: configured)", url_display)
                 }
             })
             .collect()
+    }
+
+    /// Verify local credentials for all matching header-type credentials.
+    /// Returns Ok(()) if all pass, or Err on first mismatch.
+    /// Only checks Header credentials (not SigV4 which need body).
+    pub fn verify_local(
+        &self,
+        request_info: &RequestInfo,
+        headers: &HeaderMap,
+    ) -> std::result::Result<(), LocalCredentialMismatch> {
+        for cred in &self.credentials {
+            if !cred.matches(request_info) {
+                continue;
+            }
+            if let ResolvedCredential::Header {
+                header,
+                local,
+                url_display,
+                ..
+            } = cred
+            {
+                let actual = headers
+                    .get(header.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if !header_matches_local(actual, local) {
+                    return Err(LocalCredentialMismatch {
+                        credential_url: url_display.clone(),
+                        credential_type: "header".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify local credentials for all matching credentials including SigV4.
+    pub fn verify_local_with_body(
+        &self,
+        request_info: &RequestInfo,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> std::result::Result<(), LocalCredentialMismatch> {
+        for cred in &self.credentials {
+            if !cred.matches(request_info) {
+                continue;
+            }
+            match cred {
+                ResolvedCredential::Header {
+                    header,
+                    local,
+                    url_display,
+                    ..
+                } => {
+                    let actual = headers
+                        .get(header.as_str())
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if !header_matches_local(actual, local) {
+                        return Err(LocalCredentialMismatch {
+                            credential_url: url_display.clone(),
+                            credential_type: "header".to_string(),
+                        });
+                    }
+                }
+                ResolvedCredential::AwsSigV4 {
+                    local, url_display, ..
+                } => {
+                    let auth_header = headers
+                        .get(hyper::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+
+                    // Collect all headers for verification.
+                    // In HTTP/1.1 through hyper, the Host header may not be present
+                    // as an explicit header (it's extracted from the URI). We add it
+                    // from request_info if missing, since SigV4 typically signs it.
+                    let mut all_headers: Vec<(String, String)> = headers
+                        .iter()
+                        .filter(|(name, _)| name.as_str() != "authorization")
+                        .map(|(name, value)| {
+                            (
+                                name.as_str().to_lowercase(),
+                                value.to_str().unwrap_or("").trim().to_string(),
+                            )
+                        })
+                        .collect();
+                    if !all_headers.iter().any(|(k, _)| k == "host") {
+                        all_headers.push(("host".to_string(), request_info.host.to_string()));
+                    }
+                    all_headers.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    if !super::sigv4::verify_request_signature(
+                        &local.access_key_id,
+                        &local.secret_access_key,
+                        request_info.method,
+                        request_info.path,
+                        request_info.query.unwrap_or(""),
+                        &all_headers,
+                        body,
+                        auth_header,
+                    ) {
+                        return Err(LocalCredentialMismatch {
+                            credential_url: url_display.clone(),
+                            credential_type: "aws-sigv4".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -267,6 +557,7 @@ mod tests {
             url: url.to_string(),
             header: header.to_string(),
             value: value.to_string(),
+            local: LocalHeaderConfig::Value("test-local".to_string()),
         }
     }
 
@@ -276,17 +567,24 @@ mod tests {
             access_key_id: "AKID".to_string(),
             secret_access_key: "SECRET".to_string(),
             session_token: None,
+            local: LocalSigV4Config::Explicit {
+                access_key_id: "LOCALAKID".to_string(),
+                secret_access_key: "LOCALSECRET".to_string(),
+            },
         }
     }
 
     #[test]
     fn test_url_pattern_matching() {
         let t = test_report!("Credential matches request with wildcard URL");
-        let engine = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "secret123",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "secret123",
+            )],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/v1/data", None);
@@ -302,11 +600,14 @@ mod tests {
     #[test]
     fn test_header_overwrite() {
         let t = test_report!("Credential overwrites existing header");
-        let engine = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "real-secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
@@ -323,10 +624,13 @@ mod tests {
     #[test]
     fn test_multiple_credentials_different_headers() {
         let t = test_report!("Multiple credentials for different headers both injected");
-        let engine = CredentialEngine::new(vec![
-            make_credential("https://api.example.com/*", "x-api-key", "key123"),
-            make_credential("https://api.example.com/*", "authorization", "Bearer tok"),
-        ])
+        let (engine, _) = CredentialEngine::new(
+            vec![
+                make_credential("https://api.example.com/*", "x-api-key", "key123"),
+                make_credential("https://api.example.com/*", "authorization", "Bearer tok"),
+            ],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("POST", "https", "api.example.com", None, "/data", None);
@@ -347,10 +651,13 @@ mod tests {
     #[test]
     fn test_last_match_wins() {
         let t = test_report!("Last match wins for same header");
-        let engine = CredentialEngine::new(vec![
-            make_credential("https://*.example.com/*", "x-api-key", "first"),
-            make_credential("https://api.example.com/*", "x-api-key", "second"),
-        ])
+        let (engine, _) = CredentialEngine::new(
+            vec![
+                make_credential("https://*.example.com/*", "x-api-key", "first"),
+                make_credential("https://api.example.com/*", "x-api-key", "second"),
+            ],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
@@ -366,11 +673,14 @@ mod tests {
     #[test]
     fn test_no_match() {
         let t = test_report!("No match leaves headers unchanged");
-        let engine = CredentialEngine::new(vec![make_credential(
-            "https://other.example.com/*",
-            "x-api-key",
-            "secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://other.example.com/*",
+                "x-api-key",
+                "secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
 
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
@@ -382,11 +692,14 @@ mod tests {
     #[test]
     fn test_matched_credential_infos_match() {
         let t = test_report!("matched_credential_infos returns matching credentials");
-        let engine = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "secret123",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "secret123",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/v1/data", None);
         let infos = engine.matched_credential_infos(&ri);
@@ -402,11 +715,14 @@ mod tests {
     #[test]
     fn test_matched_credential_infos_no_match() {
         let t = test_report!("matched_credential_infos returns empty for non-matching request");
-        let engine = CredentialEngine::new(vec![make_credential(
-            "https://other.example.com/*",
-            "x-api-key",
-            "secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://other.example.com/*",
+                "x-api-key",
+                "secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
         let infos = engine.matched_credential_infos(&ri);
@@ -416,10 +732,13 @@ mod tests {
     #[test]
     fn test_credential_count() {
         let t = test_report!("credential_count returns correct count");
-        let engine = CredentialEngine::new(vec![
-            make_credential("https://a.com/*", "x-key", "a"),
-            make_credential("https://b.com/*", "x-key", "b"),
-        ])
+        let (engine, _) = CredentialEngine::new(
+            vec![
+                make_credential("https://a.com/*", "x-key", "a"),
+                make_credential("https://b.com/*", "x-key", "b"),
+            ],
+            &Default::default(),
+        )
         .unwrap();
         t.assert_eq("count", &engine.credential_count(), &2usize);
     }
@@ -429,11 +748,14 @@ mod tests {
     #[test]
     fn test_needs_body_false_for_header_credentials() {
         let t = test_report!("needs_body returns false when only Header credentials match");
-        let engine = CredentialEngine::new(vec![make_credential(
-            "https://api.example.com/*",
-            "x-api-key",
-            "secret",
-        )])
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential(
+                "https://api.example.com/*",
+                "x-api-key",
+                "secret",
+            )],
+            &Default::default(),
+        )
         .unwrap();
         let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
         t.assert_true("needs_body is false", !engine.needs_body(&ri));
@@ -442,9 +764,11 @@ mod tests {
     #[test]
     fn test_needs_body_true_for_matching_sigv4() {
         let t = test_report!("needs_body returns true for matching AwsSigV4 credential");
-        let engine =
-            CredentialEngine::new(vec![make_sigv4_credential("https://*.amazonaws.com/*")])
-                .unwrap();
+        let (engine, _) = CredentialEngine::new(
+            vec![make_sigv4_credential("https://*.amazonaws.com/*")],
+            &Default::default(),
+        )
+        .unwrap();
         let matching_ri = RequestInfo::http(
             "GET",
             "https",
@@ -461,5 +785,82 @@ mod tests {
             "non-matching sigv4 does not need body",
             !engine.needs_body(&non_matching_ri),
         );
+    }
+
+    // --- verify_local tests ---
+
+    fn make_credential_with_local(
+        url: &str,
+        header: &str,
+        value: &str,
+        local_value: &str,
+    ) -> Credential {
+        Credential::Header {
+            url: url.to_string(),
+            header: header.to_string(),
+            value: value.to_string(),
+            local: LocalHeaderConfig::Value(local_value.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_verify_local_rejects_wrong_header_value() {
+        let t = test_report!("verify_local rejects when header value doesn't match local");
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential_with_local(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+                "expected-local",
+            )],
+            &Default::default(),
+        )
+        .unwrap();
+        let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "wrong-value".parse().unwrap());
+        let result = engine.verify_local(&ri, &headers);
+        t.assert_true("should reject", result.is_err());
+        let err = result.unwrap_err();
+        t.assert_eq("type", &err.credential_type.as_str(), &"header");
+    }
+
+    #[test]
+    fn test_verify_local_passes_matching_header_value() {
+        let t = test_report!("verify_local passes when header value matches local");
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential_with_local(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+                "expected-local",
+            )],
+            &Default::default(),
+        )
+        .unwrap();
+        let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "expected-local".parse().unwrap());
+        let result = engine.verify_local(&ri, &headers);
+        t.assert_true("should pass", result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_local_rejects_missing_header() {
+        let t = test_report!("verify_local rejects when header is missing entirely");
+        let (engine, _) = CredentialEngine::new(
+            vec![make_credential_with_local(
+                "https://api.example.com/*",
+                "x-api-key",
+                "real-secret",
+                "expected-local",
+            )],
+            &Default::default(),
+        )
+        .unwrap();
+        let ri = RequestInfo::http("GET", "https", "api.example.com", None, "/test", None);
+        let headers = HeaderMap::new();
+        let result = engine.verify_local(&ri, &headers);
+        t.assert_true("should reject", result.is_err());
     }
 }
