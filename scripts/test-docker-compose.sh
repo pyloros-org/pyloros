@@ -86,15 +86,17 @@ CA_DIR="$(mktemp -d)"
 echo "Generating CA certificate..."
 "$BINARY" generate-ca --out "$CA_DIR" >/dev/null
 
-# Copy the example config to a tempfile so the config-reload test can mutate
-# it without touching the checked-in file. The compose file bind-mounts
-# $CONFIG_FILE (default ./config.toml) into the container.
-CONFIG_FILE="$(mktemp --suffix=.toml)"
-cp "$PROJECT_DIR/examples/docker-compose/config.toml" "$CONFIG_FILE"
+# Copy the example config into a tempdir so the config-reload test can
+# mutate it without touching the checked-in file. The compose file
+# bind-mounts $CONFIG_DIR (default ./conf) into the container.
+CONFIG_DIR_HOST="$(mktemp -d)"
+cp "$PROJECT_DIR/examples/docker-compose/conf/config.toml" "$CONFIG_DIR_HOST/config.toml"
+CONFIG_FILE="$CONFIG_DIR_HOST/config.toml"  # used by reload test
+CONFIG_DIR="$CONFIG_DIR_HOST"
 
 # Use a unique project name for isolation
 COMPOSE_PROJECT_NAME="pyloros-compose-test-$$"
-export COMPOSE_PROJECT_NAME PROXY_IMAGE CA_DIR SANDBOX_IMAGE CONFIG_FILE
+export COMPOSE_PROJECT_NAME PROXY_IMAGE CA_DIR SANDBOX_IMAGE CONFIG_DIR
 
 # Compose helper — runs compose with our file and project name
 dc() {
@@ -108,7 +110,7 @@ cleanup() {
     echo "Cleaning up..."
     dc down --volumes --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$CA_DIR"
-    rm -f "$CONFIG_FILE"
+    rm -rf "$CONFIG_DIR_HOST"
     docker rmi "$PROXY_IMAGE" >/dev/null 2>&1 || true
     exit "$exit_code"
 }
@@ -274,29 +276,22 @@ else
     echo "$OUTPUT" | tail -10 | sed 's/^/    /'
 fi
 
-# --- Config reload test ---
-# The proxy is supposed to detect edits to its config file and reload rules
-# without a restart. We exercise the in-place-rewrite editor pattern (write
-# truncates the existing inode), which is what the proxy can actually
-# observe across a docker single-file bind-mount.
-#
-# Atomic-rename saves (vim default, `mv -f new old`) cannot be tested here:
-# docker bind-mounts a single file by inode at mount time, so a host-side
-# rename detaches the bind-mount from the new content — the container keeps
-# reading the original (orphaned) inode. To support live reload across all
-# editor save patterns, users should bind-mount the *directory* containing
-# config.toml instead of the single file. See devdocs/lessons/.
+# --- Config reload tests ---
+# The compose example bind-mounts the *directory* containing config.toml,
+# so both editor save patterns reach the container:
+#   - in-place rewrite (cat >, truncate+write) keeps the inode and is
+#     observed by the proxy's polling fallback;
+#   - atomic rename (mv -f new old) replaces the directory entry, which
+#     inotify on the parent dir sees because the mount is the host
+#     directory itself (same inode, not a single-file bind).
 
-# wait_for_uuid_allowed: polls the sandbox for up to ~30s waiting for the
-# httpbin.org/uuid request to return 200. Returns 0 on success, non-zero on
-# timeout. Each `docker compose exec` takes a few hundred ms, so we cap by
-# attempt count rather than by wallclock seconds.
-wait_for_uuid_allowed() {
-    local i
+# wait_for_url: polls sandbox for up to ~30s waiting for $1 to return $2.
+# Each docker compose exec adds latency, so we cap by attempt count.
+wait_for_url() {
+    local url="$1" expected="$2" i code
     for (( i = 0; i < 60; i++ )); do
-        local code
-        code=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>/dev/null || true)
-        if [[ "$code" == "200" ]]; then return 0; fi
+        code=$(sandbox_exec curl -so /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
+        if [[ "$code" == "$expected" ]]; then return 0; fi
         sleep 0.5
     done
     return 1
@@ -314,26 +309,28 @@ else
     fail "Expected 451 before reload, got '$HTTP_CODE'"
 fi
 
-# Test 10: In-place rewrite (truncate+write) triggers reload
-echo "Test 10: Config reload after in-place rewrite"
-# `cat >` truncates and rewrites the existing inode — the container's
-# bind-mounted file sees the new contents.
-cat >> "$CONFIG_FILE" <<'EOF'
+# Test 10: Atomic-rename edit (typical editor save pattern: write tmp, mv -f)
+# triggers reload via inotify on the bind-mounted directory.
+echo "Test 10: Config reload after atomic-rename edit"
+TMP_CFG="${CONFIG_FILE}.new"
+cp "$CONFIG_FILE" "$TMP_CFG"
+cat >> "$TMP_CFG" <<'EOF'
 
 [[rules]]
 method = "GET"
 url = "https://httpbin.org/uuid"
 EOF
+mv -f "$TMP_CFG" "$CONFIG_FILE"
 
 set +e
-wait_for_uuid_allowed
+wait_for_url https://httpbin.org/uuid 200
 RELOAD_RC=$?
 HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
 set -e
 if [[ $RELOAD_RC -eq 0 && "$HTTP_CODE" == "200" ]]; then
-    pass "In-place rewrite triggered reload (httpbin.org/uuid now 200)"
+    pass "Atomic-rename edit triggered reload (httpbin.org/uuid now 200)"
 else
-    fail "In-place rewrite did not trigger reload (final HTTP=$HTTP_CODE, wait_rc=$RELOAD_RC)"
+    fail "Atomic-rename edit did not trigger reload (final HTTP=$HTTP_CODE, wait_rc=$RELOAD_RC)"
     echo "    --- proxy logs (last 30 lines) ---"
     dc logs --tail=30 proxy 2>&1 | sed 's/^/    /' || true
 fi
