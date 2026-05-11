@@ -7,7 +7,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use std::sync::{Arc, Mutex};
 
-/// AWS STS regional endpoints negotiate http/1.1 (not h2) over ALPN, and
+/// Some servers are still http/1.1 only (e.g. AWS STS regional endpoints), and
 /// strictly require a `Host:` header on HTTP/1.1 requests — they return
 /// `400` with an empty body if it's missing.
 ///
