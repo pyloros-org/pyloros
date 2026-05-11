@@ -1027,12 +1027,21 @@ fn rebuild_request_for_upstream<B>(
 
     let mut builder = Request::builder().method(parts.method).uri(uri);
 
+    let mut host_set = false;
     for (name, value) in parts.headers.iter() {
         if name == hyper::header::HOST {
             builder = builder.header(name, &host_value);
+            host_set = true;
         } else {
             builder = builder.header(name, value);
         }
+    }
+    // hyper's h2 server does not synthesize a Host header from :authority,
+    // so when forwarding an h2-originated request to an h1 upstream the Host
+    // header would otherwise be missing — RFC-compliant h1 servers reject
+    // such requests with 400. Always set Host explicitly.
+    if !host_set {
+        builder = builder.header(hyper::header::HOST, &host_value);
     }
 
     builder
