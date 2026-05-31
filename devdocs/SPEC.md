@@ -17,7 +17,7 @@ The intended deployment is one proxy per VM/container running an AI agent. All o
 - MITM TLS interception for HTTPS traffic via CONNECT tunnels
 - Plain HTTP forwarding for non-CONNECT proxy requests (e.g. `http://` URLs used by apt-get)
 - Hop-by-hop header stripping per RFC 7230 for forwarded HTTP requests
-- CONNECT restricted to port 443 (non-443 CONNECT requests are blocked)
+- CONNECT supported on port 443 (MITM'd as HTTPS) and port 80 (the tunneled bytes are served as plain HTTP via the same code path as the direct-HTTP listener — filtering and audit are identical to a plain `http://` request through the explicit-proxy port); CONNECT to any other port is blocked
 - Allowlist rule engine: requests must match at least one rule to be allowed; everything else is blocked with HTTP 451
 - **Default-deny for unverifiable restrictions**: when a rule requires fine-grained inspection (e.g. branch-level body inspection for git push) but the request arrives on a code path that cannot perform that inspection (e.g. plain HTTP instead of HTTPS CONNECT), the request is blocked rather than silently allowed. If we can't verify a restriction, we deny.
 - TOML configuration file
@@ -344,7 +344,7 @@ When deploying pyloros for the first time, operators may not know what rules the
 
 - Enabled via `permissive = true` in `[proxy]` (default: `false`)
 - Only converts `FilterResult::Blocked` (no matching rule) to allow-through
-- All other block reasons (branch restriction, LFS check, body-inspection-requires-HTTPS, non-HTTPS CONNECT, auth failure) still block — those represent matched rules with failed constraints
+- All other block reasons (branch restriction, LFS check, body-inspection-requires-HTTPS, unsupported CONNECT port, auth failure) still block — those represent matched rules with failed constraints
 - Permitted requests emit a distinct audit event `"request_permitted"` with `decision: "allowed"`, `reason: "no_matching_rule"` — easy to grep, distinct from `"request_allowed"` (which means a rule matched)
 - Permitted requests ALWAYS emit a tracing log line (regardless of `log_allowed_requests`/`log_blocked_requests`) since the point is visibility
 - Requests matching an explicit rule are logged normally as `"request_allowed"`
