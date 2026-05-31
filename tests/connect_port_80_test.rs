@@ -7,6 +7,7 @@
 mod common;
 
 use common::{read_audit_entries, rule, TestCa, TestProxy};
+use pyloros::config::Credential;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
@@ -179,6 +180,52 @@ async fn test_port_80_connect_audit_scheme_is_http() {
         &entries[0]["protocol"].as_str().unwrap(),
         &"http",
     );
+
+    proxy.shutdown();
+}
+
+/// Per SPEC.md, credentials are not injected over cleartext channels. A
+/// port-80 CONNECT tunnels plain HTTP to the upstream, so even when a
+/// credential rule matches the URL, the injected header must NOT appear in
+/// the upstream-received request — same posture as an explicit plain-HTTP
+/// proxy request.
+#[tokio::test]
+async fn test_port_80_connect_does_not_inject_credentials() {
+    let t = test_report!("Port-80 CONNECT does not inject credentials (cleartext)");
+    let ca = TestCa::generate();
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&upstream)
+        .await;
+    let upstream_port = upstream.address().port();
+    let url_pattern = format!("http://localhost:{}/*", upstream_port);
+
+    let proxy = TestProxy::builder(&ca, vec![rule("*", &url_pattern)], upstream_port)
+        .credentials(vec![Credential::Header {
+            url: url_pattern.clone(),
+            header: "x-api-key".to_string(),
+            value: "should-not-inject".to_string(),
+        }])
+        .report(&t)
+        .start()
+        .await;
+
+    t.action("CONNECT localhost:80 + GET /needs-creds");
+    let mut tunnel = open_connect_tunnel(proxy.addr(), "localhost:80").await;
+    let (status, _) = tunneled_get(
+        &mut tunnel,
+        &format!("localhost:{}", upstream_port),
+        "/needs-creds",
+    )
+    .await;
+    t.assert_eq("status", &status, &200u16);
+
+    let requests = upstream.received_requests().await.unwrap();
+    t.assert_eq("one request received", &requests.len(), &1usize);
+    let has_api_key = requests[0].headers.get("x-api-key").is_some();
+    t.assert_true("no x-api-key header on upstream request", !has_api_key);
 
     proxy.shutdown();
 }
