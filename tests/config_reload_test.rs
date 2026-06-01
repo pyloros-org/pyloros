@@ -6,74 +6,9 @@
 mod common;
 
 use common::*;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
-// ReloadableProxy — test helper for config-file-based proxy with reload
-// ---------------------------------------------------------------------------
-
-struct ReloadableProxy {
-    addr: SocketAddr,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    reload_tx: tokio::sync::mpsc::Sender<()>,
-    reload_complete: Arc<tokio::sync::Notify>,
-    config_path: PathBuf,
-    _dir: tempfile::TempDir,
-}
-
-impl ReloadableProxy {
-    /// Start a proxy from a TOML config string. Writes the config to a temp file
-    /// and sets up reload trigger + completion notification.
-    async fn start(ca: &TestCa, config_toml: &str, upstream_port: u16) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, config_toml).unwrap();
-
-        let config = pyloros::Config::from_file(&config_path).unwrap();
-        let mut server = pyloros::ProxyServer::new(config)
-            .unwrap()
-            .with_config_path(config_path.clone())
-            .with_upstream_port_override(upstream_port)
-            .with_upstream_tls(ca.client_tls_config());
-
-        let reload_tx = server.reload_trigger();
-        let reload_complete = server.reload_complete_notify();
-        let addr = server.bind().await.unwrap().tcp_addr();
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ = server.serve(shutdown_rx).await;
-        });
-
-        Self {
-            addr,
-            shutdown_tx,
-            reload_tx,
-            reload_complete,
-            config_path,
-            _dir: dir,
-        }
-    }
-
-    /// Write a new config and trigger a reload, waiting for completion.
-    /// Safe in current_thread tokio runtime (default for #[tokio::test]).
-    async fn reload(&self, config_toml: &str) {
-        std::fs::write(&self.config_path, config_toml).unwrap();
-        let notified = self.reload_complete.notified();
-        self.reload_tx.send(()).await.unwrap();
-        notified.await;
-    }
-
-    fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    fn shutdown(self) {
-        let _ = self.shutdown_tx.send(());
-    }
-}
+// Config-file-based proxies with live reload use the shared
+// `TestProxy::reloadable` helper (see tests/common/mod.rs).
 
 /// Generate the [proxy] section of a config TOML with CA paths from TestCa.
 fn base_proxy_config(ca: &TestCa) -> String {
@@ -115,7 +50,7 @@ async fn test_rules_reload() {
         "{}\n[[rules]]\nmethod = \"GET\"\nurl = \"https://localhost/*\"\n",
         base_proxy_config(&ca)
     );
-    let proxy = ReloadableProxy::start(&ca, &config, upstream.port()).await;
+    let proxy = TestProxy::reloadable(&ca, &config, upstream.port()).await;
     t.setup("Proxy with rules: [`GET https://localhost/*`]");
 
     // Before reload: request is allowed
@@ -151,7 +86,7 @@ async fn test_invalid_config_preserves_old_rules() {
         "{}\n[[rules]]\nmethod = \"GET\"\nurl = \"https://localhost/*\"\n",
         base_proxy_config(&ca)
     );
-    let proxy = ReloadableProxy::start(&ca, &config, upstream.port()).await;
+    let proxy = TestProxy::reloadable(&ca, &config, upstream.port()).await;
     t.setup("Proxy with rule: `GET https://localhost/*`");
 
     // Before reload: request is allowed
@@ -190,7 +125,7 @@ async fn test_auth_reload() {
          [[rules]]\nmethod = \"GET\"\nurl = \"https://localhost/*\"\n",
         base_proxy_config(&ca)
     );
-    let proxy = ReloadableProxy::start(&ca, &config, upstream.port()).await;
+    let proxy = TestProxy::reloadable(&ca, &config, upstream.port()).await;
     t.setup("Proxy with auth (user/pass1) and rule `GET https://localhost/*`");
 
     // With correct password (pass1): allowed
@@ -249,7 +184,7 @@ async fn test_non_reloadable_field_warns() {
     );
 
     let logs = LogCapture::new();
-    let proxy = ReloadableProxy::start(&ca, &config, upstream.port()).await;
+    let proxy = TestProxy::reloadable(&ca, &config, upstream.port()).await;
     t.setup("Proxy with bind_address 127.0.0.1:0");
 
     // Reload with different bind_address
@@ -290,7 +225,7 @@ async fn test_audit_log_reload() {
         "{}\n[[rules]]\nmethod = \"GET\"\nurl = \"https://localhost/*\"\n",
         base_proxy_config(&ca)
     );
-    let proxy = ReloadableProxy::start(&ca, &config, upstream.port()).await;
+    let proxy = TestProxy::reloadable(&ca, &config, upstream.port()).await;
     t.setup("Proxy without audit log");
 
     let audit_dir = tempfile::tempdir().unwrap();
