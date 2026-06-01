@@ -77,6 +77,7 @@ CA_KEY="$TMPDIR_BASE/ca.key"
 PROXY_BIND="127.0.0.1:7777"
 DASH_BIND="127.0.0.1:7778"
 PERMANENT_RULES="$TMPDIR_BASE/approvals-permanent-rules.toml"
+AUDIT_LOG="$TMPDIR_BASE/audit.jsonl"
 CONFIG="$TMPDIR_BASE/config.toml"
 
 # Pre-allow Anthropic so Claude Code itself can talk to its own backend.
@@ -90,6 +91,7 @@ ca_key  = "$CA_KEY"
 [logging]
 level = "info"
 log_requests = true
+audit_log = "$AUDIT_LOG"
 
 [approvals]
 permanent_rules_file   = "$PERMANENT_RULES"
@@ -159,20 +161,42 @@ cat <<EOF
   Dashboard    $DASHBOARD_URL  (open in your browser)
   CA cert      $CA_CERT
   Rules file   $PERMANENT_RULES  (permanent approvals persist here)
+  Audit log    $AUDIT_LOG  (JSONL; tail -f to watch)
   Proxy log    $TMPDIR_BASE/proxy.log
   Workspace    $WORKSPACE  (claude runs here; CLAUDE.md primes the agent)
 
   Pre-allowed: *.anthropic.com
   Everything else: blocked (451) until approved via the dashboard.
 
-  When Claude needs network access for a tool call, it should hit a
-  451 and POST to https://pyloros.internal/approvals. Approve in the
-  browser, the agent's long-poll wakes up, and the rule is live.
+  Dashboard panels to explore:
+    1. Permissive-mode bar    — flip "permissive mode" on for 5/15/60
+                                min to unblock everything temporarily.
+                                Auto-expires; recorded in the audit log.
+    2. Pending approvals      — edit the rule TOML before approving
+                                (typo fix, widen URL, change git op).
+    3. Active timeboxed rules — see what's currently allowed and a
+                                Revoke button per group.
+    4. Recent blocked         — each row has a "Create rule" button
+                                that pre-fills exact + commented
+                                broader TOML (git-shape aware).
+    5. Audit log              — toggleable browser over the in-memory
+                                ring buffer; older entries on disk.
 
   Try prompts like:
     - "fetch https://httpbin.org/get and show me the JSON"
+       (then "Create rule" from the blocked row in the dashboard
+        instead of waiting for the agent to ask)
     - "clone https://github.com/anthropics/anthropic-cookbook"
+       (watch the git=fetch suggestion appear in the rule editor)
     - "curl https://api.github.com/zen"
+
+  Try from the dashboard directly:
+    - Enable permissive mode for 5 min and re-run any blocked agent
+      step — it goes through (and a permissive_enabled entry appears
+      in the audit panel).
+    - Click "Create rule" on a blocked row, tweak the TOML, hit Add
+      with a 1-hour TTL; watch it show up in "Active timeboxed rules"
+      with a countdown.
 
   Press Ctrl-C to stop everything.
 ================================================================
