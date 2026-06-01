@@ -16,6 +16,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ServerConfig};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -452,6 +453,19 @@ pub struct TestProxy {
     pub dashboard_addr: Option<SocketAddr>,
     pub approvals: Option<Arc<pyloros::approvals::ApprovalManager>>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    // Reload support: populated only when started via `reloadable()`.
+    reload: Option<ReloadHandle>,
+}
+
+/// Wiring for triggering a live config reload against a `TestProxy` started
+/// with `reloadable()`. The config file is rewritten and the reload is signaled
+/// through the proxy's own reload channel, so tests exercise the production
+/// reload path (file re-read + FilterEngine rebuild), not a shortcut.
+struct ReloadHandle {
+    config_path: PathBuf,
+    reload_tx: tokio::sync::mpsc::Sender<()>,
+    reload_complete: Arc<tokio::sync::Notify>,
+    _dir: TempDir,
 }
 
 impl TestProxy {
@@ -523,7 +537,82 @@ impl TestProxy {
             dashboard_addr,
             approvals,
             shutdown_tx,
+            reload: None,
         }
+    }
+
+    /// Start a reload-capable proxy from a raw config TOML string.
+    ///
+    /// The config is written to a temp file and `config_path` is wired up, so
+    /// `reload()` exercises the production reload path (config-file re-read +
+    /// FilterEngine rebuild) rather than a test shortcut. Upstream TLS and a
+    /// port override are applied so HTTPS requests reach a `TestUpstream`. If
+    /// the config contains an `[approvals]` section, the dashboard is bound and
+    /// the `ApprovalManager` is exposed via `self.approvals`.
+    ///
+    /// This is the shared replacement for the per-test `ReloadableProxy` /
+    /// `ReloadableApprovalsProxy` helpers.
+    pub async fn reloadable(ca: &TestCa, config_toml: &str, upstream_port: u16) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, config_toml).unwrap();
+
+        let config = Config::from_file(&config_path).unwrap();
+        let has_approvals = config.approvals.is_some();
+
+        let mut server = ProxyServer::new(config)
+            .unwrap()
+            .with_config_path(config_path.clone())
+            .with_upstream_port_override(upstream_port)
+            .with_upstream_tls(ca.client_tls_config());
+        let reload_tx = server.reload_trigger();
+        let reload_complete = server.reload_complete_notify();
+        let addr = server.bind().await.unwrap().tcp_addr();
+        let dashboard_addr = if has_approvals {
+            Some(
+                server
+                    .bind_dashboard("127.0.0.1:0")
+                    .await
+                    .unwrap()
+                    .tcp_addr(),
+            )
+        } else {
+            None
+        };
+        let approvals = server.approvals_manager().cloned();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = server.serve(shutdown_rx).await;
+        });
+
+        Self {
+            addr,
+            dashboard_addr,
+            approvals,
+            shutdown_tx,
+            reload: Some(ReloadHandle {
+                config_path,
+                reload_tx,
+                reload_complete,
+                _dir: dir,
+            }),
+        }
+    }
+
+    /// Rewrite the config file with `config_toml` and trigger a live reload,
+    /// awaiting completion. Panics if the proxy was not started via
+    /// `reloadable()`. Passing the same TOML the proxy started with simulates a
+    /// SIGHUP / file-watcher event that doesn't change the rules.
+    pub async fn reload(&self, config_toml: &str) {
+        let h = self
+            .reload
+            .as_ref()
+            .expect("reload() requires a proxy started via TestProxy::reloadable()");
+        std::fs::write(&h.config_path, config_toml).unwrap();
+        let notified = h.reload_complete.notified();
+        h.reload_tx.send(()).await.unwrap();
+        notified.await;
     }
 
     pub fn addr(&self) -> SocketAddr {
