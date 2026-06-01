@@ -19,7 +19,7 @@
       .controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-top: .5rem; }
       .controls select, .controls input, .controls textarea { font: inherit; padding: .3rem; border: 1px solid #ccc; border-radius: 3px; }
       .deny-msg { flex: 1; min-width: 220px; height: 2.2em; resize: vertical; }
-      .rule-toml { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: .85em; padding: .5rem; border: 1px solid #ddd; border-radius: 4px; min-height: 5em; }
+      .rule-toml { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: .85em; padding: .5rem; border: 1px solid #ddd; border-radius: 4px; min-height: 9em; resize: vertical; }
       .parse-error { color: #c13030; font-size: .85em; margin-top: .25rem; white-space: pre-wrap; font-family: ui-monospace, monospace; display: none; }
       .approve { background: #1b8f3a; color: #fff; border-color: #1b8f3a; }
       .deny { background: #c13030; color: #fff; border-color: #c13030; }
@@ -79,13 +79,10 @@
     <h2>Active timeboxed rules</h2>
     <div id="active-list"></div>
 
-    <h2>Recent blocked requests</h2>
-    <div id="blocked-list"></div>
-
     <h2>Audit log
       <label class="inline" style="font-weight: normal; margin-left: .5rem;">
         <input type="checkbox" id="audit-include-allowed" />
-        show allowed + permitted
+        also show allowed (rule-matched) requests
       </label>
     </h2>
     <div id="audit-list"></div>
@@ -95,7 +92,6 @@
       const els = {
         pending: document.getElementById('pending-list'),
         active: document.getElementById('active-list'),
-        blocked: document.getElementById('blocked-list'),
         audit: document.getElementById('audit-list'),
         permBar: document.getElementById('perm-bar'),
         permStatus: document.getElementById('perm-status'),
@@ -334,21 +330,7 @@
         }
       }
 
-      // ---------- recent blocked + audit list ----------
-      function renderBlocked() {
-        const items = state.recent_blocked.slice(0, 50);
-        if (items.length === 0) {
-          els.blocked.innerHTML = '<div class="empty">No recent blocked requests.</div>';
-          return;
-        }
-        els.blocked.innerHTML = '<div class="audit-list"></div>';
-        const list = els.blocked.firstElementChild;
-        for (const e of items) {
-          const row = auditRow(e, true);
-          list.appendChild(row);
-        }
-      }
-
+      // ---------- audit list ----------
       function renderAudit() {
         const src = state.showAllowed ? state.recent_all : state.recent_blocked;
         const items = src.slice(0, 100);
@@ -358,10 +340,16 @@
         }
         els.audit.innerHTML = '<div class="audit-list"></div>';
         const list = els.audit.firstElementChild;
-        for (const e of items) list.appendChild(auditRow(e, false));
+        for (const e of items) list.appendChild(auditRow(e));
       }
 
-      function auditRow(e, withCreateButton) {
+      // Events where "Create rule" makes sense: a real request that
+      // either was blocked, was let through only because permissive
+      // mode was on (so the user likely wants a permanent rule), or
+      // failed auth.
+      const RULE_EVENTS = new Set(['request_blocked', 'request_permitted', 'auth_failed']);
+
+      function auditRow(e) {
         const row = document.createElement('div');
         const cls = e.event === 'request_blocked' ? 'blocked'
                   : e.event === 'request_permitted' ? 'permitted'
@@ -375,7 +363,7 @@
           : `<span class="method">${escapeHtml(e.method)}</span><span class="url">${escapeHtml(e.url)}</span>`;
         const reason = e.reason ? `<span class="reason">${escapeHtml(e.reason)}</span>` : '';
         row.innerHTML = `<span class="ts">${escapeHtml(ts)}</span>${ev}${reason}`;
-        if (withCreateButton && (e.event === 'request_blocked' || e.event === 'auth_failed')) {
+        if (RULE_EVENTS.has(e.event)) {
           const btn = document.createElement('button');
           btn.className = 'small createrule';
           btn.textContent = 'Create rule';
@@ -433,7 +421,7 @@
           }
         });
         card.querySelector('.cancel').addEventListener('click', () => card.remove());
-        els.blocked.parentElement.insertBefore(card, els.blocked);
+        els.audit.parentElement.insertBefore(card, els.audit);
       }
 
       // ---------- notifications ----------
@@ -479,7 +467,6 @@
         renderPermissive();
         renderPending();
         renderActive();
-        renderBlocked();
         renderAudit();
       }
 
@@ -522,11 +509,15 @@
             // Prepend, cap to a reasonable size to bound memory.
             state.recent_all.unshift(e);
             if (state.recent_all.length > 500) state.recent_all.pop();
+            // recent_blocked is what the audit panel shows when the
+            // "show allowed + permitted" toggle is OFF; keep it in sync
+            // with the server's filter (blocked / auth_failed / both
+            // permissive-toggle events).
             if (e.event === 'request_blocked' || e.event === 'auth_failed'
+                || e.event === 'request_permitted'
                 || e.event === 'permissive_enabled' || e.event === 'permissive_disabled') {
               state.recent_blocked.unshift(e);
               if (state.recent_blocked.length > 500) state.recent_blocked.pop();
-              renderBlocked();
             }
             renderAudit();
           }

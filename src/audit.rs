@@ -273,9 +273,12 @@ impl AuditLogger {
         *self.subscriber.lock().unwrap() = Some(cb);
     }
 
-    /// Most recent entries, newest first. If `include_allowed` is false,
-    /// only blocked / auth-failed entries are returned. Permissive-mode
-    /// toggle entries are always included so the user can correlate.
+    /// Most recent entries, newest first. With `include_allowed = false`
+    /// returns the entries the user typically acts on: blocked,
+    /// auth-failed, permitted (unmatched but let through by permissive
+    /// mode — the "discover rules while permissive" workflow), and
+    /// permissive-mode toggle markers. `include_allowed = true` also
+    /// returns the `RequestAllowed` rows that matched an explicit rule.
     pub fn recent_entries(&self, include_allowed: bool) -> Vec<AuditEntrySnapshot> {
         let buf = self.recent.lock().unwrap();
         buf.iter()
@@ -288,6 +291,7 @@ impl AuditLogger {
                     e.event,
                     AuditEvent::RequestBlocked
                         | AuditEvent::AuthFailed
+                        | AuditEvent::RequestPermitted
                         | AuditEvent::PermissiveEnabled
                         | AuditEvent::PermissiveDisabled
                 )
