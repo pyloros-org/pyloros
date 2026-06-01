@@ -1,9 +1,12 @@
 mod common;
 
 use common::{ok_handler, ReportingClient, TestCa, TestProxy, TestUpstream};
-use pyloros::approvals::{ApprovalStatus, Lifetime};
+use pyloros::approvals::{ApprovalManager, ApprovalStatus, Lifetime};
 use pyloros::config::Rule;
 use serde_json::json;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Build a method Rule for tests. Mirrors the JSON shape the API now accepts.
 fn method_rule(method: &str, url: &str) -> Rule {
@@ -1107,6 +1110,269 @@ async fn test_git_fetch_rule_roundtrip() {
         .get("https://localhost/repo/info/refs?service=git-upload-pack")
         .await;
     t.assert_eq("post-approval info/refs", &resp.status().as_u16(), &200u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Config-reload + approvals interaction
+//
+// Regression coverage for a bug where a config reload (SIGHUP / config-file
+// watcher) rebuilt the FilterEngine from `config.rules` alone, silently
+// dropping every permanent approval rule loaded from the permanent-rules file.
+// Startup merged them correctly, but the first reload wiped them — so loaded
+// permanent approvals "didn't apply" in real usage.
+// ---------------------------------------------------------------------------
+
+/// Build a full config TOML with an `[approvals]` section plus the given
+/// `[[rules]]` block. Used both to start the proxy and to rewrite the file for
+/// a live reload.
+fn approvals_config_toml(ca: &TestCa, rules_toml: &str, permanent_rules_path: &str) -> String {
+    format!(
+        "[proxy]\nbind_address = \"127.0.0.1:0\"\nca_cert = \"{}\"\nca_key = \"{}\"\n\n\
+         [approvals]\npermanent_rules_file = \"{}\"\ndashboard_bind = \"127.0.0.1:0\"\n\n{}",
+        ca.cert_path, ca.key_path, permanent_rules_path, rules_toml,
+    )
+}
+
+/// A proxy with approvals enabled AND a config file on disk, so tests can
+/// trigger a realistic live reload (the production path that dropped approval
+/// rules). Mirrors `ReloadableProxy` in `config_reload_test.rs`, but exposes the
+/// `ApprovalManager` so the test can grant permanent approvals.
+struct ReloadableApprovalsProxy {
+    addr: SocketAddr,
+    manager: Arc<ApprovalManager>,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    reload_tx: tokio::sync::mpsc::Sender<()>,
+    reload_complete: Arc<tokio::sync::Notify>,
+    config_path: PathBuf,
+    config_toml: String,
+    _dir: tempfile::TempDir,
+}
+
+impl ReloadableApprovalsProxy {
+    async fn start(
+        ca: &TestCa,
+        rules_toml: &str,
+        permanent_rules_path: &str,
+        upstream_port: u16,
+    ) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let config_toml = approvals_config_toml(ca, rules_toml, permanent_rules_path);
+        std::fs::write(&config_path, &config_toml).unwrap();
+
+        let config = pyloros::Config::from_file(&config_path).unwrap();
+        let mut server = pyloros::ProxyServer::new(config)
+            .unwrap()
+            .with_config_path(config_path.clone())
+            .with_upstream_port_override(upstream_port)
+            .with_upstream_tls(ca.client_tls_config());
+
+        let reload_tx = server.reload_trigger();
+        let reload_complete = server.reload_complete_notify();
+        let addr = server.bind().await.unwrap().tcp_addr();
+        let manager = server.approvals_manager().cloned().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = server.serve(shutdown_rx).await;
+        });
+
+        Self {
+            addr,
+            manager,
+            shutdown_tx,
+            reload_tx,
+            reload_complete,
+            config_path,
+            config_toml,
+            _dir: dir,
+        }
+    }
+
+    /// Grant a permanent approval for a single GET rule and wait for the
+    /// rebuild to propagate.
+    async fn approve_permanent_get(&self, url: &str) {
+        let req = self
+            .manager
+            .post(vec![method_rule("GET", url)], None, None, None)
+            .unwrap();
+        self.manager
+            .resolve(
+                &req.id,
+                ApprovalStatus::Approved {
+                    rules_applied: vec![method_rule("GET", url)],
+                    ttl: Lifetime::Permanent,
+                },
+            )
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// Rewrite the config file with `config_toml` and trigger a live reload,
+    /// awaiting completion.
+    async fn reload(&self, config_toml: &str) {
+        std::fs::write(&self.config_path, config_toml).unwrap();
+        let notified = self.reload_complete.notified();
+        self.reload_tx.send(()).await.unwrap();
+        notified.await;
+    }
+
+    /// Trigger a reload that rewrites the same config — the realistic case where
+    /// something touches the config file or sends SIGHUP without changing rules.
+    async fn reload_unchanged(&self) {
+        let toml = self.config_toml.clone();
+        self.reload(&toml).await;
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+    }
+}
+
+/// A permanent approval loaded into the FilterEngine must survive a config
+/// reload. Before the fix, `apply_reload` rebuilt the engine from
+/// `config.rules` alone, so the first reload silently dropped the approval and
+/// the request started getting blocked.
+#[tokio::test]
+async fn test_permanent_approval_survives_config_reload() {
+    let t = test_report!("Permanent approval rules survive a config reload");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("hello from upstream"))
+        .report(&t, "returns 'hello from upstream'")
+        .start()
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let permanent_rules_path = dir
+        .path()
+        .join("approvals.toml")
+        .to_string_lossy()
+        .into_owned();
+
+    // Base config has NO rules — only the permanent approval can allow the request.
+    let proxy =
+        ReloadableApprovalsProxy::start(&ca, "", &permanent_rules_path, upstream.port()).await;
+
+    proxy.approve_permanent_get("https://localhost/*").await;
+
+    // Before reload: the permanent approval allows the request.
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client.get("https://localhost/before").await;
+    t.assert_eq("before reload: status", &resp.status().as_u16(), &200u16);
+
+    // Trigger a live reload of the (unchanged) config — the production path that
+    // previously rebuilt the FilterEngine from config.rules alone.
+    t.action("Trigger config reload");
+    proxy.reload_unchanged().await;
+
+    // After reload: the permanent approval must STILL apply. New client because
+    // reqwest reuses CONNECT tunnels from the old connection otherwise.
+    let client2 = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client2.get("https://localhost/after").await;
+    t.assert_eq("after reload: status", &resp.status().as_u16(), &200u16);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+/// A reload that changes the base rules must apply the new base rules AND
+/// preserve active permanent approvals — i.e. the rebuilt engine is
+/// `new_config.rules ++ active_approval_rules`, not one or the other.
+#[tokio::test]
+async fn test_config_reload_merges_new_base_rules_with_approvals() {
+    let t = test_report!("Config reload applies new base rules while preserving approvals");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
+        .report(&t, "returns 200")
+        .start()
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let permanent_rules_path = dir
+        .path()
+        .join("approvals.toml")
+        .to_string_lossy()
+        .into_owned();
+
+    // Base rule allows /base/*.
+    let base_rules = "[[rules]]\nmethod = \"GET\"\nurl = \"https://localhost/base/*\"\n";
+    let proxy =
+        ReloadableApprovalsProxy::start(&ca, base_rules, &permanent_rules_path, upstream.port())
+            .await;
+
+    // Permanent approval allows /approved/*.
+    proxy
+        .approve_permanent_get("https://localhost/approved/*")
+        .await;
+
+    // Before reload: both the base rule and the approval apply.
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    t.assert_eq(
+        "before: /base allowed",
+        &client
+            .get("https://localhost/base/x")
+            .await
+            .status()
+            .as_u16(),
+        &200u16,
+    );
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    t.assert_eq(
+        "before: /approved allowed",
+        &client
+            .get("https://localhost/approved/x")
+            .await
+            .status()
+            .as_u16(),
+        &200u16,
+    );
+
+    // Reload with base rules now allowing /reloaded/* instead of /base/*.
+    let reloaded_rules = "[[rules]]\nmethod = \"GET\"\nurl = \"https://localhost/reloaded/*\"\n";
+    let new_toml = approvals_config_toml(&ca, reloaded_rules, &permanent_rules_path);
+    t.action("Reload config: base rules /base/* -> /reloaded/*");
+    proxy.reload(&new_toml).await;
+
+    // After reload: approval preserved, new base rule applied, old base rule gone.
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    t.assert_eq(
+        "after: /approved still allowed",
+        &client
+            .get("https://localhost/approved/x")
+            .await
+            .status()
+            .as_u16(),
+        &200u16,
+    );
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    t.assert_eq(
+        "after: /reloaded now allowed",
+        &client
+            .get("https://localhost/reloaded/x")
+            .await
+            .status()
+            .as_u16(),
+        &200u16,
+    );
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    t.assert_eq(
+        "after: /base now blocked",
+        &client
+            .get("https://localhost/base/x")
+            .await
+            .status()
+            .as_u16(),
+        &451u16,
+    );
 
     proxy.shutdown();
     upstream.shutdown();
