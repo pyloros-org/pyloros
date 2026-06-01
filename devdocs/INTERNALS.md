@@ -239,3 +239,39 @@ healthcheck probes to `http://127.0.0.1:8080/`), HTTP-level checks like `wget --
 fail. Instead, `nc -z 127.0.0.1 8080` performs a TCP port check — available via BusyBox
 in Alpine without extra packages.
 
+
+## Dashboard recent-audit buffer
+
+The dashboard's "recent blocked requests" and "audit log browser" panels read
+from an in-memory ring buffer attached to `AuditLogger` (capacity ~500 entries),
+not from the JSONL file on disk. Rationale:
+
+- Reuses the existing write site — the logger already serializes every decision,
+  so we get the same data for free.
+- Keeps the JSONL file contract untouched: the file is still the
+  source-of-truth, append-only, exact bytes the user expects from `tail`.
+- Avoids parsing a potentially-large JSONL file on every dashboard load.
+- Memory is bounded (snapshots strip request/response bodies — only
+  `event`, `decision`, `reason`, method, URL, host, timestamp, and any
+  `permissive_*` fields are kept).
+
+The dashboard explicitly notes "older entries available in the audit log file
+at <path>" so users know the in-memory view is intentionally truncated.
+
+## Timeboxed permissive mode
+
+Permissive mode is now routed through `ApprovalManager` so the dashboard can
+toggle it at runtime without a config reload. `proxy.permissive = true` in
+the config file still works as a permanent override; the dashboard toggle
+layers on top via `ApprovalManager::is_permissive_active()`, which the
+proxy queries on each request decision (via the `TunnelHandler` / `ProxyHandler`
+factory). When the timer fires, the manager calls `request_rebuild()` on the
+same channel approval-rule changes use, so a new `TunnelHandler` gets
+broadcast and subsequent requests see the flipped flag.
+
+Permissive-mode toggles emit dedicated audit entries
+(`AuditEvent::PermissiveEnabled` / `PermissiveDisabled`) with
+`permissive_duration_secs` and `permissive_source` (`dashboard`,
+`dashboard_clear`, `expired`) fields. Method/URL/host fields are set to `"-"`
+placeholders since these entries are not per-request — keeping the schema
+consistent rather than introducing per-variant required-vs-optional rules.
