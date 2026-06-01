@@ -551,6 +551,12 @@ impl TestProxy {
     /// the `ApprovalManager` is exposed via `self.approvals`.
     ///
     /// Shared by `config_reload_test` and the approvals reload tests.
+    ///
+    /// Separate from `builder()` rather than a `.reloadable()` flag because the
+    /// builder is value-based while reload is TOML-text-based: reload tests
+    /// rewrite the file with raw TOML the builder can't express (invalid TOML, a
+    /// changed `bind_address`), and a builder-built config would have to be
+    /// serialized back to TOML to be reloadable.
     pub async fn reloadable(ca: &TestCa, config_toml: &str, upstream_port: u16) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
