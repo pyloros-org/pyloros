@@ -44,8 +44,6 @@ pub struct TriggeredBy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifetime {
-    /// Active only for the proxy's current process lifetime.
-    Session,
     /// Active for one hour.
     OneHour,
     /// Active for 24 hours.
@@ -56,13 +54,13 @@ pub enum Lifetime {
 
 impl Lifetime {
     /// Duration for lifetimes that have a natural expiry, else `None`.
-    /// Session and Permanent never expire in memory — Session is dropped
-    /// on process exit, Permanent is loaded from the permanent-rules file on startup.
+    /// Permanent is loaded from the permanent-rules file on startup and
+    /// never expires in memory.
     pub fn duration(self) -> Option<std::time::Duration> {
         match self {
             Lifetime::OneHour => Some(std::time::Duration::from_secs(3600)),
             Lifetime::OneDay => Some(std::time::Duration::from_secs(86_400)),
-            Lifetime::Session | Lifetime::Permanent => None,
+            Lifetime::Permanent => None,
         }
     }
 

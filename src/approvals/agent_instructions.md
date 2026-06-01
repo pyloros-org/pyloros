@@ -30,7 +30,7 @@ Request body (JSON):
   "context": {
     "triggered_by": {"method": "GET", "url": "https://api.example.com/whatever"}
   },
-  "suggested_ttl": "session"
+  "suggested_ttl": "one_hour"
 }
 ```
 

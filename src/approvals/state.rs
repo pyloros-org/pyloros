@@ -320,8 +320,7 @@ impl ApprovalManager {
             }
         }
 
-        // Schedule expiry for timed lifetimes. Permanent never expires
-        // automatically; Session is dropped on process exit.
+        // Schedule expiry for timed lifetimes. Permanent never expires.
         if let Some(ttl) = approve_ttl {
             if let Some(duration) = ttl.duration() {
                 self.spawn_expiry_timer(id.to_string(), duration);
