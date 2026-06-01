@@ -174,6 +174,11 @@ pub enum NotifierEvent {
     ActiveRulesChanged {
         rules: Vec<ActiveApprovalSnapshot>,
     },
+    /// A new audit entry was recorded — broadcast so the dashboard's
+    /// "recent blocked" and "audit log browser" panels update live.
+    Audit {
+        entry: crate::audit::AuditEntrySnapshot,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

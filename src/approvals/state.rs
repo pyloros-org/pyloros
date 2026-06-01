@@ -127,9 +127,16 @@ impl ApprovalManager {
         })
     }
 
-    /// Attach the audit logger so permissive-toggle entries can be recorded.
-    /// Silent no-op if already attached.
-    pub fn attach_audit_logger(&self, logger: Arc<crate::audit::AuditLogger>) {
+    /// Attach the audit logger so permissive-toggle entries can be recorded
+    /// and audit snapshots forwarded to dashboard SSE subscribers. Silent
+    /// no-op if already attached.
+    pub fn attach_audit_logger(self: &Arc<Self>, logger: Arc<crate::audit::AuditLogger>) {
+        let notifier = self.notifier.clone();
+        logger.set_subscriber(Arc::new(move |snapshot| {
+            let _ = notifier.send(NotifierEvent::Audit {
+                entry: snapshot.clone(),
+            });
+        }));
         let _ = self.audit_logger.set(logger);
     }
 

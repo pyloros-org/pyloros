@@ -181,6 +181,67 @@ pub fn now_iso8601() -> String {
 /// and fast, avoiding the need for tokio's `fs` feature.
 pub struct AuditLogger {
     writer: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+    /// In-memory ring buffer of recent entries (snapshots only, bodies
+    /// stripped) so the dashboard can show recent activity without
+    /// re-parsing the JSONL file. Bounded to `RECENT_BUFFER_CAPACITY`.
+    recent: std::sync::Mutex<std::collections::VecDeque<AuditEntrySnapshot>>,
+    /// Optional callback fired after every entry is recorded — used
+    /// by `ApprovalManager` to forward the snapshot to dashboard SSE
+    /// subscribers. Wrapped in a Mutex so it can be set after construction.
+    subscriber: std::sync::Mutex<Option<AuditSubscriber>>,
+}
+
+/// Callback type for `AuditLogger::set_subscriber`. Boxed once at
+/// registration; clippy flagged the inline form as too complex.
+pub type AuditSubscriber = Arc<dyn Fn(&AuditEntrySnapshot) + Send + Sync>;
+
+/// Capacity of the in-memory audit ring buffer. ~500 entries keeps
+/// memory tiny while covering the recent-history window the dashboard
+/// shows.
+pub const RECENT_BUFFER_CAPACITY: usize = 500;
+
+use std::sync::Arc;
+
+/// Lightweight snapshot of an audit entry for dashboard display.
+/// Drops request/response bodies to keep the in-memory buffer small,
+/// while keeping the fields users actually scan: method, URL, host,
+/// reason, and the permissive-toggle metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEntrySnapshot {
+    pub timestamp: String,
+    pub event: AuditEvent,
+    pub method: String,
+    pub url: String,
+    pub host: String,
+    pub scheme: String,
+    pub protocol: String,
+    pub decision: AuditDecision,
+    pub reason: AuditReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<AuditGitInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_duration_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_source: Option<String>,
+}
+
+impl AuditEntrySnapshot {
+    fn from_entry(e: &AuditEntry) -> Self {
+        Self {
+            timestamp: e.timestamp.clone(),
+            event: e.event.clone(),
+            method: e.method.clone(),
+            url: e.url.clone(),
+            host: e.host.clone(),
+            scheme: e.scheme.clone(),
+            protocol: e.protocol.clone(),
+            decision: e.decision.clone(),
+            reason: e.reason.clone(),
+            git: e.git.clone(),
+            permissive_duration_secs: e.permissive_duration_secs,
+            permissive_source: e.permissive_source.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for AuditLogger {
@@ -198,7 +259,41 @@ impl AuditLogger {
             .open(path)?;
         Ok(Self {
             writer: std::sync::Mutex::new(std::io::BufWriter::new(file)),
+            recent: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                RECENT_BUFFER_CAPACITY,
+            )),
+            subscriber: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Register a callback fired on every recorded entry. Used by
+    /// `ApprovalManager` to broadcast audit snapshots over the dashboard
+    /// SSE channel. Replaces any previously-registered callback.
+    pub fn set_subscriber(&self, cb: AuditSubscriber) {
+        *self.subscriber.lock().unwrap() = Some(cb);
+    }
+
+    /// Most recent entries, newest first. If `include_allowed` is false,
+    /// only blocked / auth-failed entries are returned. Permissive-mode
+    /// toggle entries are always included so the user can correlate.
+    pub fn recent_entries(&self, include_allowed: bool) -> Vec<AuditEntrySnapshot> {
+        let buf = self.recent.lock().unwrap();
+        buf.iter()
+            .rev()
+            .filter(|e| {
+                if include_allowed {
+                    return true;
+                }
+                matches!(
+                    e.event,
+                    AuditEvent::RequestBlocked
+                        | AuditEvent::AuthFailed
+                        | AuditEvent::PermissiveEnabled
+                        | AuditEvent::PermissiveDisabled
+                )
+            })
+            .cloned()
+            .collect()
     }
 
     /// Write an audit entry as a JSON line. Errors are logged but never propagated.
@@ -221,10 +316,23 @@ impl AuditLogger {
         };
         if let Err(e) = writeln!(writer, "{}", json) {
             tracing::error!(error = %e, "Failed to write audit entry");
-            return;
-        }
-        if let Err(e) = writer.flush() {
+        } else if let Err(e) = writer.flush() {
             tracing::error!(error = %e, "Failed to flush audit log");
+        }
+        drop(writer);
+
+        // Push into the in-memory ring buffer and fire the subscriber
+        // (if any) so dashboards update live.
+        let snapshot = AuditEntrySnapshot::from_entry(entry);
+        {
+            let mut buf = self.recent.lock().unwrap();
+            if buf.len() >= RECENT_BUFFER_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(snapshot.clone());
+        }
+        if let Some(cb) = self.subscriber.lock().unwrap().as_ref() {
+            cb(&snapshot);
         }
     }
 }
