@@ -64,6 +64,14 @@ impl ProxyHandler {
         self
     }
 
+    pub fn with_approvals(
+        mut self,
+        manager: Option<Arc<crate::approvals::ApprovalManager>>,
+    ) -> Self {
+        self.logger = self.logger.with_approvals(manager);
+        self
+    }
+
     pub fn with_max_body_log_size(mut self, size: usize) -> Self {
         self.max_body_log_size = size;
         self
@@ -138,6 +146,8 @@ impl ProxyHandler {
                 response_body: None,
                 response_body_encoding: None,
                 body_truncated: None,
+                permissive_duration_secs: None,
+                permissive_source: None,
             });
             return Ok(auth_required_response());
         }
@@ -181,6 +191,8 @@ impl ProxyHandler {
                 response_body: None,
                 response_body_encoding: None,
                 body_truncated: None,
+                permissive_duration_secs: None,
+                permissive_source: None,
             });
             return Ok(blocked_response("CONNECT", &url));
         }
@@ -289,6 +301,8 @@ impl ProxyHandler {
                     response_body: None,
                     response_body_encoding: None,
                     body_truncated: None,
+                    permissive_duration_secs: None,
+                    permissive_source: None,
                 });
                 return Ok(blocked_response(&method, &full_url));
             }
@@ -339,6 +353,8 @@ impl ProxyHandler {
                                 response_body: Some(resp_str),
                                 response_body_encoding: resp_enc,
                                 body_truncated: if truncated { Some(true) } else { None },
+                                permissive_duration_secs: None,
+                                permissive_source: None,
                             });
                             let new_body =
                                 Full::new(resp_body_bytes).map_err(|e| match e {}).boxed();

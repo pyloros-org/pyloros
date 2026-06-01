@@ -104,12 +104,76 @@ pub enum DecisionAction {
     Deny,
 }
 
+/// Snapshot of an active (approved-and-still-effective) rule group, used
+/// by the dashboard "active timeboxed rules" panel and the `/state`
+/// endpoint. One snapshot per `ApprovalManager::ActiveApproval` entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveApprovalSnapshot {
+    /// Group identifier — the originating approval id, or a synthetic
+    /// `rul_…` id for rules added directly through the dashboard. Used
+    /// as the path component for `DELETE /approvals/{id}/rules`.
+    pub approval_id: String,
+    pub rule: Rule,
+    pub lifetime: Lifetime,
+    /// Seconds remaining before expiry. `None` for `Permanent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_secs: Option<u64>,
+    /// Pre-formatted TOML representation of the rule, so the dashboard
+    /// can render it without needing a separate format round-trip.
+    pub toml: String,
+}
+
+/// Status of the dashboard-controlled permissive-mode override.
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissiveStatus {
+    pub active: bool,
+    /// Seconds remaining before auto-disable. `None` when inactive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_secs: Option<u64>,
+}
+
+/// Source of a permissive-mode toggle, threaded into audit entries.
+#[derive(Debug, Clone, Copy)]
+pub enum PermissiveSource {
+    /// User clicked "enable permissive mode" in the dashboard.
+    Dashboard,
+    /// User clicked "disable" (clear) in the dashboard.
+    DashboardClear,
+    /// Auto-disable timer fired.
+    Expired,
+}
+
+impl PermissiveSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissiveSource::Dashboard => "dashboard",
+            PermissiveSource::DashboardClear => "dashboard_clear",
+            PermissiveSource::Expired => "expired",
+        }
+    }
+}
+
 /// Event broadcast to dashboard SSE subscribers.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum NotifierEvent {
-    Pending { approval: ApprovalRequest },
-    Resolved { id: String, status: ApprovalStatus },
+    Pending {
+        approval: ApprovalRequest,
+    },
+    Resolved {
+        id: String,
+        status: ApprovalStatus,
+    },
+    /// Dashboard-controlled permissive-mode override changed state.
+    PermissiveChanged {
+        status: PermissiveStatus,
+    },
+    /// The active timeboxed-rules set changed (rule added, revoked, or
+    /// auto-expired). Carries the full list so dashboards stay in sync
+    /// without separate fetches.
+    ActiveRulesChanged {
+        rules: Vec<ActiveApprovalSnapshot>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

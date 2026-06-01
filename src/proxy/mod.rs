@@ -13,6 +13,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use std::sync::Arc;
 
+use crate::approvals::ApprovalManager;
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason,
 };
@@ -56,7 +57,12 @@ pub(crate) struct RequestLogger {
     pub audit_logger: Option<Arc<AuditLogger>>,
     pub log_allowed_requests: bool,
     pub log_blocked_requests: bool,
-    pub permissive: bool,
+    /// Permissive mode from the config (`[proxy] permissive = true`),
+    /// fixed for the lifetime of this handler.
+    pub permissive_base: bool,
+    /// Optional approvals manager; if set, also consults the
+    /// dashboard-controlled timeboxed permissive override on each request.
+    pub approvals: Option<Arc<ApprovalManager>>,
 }
 
 impl RequestLogger {
@@ -65,7 +71,8 @@ impl RequestLogger {
             audit_logger: None,
             log_allowed_requests: true,
             log_blocked_requests: true,
-            permissive: false,
+            permissive_base: false,
+            approvals: None,
         }
     }
 
@@ -81,8 +88,24 @@ impl RequestLogger {
     }
 
     pub fn with_permissive(mut self, permissive: bool) -> Self {
-        self.permissive = permissive;
+        self.permissive_base = permissive;
         self
+    }
+
+    pub fn with_approvals(mut self, approvals: Option<Arc<ApprovalManager>>) -> Self {
+        self.approvals = approvals;
+        self
+    }
+
+    /// Effective permissive flag at this instant: config flag OR an active
+    /// dashboard-triggered override.
+    pub fn is_permissive_now(&self) -> bool {
+        self.permissive_base
+            || self
+                .approvals
+                .as_ref()
+                .map(|m| m.is_permissive_active())
+                .unwrap_or(false)
     }
 
     pub fn emit_audit(&self, entry: AuditEntry) {
@@ -101,14 +124,15 @@ impl RequestLogger {
         &self,
         ctx: &RequestContext<'_>,
     ) -> Option<hyper::Response<BoxBody<Bytes, hyper::Error>>> {
-        if self.permissive {
+        let permissive = self.is_permissive_now();
+        if permissive {
             tracing::warn!(method = %ctx.method, url = %ctx.url, "PERMITTED{}", ctx.label);
         } else if self.log_blocked_requests {
             tracing::warn!(method = %ctx.method, url = %ctx.url, "BLOCKED{}", ctx.label);
         }
         self.emit_audit(AuditEntry {
             timestamp: crate::audit::now_iso8601(),
-            event: if self.permissive {
+            event: if permissive {
                 AuditEvent::RequestPermitted
             } else {
                 AuditEvent::RequestBlocked
@@ -118,7 +142,7 @@ impl RequestLogger {
             host: ctx.host.to_string(),
             scheme: ctx.scheme.to_string(),
             protocol: ctx.protocol.to_string(),
-            decision: if self.permissive {
+            decision: if permissive {
                 AuditDecision::Allowed
             } else {
                 AuditDecision::Blocked
@@ -131,8 +155,10 @@ impl RequestLogger {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
         });
-        if self.permissive {
+        if permissive {
             None
         } else {
             Some(blocked_response(ctx.method, ctx.url))
@@ -188,6 +214,8 @@ impl RequestLogger {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
         });
     }
 }

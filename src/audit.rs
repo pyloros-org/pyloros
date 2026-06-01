@@ -11,6 +11,11 @@ pub enum AuditEvent {
     RequestBlocked,
     RequestPermitted,
     AuthFailed,
+    /// Dashboard-triggered timeboxed permissive mode was enabled.
+    PermissiveEnabled,
+    /// Dashboard-triggered timeboxed permissive mode was disabled
+    /// (manually cleared or auto-expired).
+    PermissiveDisabled,
 }
 
 /// Decision outcome.
@@ -38,6 +43,8 @@ pub enum AuditReason {
     /// Request was allowed because its (method, URL) was advertised as an LFS action
     /// in a recent successful Git-LFS batch response.
     LfsActionWhitelisted,
+    /// Marker for permissive-mode toggle audit entries; not a request decision.
+    PermissiveToggle,
 }
 
 /// Credential info attached to an audit entry.
@@ -80,6 +87,65 @@ pub struct AuditEntry {
     pub response_body_encoding: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_truncated: Option<bool>,
+    /// For `PermissiveEnabled` entries: how long the override was set for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_duration_secs: Option<u64>,
+    /// For `PermissiveEnabled` / `PermissiveDisabled` entries: who/what
+    /// triggered the toggle (`"dashboard"`, `"dashboard_clear"`, `"expired"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_source: Option<String>,
+}
+
+impl AuditEntry {
+    /// Build a permissive-mode-enabled audit entry. Method/URL/host are
+    /// `"-"` placeholders since this entry is not tied to a single
+    /// request — see INTERNALS.md "Timeboxed permissive mode".
+    pub fn permissive_enabled(duration_secs: u64, source: &str) -> Self {
+        Self {
+            timestamp: now_iso8601(),
+            event: AuditEvent::PermissiveEnabled,
+            method: "-".to_string(),
+            url: "-".to_string(),
+            host: "-".to_string(),
+            scheme: "-".to_string(),
+            protocol: "-".to_string(),
+            decision: AuditDecision::Allowed,
+            reason: AuditReason::PermissiveToggle,
+            credential: None,
+            git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
+            permissive_duration_secs: Some(duration_secs),
+            permissive_source: Some(source.to_string()),
+        }
+    }
+
+    /// Build a permissive-mode-disabled audit entry.
+    pub fn permissive_disabled(source: &str) -> Self {
+        Self {
+            timestamp: now_iso8601(),
+            event: AuditEvent::PermissiveDisabled,
+            method: "-".to_string(),
+            url: "-".to_string(),
+            host: "-".to_string(),
+            scheme: "-".to_string(),
+            protocol: "-".to_string(),
+            decision: AuditDecision::Blocked,
+            reason: AuditReason::PermissiveToggle,
+            credential: None,
+            git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: Some(source.to_string()),
+        }
+    }
 }
 
 /// Encode a body for inclusion in an audit entry.
@@ -115,6 +181,12 @@ pub fn now_iso8601() -> String {
 /// and fast, avoiding the need for tokio's `fs` feature.
 pub struct AuditLogger {
     writer: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogger").finish_non_exhaustive()
+    }
 }
 
 impl AuditLogger {
@@ -182,6 +254,8 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_contains("has event", &json, "\"event\":\"request_allowed\"");
@@ -212,6 +286,8 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_true("no credential field", !json.contains("\"credential\""));
@@ -243,6 +319,8 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -337,6 +415,8 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
         };
         logger.log(&entry);
 

@@ -79,6 +79,9 @@ impl TunnelHandler {
     /// `https://pyloros.internal/` are routed to the agent API handler
     /// instead of being treated as a normal upstream host.
     pub fn with_approvals(mut self, manager: Arc<ApprovalManager>) -> Self {
+        // Also wire into the logger so dashboard-controlled permissive
+        // overrides take effect on HTTPS requests too.
+        self.logger = self.logger.with_approvals(Some(Arc::clone(&manager)));
         self.approvals = Some(manager);
         self
     }
@@ -292,7 +295,8 @@ impl TunnelHandler {
                     self_arc.logger.log_blocked_requests,
                 )
                 .with_audit_logger(self_arc.logger.audit_logger.clone())
-                .with_permissive(self_arc.logger.permissive)
+                .with_permissive(self_arc.logger.permissive_base)
+                .with_approvals(self_arc.logger.approvals.clone())
                 .with_max_body_log_size(self_arc.max_body_log_size);
                 handler.handle(req).await
             }
@@ -424,6 +428,8 @@ impl TunnelHandler {
                         response_body: None,
                         response_body_encoding: None,
                         body_truncated: None,
+                        permissive_duration_secs: None,
+                        permissive_source: None,
                     });
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
                 }
@@ -511,6 +517,8 @@ impl TunnelHandler {
                         response_body: None,
                         response_body_encoding: None,
                         body_truncated: None,
+                        permissive_duration_secs: None,
+                        permissive_source: None,
                     });
                     return Ok(blocked_response(&method, &full_url));
                 }
@@ -718,6 +726,8 @@ impl TunnelHandler {
             response_body: Some(resp_str),
             response_body_encoding: resp_enc,
             body_truncated: if truncated { Some(true) } else { None },
+            permissive_duration_secs: None,
+            permissive_source: None,
         });
     }
 
