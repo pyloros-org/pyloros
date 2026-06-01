@@ -4,7 +4,7 @@
 //! single-sourced (via serde + `toml::to_string`); the dashboard never
 //! constructs TOML in JS.
 
-use crate::audit::{AuditEntry, AuditEvent, AuditReason};
+use crate::audit::{AuditEntrySnapshot, AuditEvent, AuditGitInfo, AuditReason};
 use crate::config::Rule;
 
 /// Format a single `Rule` as a `[[rules]]` TOML block. Falls back to a
@@ -40,7 +40,7 @@ pub fn format_rules_toml(rules: &[Rule]) -> String {
 /// blocks the suggestion uses a `git = "..."` rule instead; for
 /// `branch_restriction` blocks a commented `branches = [...]` line is
 /// included so the user can opt into allowing the blocked refs.
-pub fn suggest_for_audit_entry(entry: &AuditEntry) -> String {
+pub fn suggest_for_audit_snapshot(entry: &AuditEntrySnapshot) -> String {
     // Permissive-toggle entries aren't request decisions, so there's
     // nothing meaningful to turn into a rule.
     if matches!(
@@ -55,7 +55,7 @@ pub fn suggest_for_audit_entry(entry: &AuditEntry) -> String {
 
     let git_op = detect_git_op(url, &entry.reason);
     if let Some(op) = git_op {
-        return suggest_git(url, op, entry);
+        return suggest_git(url, op, entry.git.as_ref(), &entry.reason);
     }
 
     let host_wildcard_url = host_wildcard_for(url);
@@ -83,7 +83,12 @@ pub fn suggest_for_audit_entry(entry: &AuditEntry) -> String {
     format!("{}\n# Or, broader:\n{}", exact, broader_commented)
 }
 
-fn suggest_git(url: &str, op: &'static str, entry: &AuditEntry) -> String {
+fn suggest_git(
+    url: &str,
+    op: &'static str,
+    git_info: Option<&AuditGitInfo>,
+    reason: &AuditReason,
+) -> String {
     // Strip git endpoint suffixes to get the repo URL.
     let repo_url = strip_git_suffix(url).to_string();
     let mut exact = Rule {
@@ -98,7 +103,7 @@ fn suggest_git(url: &str, op: &'static str, entry: &AuditEntry) -> String {
 
     // If this was a branch_restriction block, surface the blocked refs
     // as a commented `branches = [...]` line.
-    let blocked_refs = match (&entry.reason, &entry.git) {
+    let blocked_refs = match (reason, git_info) {
         (AuditReason::BranchRestriction, Some(g)) => g.blocked_refs.clone(),
         _ => Vec::new(),
     };

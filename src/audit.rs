@@ -1,10 +1,10 @@
 //! Structured JSONL audit logging for request decisions.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Event type for an audit entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEvent {
     RequestAllowed,
@@ -19,7 +19,7 @@ pub enum AuditEvent {
 }
 
 /// Decision outcome.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditDecision {
     Allowed,
@@ -27,7 +27,7 @@ pub enum AuditDecision {
 }
 
 /// Reason for the decision.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditReason {
     RuleMatched,
@@ -56,7 +56,7 @@ pub struct AuditCredential {
 }
 
 /// Git-specific info attached to an audit entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditGitInfo {
     pub blocked_refs: Vec<String>,
 }
@@ -206,7 +206,7 @@ use std::sync::Arc;
 /// Drops request/response bodies to keep the in-memory buffer small,
 /// while keeping the fields users actually scan: method, URL, host,
 /// reason, and the permissive-toggle metadata.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntrySnapshot {
     pub timestamp: String,
     pub event: AuditEvent,

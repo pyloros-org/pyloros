@@ -146,6 +146,12 @@ impl ApprovalManager {
         }
     }
 
+    /// Borrow the attached audit logger (used by the dashboard to read
+    /// the recent-entries ring buffer).
+    pub fn audit_logger_ref(&self) -> Option<&Arc<crate::audit::AuditLogger>> {
+        self.audit_logger.get()
+    }
+
     /// Attach the mpsc channel that the proxy's main select loop listens
     /// on for FilterEngine rebuilds. Called once by `ProxyServer::serve`.
     pub fn attach_rebuild_tx(&self, tx: mpsc::Sender<()>) {
