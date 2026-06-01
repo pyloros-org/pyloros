@@ -550,8 +550,7 @@ impl TestProxy {
     /// the config contains an `[approvals]` section, the dashboard is bound and
     /// the `ApprovalManager` is exposed via `self.approvals`.
     ///
-    /// This is the shared replacement for the per-test `ReloadableProxy` /
-    /// `ReloadableApprovalsProxy` helpers.
+    /// Shared by `config_reload_test` and the approvals reload tests.
     pub async fn reloadable(ca: &TestCa, config_toml: &str, upstream_port: u16) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
