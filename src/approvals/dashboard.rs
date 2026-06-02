@@ -73,7 +73,7 @@ async fn dispatch(
         (&Method::POST, "/permissive") => serve_permissive(manager, req).await,
         (&Method::POST, "/rules") => serve_add_rules(manager, req).await,
         (&Method::POST, "/rules/parse") => serve_rules_parse(req).await,
-        (&Method::POST, "/rules/suggest") => serve_rules_suggest(manager, req).await,
+        (&Method::POST, "/rules/suggest") => serve_rules_suggest(req).await,
         (&Method::POST, p) if p.starts_with("/approvals/") && p.ends_with("/decision") => {
             let id = p
                 .trim_start_matches("/approvals/")
@@ -333,10 +333,7 @@ struct RulesSuggestResponse {
     toml: String,
 }
 
-async fn serve_rules_suggest(
-    manager: Arc<ApprovalManager>,
-    req: Request<Incoming>,
-) -> Response<BoxBody<Bytes, hyper::Error>> {
+async fn serve_rules_suggest(req: Request<Incoming>) -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = match read_body(req).await {
         Ok(b) => b,
         Err(e) => return bad_request(&e),
@@ -346,17 +343,7 @@ async fn serve_rules_suggest(
         Err(e) => return bad_request(&format!("invalid JSON: {}", e)),
     };
     let toml_str = match parsed {
-        RulesSuggestBody::AuditEntry { mut audit } => {
-            // If the dashboard's snapshot pre-dates the redirect being
-            // observed, the in-memory ring buffer may have a fresher
-            // copy with redirect_target set. Cross-check by URL.
-            if audit.redirect_target.is_none() {
-                if let Some(logger) = manager.audit_logger_ref() {
-                    if let Some(t) = logger.lookup_redirect_target(&audit.url) {
-                        audit.redirect_target = Some(t);
-                    }
-                }
-            }
+        RulesSuggestBody::AuditEntry { audit } => {
             rule_suggest::suggest_for_audit_snapshot(audit.as_ref())
         }
         RulesSuggestBody::RawRules { rules } => rule_suggest::format_rules_toml(&rules),

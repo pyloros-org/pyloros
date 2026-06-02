@@ -285,23 +285,6 @@ impl AuditLogger {
         *self.subscriber.lock().unwrap() = Some(cb);
     }
 
-    /// Look up the most recent observed redirect target for a given
-    /// request URL. Used by `/rules/suggest` as a fallback when the
-    /// dashboard's audit snapshot is older than the redirect
-    /// observation (e.g. clicking Create-rule on a blocked entry after
-    /// permissive mode previously captured the redirect target).
-    pub fn lookup_redirect_target(&self, request_url: &str) -> Option<String> {
-        let buf = self.recent.lock().unwrap();
-        for e in buf.iter().rev() {
-            if e.url == request_url {
-                if let Some(t) = &e.redirect_target {
-                    return Some(t.clone());
-                }
-            }
-        }
-        None
-    }
-
     /// Annotate the most recent matching ring-buffer entry with the
     /// redirect target observed in its response. Used by the proxy on
     /// every 3xx response so `/rules/suggest` can pre-fill
