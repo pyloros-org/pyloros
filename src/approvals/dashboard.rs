@@ -23,7 +23,6 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
 use hyper::body::Incoming;
-use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
@@ -68,8 +67,6 @@ where
             tracing::debug!("dashboard service error: {}", e);
         }
     }
-    // Silence unused import: hyper::Request reads through axum extractors.
-    let _ = std::marker::PhantomData::<Request<Incoming>>;
 }
 
 // ---------- routes ----------
