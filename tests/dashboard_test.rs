@@ -585,3 +585,130 @@ async fn test_state_includes_recent_audit_entries() {
     proxy.shutdown();
     upstream.shutdown();
 }
+
+/// /rules/suggest pre-fills `allow_redirects` with the observed
+/// redirect target when the audit snapshot carries one. Both an exact
+/// URL and a host-wildcard alternative are emitted.
+#[tokio::test]
+async fn test_rules_suggest_includes_observed_redirect_target() {
+    let t = test_report!(
+        "/rules/suggest pre-fills allow_redirects from the audit entry's redirect_target"
+    );
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
+        .report(&t, "ok")
+        .start()
+        .await;
+    let (proxy, _rules_file, _audit_file) = start_proxy(&t, &ca, upstream.port()).await;
+    let dashboard = format!("http://{}", proxy.dashboard_addr.unwrap());
+    let http = http_client();
+
+    // Synthesize an audit snapshot with redirect_target set, matching
+    // what the proxy would attach after seeing a 3xx response.
+    let entry = json!({
+        "timestamp": "2026-06-02T00:00:00Z",
+        "event": "request_permitted",
+        "method": "GET",
+        "url": "https://login.example.com/start",
+        "host": "login.example.com",
+        "scheme": "https",
+        "protocol": "https",
+        "decision": "allowed",
+        "reason": "no_matching_rule",
+        "redirect_target": "https://auth.example.com/callback?ticket=abc",
+    });
+    let (s, body) = json_post(
+        &http,
+        format!("{}/rules/suggest", dashboard),
+        json!({"audit": entry}),
+    )
+    .await;
+    t.assert_eq("status", &s, &200u16);
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    let toml_text = parsed["toml"].as_str().unwrap().to_string();
+
+    t.assert_contains(
+        "allow_redirects exact present",
+        toml_text.as_str(),
+        "allow_redirects = [\"https://auth.example.com/callback?ticket=abc\"]",
+    );
+    t.assert_contains(
+        "wildcard alternative present",
+        toml_text.as_str(),
+        "https://auth.example.com/*",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+/// If the dashboard's audit snapshot pre-dates the redirect-target
+/// observation, the suggest endpoint falls back to looking up the
+/// ring buffer for a fresher entry on the same URL.
+#[tokio::test]
+async fn test_rules_suggest_falls_back_to_ring_buffer_redirect() {
+    let t = test_report!(
+        "/rules/suggest looks up the ring buffer when the dashboard snapshot lacks redirect_target"
+    );
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
+        .report(&t, "ok")
+        .start()
+        .await;
+    let (proxy, _rules_file, _audit_file) = start_proxy(&t, &ca, upstream.port()).await;
+    let manager = proxy.approvals.as_ref().unwrap();
+    let dashboard = format!("http://{}", proxy.dashboard_addr.unwrap());
+    let http = http_client();
+
+    // Drive a permitted request into the audit log so the ring buffer
+    // has an entry for the URL, then post-hoc annotate it with a
+    // redirect target (simulating what the proxy does on a 3xx).
+    {
+        let (_, _) = json_post(
+            &http,
+            format!("{}/permissive", dashboard),
+            json!({"duration_secs": 60}),
+        )
+        .await;
+        let client = ReportingClient::new(&t, proxy.addr(), &ca);
+        let _ = client.get("https://target.example.com/path").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        manager.audit_logger_ref().unwrap().record_redirect(
+            "https://target.example.com/path",
+            "https://final.example.com/callback",
+        );
+    }
+
+    // The snapshot the dashboard would send has no redirect_target on
+    // it (e.g. the SSE update arrived after the user cached the row).
+    let stale = json!({
+        "timestamp": "2026-06-02T00:00:00Z",
+        "event": "request_permitted",
+        "method": "GET",
+        "url": "https://target.example.com/path",
+        "host": "target.example.com",
+        "scheme": "https",
+        "protocol": "https",
+        "decision": "allowed",
+        "reason": "no_matching_rule",
+    });
+    let (_, body) = json_post(
+        &http,
+        format!("{}/rules/suggest", dashboard),
+        json!({"audit": stale}),
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    let toml_text = parsed["toml"].as_str().unwrap().to_string();
+
+    t.assert_contains(
+        "fallback brought in redirect_target from ring buffer",
+        toml_text.as_str(),
+        "allow_redirects = [\"https://final.example.com/callback\"]",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}

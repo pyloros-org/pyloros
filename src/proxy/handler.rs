@@ -148,6 +148,7 @@ impl ProxyHandler {
                 body_truncated: None,
                 permissive_duration_secs: None,
                 permissive_source: None,
+                redirect_target: None,
             });
             return Ok(auth_required_response());
         }
@@ -193,6 +194,7 @@ impl ProxyHandler {
                 body_truncated: None,
                 permissive_duration_secs: None,
                 permissive_source: None,
+                redirect_target: None,
             });
             return Ok(blocked_response("CONNECT", &url));
         }
@@ -303,6 +305,7 @@ impl ProxyHandler {
                     body_truncated: None,
                     permissive_duration_secs: None,
                     permissive_source: None,
+                    redirect_target: None,
                 });
                 return Ok(blocked_response(&method, &full_url));
             }
@@ -355,6 +358,7 @@ impl ProxyHandler {
                                 body_truncated: if truncated { Some(true) } else { None },
                                 permissive_duration_secs: None,
                                 permissive_source: None,
+                                redirect_target: None,
                             });
                             let new_body =
                                 Full::new(resp_body_bytes).map_err(|e| match e {}).boxed();
@@ -386,12 +390,12 @@ impl ProxyHandler {
         let upstream_port = port.unwrap_or(80);
         match forward_http_request(&host, upstream_port, req).await {
             Ok(resp) => {
+                let status = resp.status().as_u16();
+                let location = resp
+                    .headers()
+                    .get(hyper::header::LOCATION)
+                    .and_then(|v| v.to_str().ok());
                 if let Some(patterns) = redirect_patterns.as_ref() {
-                    let status = resp.status().as_u16();
-                    let location = resp
-                        .headers()
-                        .get(hyper::header::LOCATION)
-                        .and_then(|v| v.to_str().ok());
                     if let Some(target) = maybe_whitelist_redirect(
                         status,
                         location,
@@ -405,6 +409,20 @@ impl ProxyHandler {
                             status = %status,
                             "REDIRECT whitelisted (HTTP)"
                         );
+                    }
+                }
+                // Annotate the audit entry with the redirect target
+                // regardless of allow_redirects pattern matching, so
+                // `/rules/suggest` can pre-fill `allow_redirects` for
+                // permissive-mode / blocked-rule / rule-matched alike.
+                if (300..400).contains(&status) {
+                    if let (Some(loc), Some(logger)) = (location, self.logger.audit_logger.as_ref())
+                    {
+                        if let Some(target) =
+                            crate::filter::dynamic_whitelist::resolve_location(&full_url, loc)
+                        {
+                            logger.record_redirect(&full_url, &target);
+                        }
                     }
                 }
                 Ok(resp)

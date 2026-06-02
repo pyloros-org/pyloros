@@ -94,6 +94,13 @@ pub struct AuditEntry {
     /// triggered the toggle (`"dashboard"`, `"dashboard_clear"`, `"expired"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissive_source: Option<String>,
+    /// If the response to this request was a 3xx with a resolvable
+    /// `Location`, the absolute target URL. Captured opportunistically
+    /// on every forwarded response; surfaces in `/rules/suggest` as a
+    /// pre-filled `allow_redirects` entry. Single-hop only; multi-hop
+    /// chains would need cross-entry correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_target: Option<String>,
 }
 
 impl AuditEntry {
@@ -120,6 +127,7 @@ impl AuditEntry {
             body_truncated: None,
             permissive_duration_secs: Some(duration_secs),
             permissive_source: Some(source.to_string()),
+            redirect_target: None,
         }
     }
 
@@ -144,6 +152,7 @@ impl AuditEntry {
             body_truncated: None,
             permissive_duration_secs: None,
             permissive_source: Some(source.to_string()),
+            redirect_target: None,
         }
     }
 }
@@ -223,6 +232,8 @@ pub struct AuditEntrySnapshot {
     pub permissive_duration_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissive_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_target: Option<String>,
 }
 
 impl AuditEntrySnapshot {
@@ -240,6 +251,7 @@ impl AuditEntrySnapshot {
             git: e.git.clone(),
             permissive_duration_secs: e.permissive_duration_secs,
             permissive_source: e.permissive_source.clone(),
+            redirect_target: e.redirect_target.clone(),
         }
     }
 }
@@ -271,6 +283,55 @@ impl AuditLogger {
     /// SSE channel. Replaces any previously-registered callback.
     pub fn set_subscriber(&self, cb: AuditSubscriber) {
         *self.subscriber.lock().unwrap() = Some(cb);
+    }
+
+    /// Look up the most recent observed redirect target for a given
+    /// request URL. Used by `/rules/suggest` as a fallback when the
+    /// dashboard's audit snapshot is older than the redirect
+    /// observation (e.g. clicking Create-rule on a blocked entry after
+    /// permissive mode previously captured the redirect target).
+    pub fn lookup_redirect_target(&self, request_url: &str) -> Option<String> {
+        let buf = self.recent.lock().unwrap();
+        for e in buf.iter().rev() {
+            if e.url == request_url {
+                if let Some(t) = &e.redirect_target {
+                    return Some(t.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Annotate the most recent matching ring-buffer entry with the
+    /// redirect target observed in its response. Used by the proxy on
+    /// every 3xx response so `/rules/suggest` can pre-fill
+    /// `allow_redirects` for the next hop. No-op if no matching entry
+    /// is found (the file is append-only and not updated either way —
+    /// the redirect target lives in the in-memory snapshot only, which
+    /// is what dashboards consume).
+    pub fn record_redirect(&self, request_url: &str, target: &str) {
+        let mut buf = self.recent.lock().unwrap();
+        for e in buf.iter_mut().rev() {
+            if e.url == request_url
+                && matches!(
+                    e.event,
+                    AuditEvent::RequestAllowed
+                        | AuditEvent::RequestPermitted
+                        | AuditEvent::RequestBlocked
+                )
+            {
+                e.redirect_target = Some(target.to_string());
+                // Re-fire the subscriber so SSE consumers see the
+                // updated entry. Clone the snapshot to drop the buffer
+                // lock before firing.
+                let snap = e.clone();
+                drop(buf);
+                if let Some(cb) = self.subscriber.lock().unwrap().as_ref() {
+                    cb(&snap);
+                }
+                return;
+            }
+        }
     }
 
     /// Most recent entries, newest first. With `include_allowed = false`
@@ -368,6 +429,7 @@ mod tests {
             body_truncated: None,
             permissive_duration_secs: None,
             permissive_source: None,
+            redirect_target: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_contains("has event", &json, "\"event\":\"request_allowed\"");
@@ -400,6 +462,7 @@ mod tests {
             body_truncated: None,
             permissive_duration_secs: None,
             permissive_source: None,
+            redirect_target: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_true("no credential field", !json.contains("\"credential\""));
@@ -433,6 +496,7 @@ mod tests {
             body_truncated: None,
             permissive_duration_secs: None,
             permissive_source: None,
+            redirect_target: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -529,6 +593,7 @@ mod tests {
             body_truncated: None,
             permissive_duration_secs: None,
             permissive_source: None,
+            redirect_target: None,
         };
         logger.log(&entry);
 

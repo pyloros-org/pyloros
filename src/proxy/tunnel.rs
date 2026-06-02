@@ -172,6 +172,37 @@ impl TunnelHandler {
         }
     }
 
+    /// On every forwarded response (3xx or otherwise), if there's a
+    /// resolvable `Location` header, annotate the matching audit
+    /// ring-buffer entry with the resolved target URL. The proxy
+    /// doesn't care about pattern matching here — this is purely for
+    /// dashboard `allow_redirects` suggestions.
+    fn record_redirect_audit(
+        &self,
+        status: u16,
+        headers: &hyper::header::HeaderMap,
+        request_url: &str,
+    ) {
+        if !(300..400).contains(&status) {
+            return;
+        }
+        let Some(logger) = self.logger.audit_logger.as_ref() else {
+            return;
+        };
+        let Some(location) = headers
+            .get(hyper::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return;
+        };
+        let Some(target) =
+            crate::filter::dynamic_whitelist::resolve_location(request_url, location)
+        else {
+            return;
+        };
+        logger.record_redirect(request_url, &target);
+    }
+
     /// Run a MITM tunnel on an upgraded connection
     pub async fn run_mitm_tunnel(
         self: &Arc<Self>,
@@ -430,6 +461,7 @@ impl TunnelHandler {
                         body_truncated: None,
                         permissive_duration_secs: None,
                         permissive_source: None,
+                        redirect_target: None,
                     });
                     return Ok(git_blocked_push_response(&body_bytes, &blocked));
                 }
@@ -519,6 +551,7 @@ impl TunnelHandler {
                         body_truncated: None,
                         permissive_duration_secs: None,
                         permissive_source: None,
+                        redirect_target: None,
                     });
                     return Ok(blocked_response(&method, &full_url));
                 }
@@ -694,6 +727,7 @@ impl TunnelHandler {
                     &full_url,
                     redirect_patterns.as_ref(),
                 );
+                self.record_redirect_audit(resp.status().as_u16(), resp.headers(), &full_url);
                 Ok(resp)
             }
             Err(e) => {
@@ -728,6 +762,7 @@ impl TunnelHandler {
             body_truncated: if truncated { Some(true) } else { None },
             permissive_duration_secs: None,
             permissive_source: None,
+            redirect_target: None,
         });
     }
 

@@ -157,6 +157,7 @@ impl RequestLogger {
             body_truncated: None,
             permissive_duration_secs: None,
             permissive_source: None,
+            redirect_target: None,
         });
         if permissive {
             None
@@ -216,6 +217,7 @@ impl RequestLogger {
             body_truncated: None,
             permissive_duration_secs: None,
             permissive_source: None,
+            redirect_target: None,
         });
     }
 }

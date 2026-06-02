@@ -506,18 +506,22 @@
             renderActive();
           } else if (msg.event === 'audit') {
             const e = msg.entry;
-            // Prepend, cap to a reasonable size to bound memory.
-            state.recent_all.unshift(e);
-            if (state.recent_all.length > 500) state.recent_all.pop();
-            // recent_blocked is what the audit panel shows when the
-            // "show allowed + permitted" toggle is OFF; keep it in sync
-            // with the server's filter (blocked / auth_failed / both
-            // permissive-toggle events).
+            // The server re-fires the SSE audit callback when an
+            // existing entry is mutated (e.g. redirect_target attached
+            // after the response arrives). Replace in place if we
+            // already have an entry with the same timestamp+url+event;
+            // otherwise prepend.
+            const sameKey = x => x.timestamp === e.timestamp && x.url === e.url && x.event === e.event;
+            const upsert = (arr) => {
+              const i = arr.findIndex(sameKey);
+              if (i >= 0) arr[i] = e; else arr.unshift(e);
+              if (arr.length > 500) arr.pop();
+            };
+            upsert(state.recent_all);
             if (e.event === 'request_blocked' || e.event === 'auth_failed'
                 || e.event === 'request_permitted'
                 || e.event === 'permissive_enabled' || e.event === 'permissive_disabled') {
-              state.recent_blocked.unshift(e);
-              if (state.recent_blocked.length > 500) state.recent_blocked.pop();
+              upsert(state.recent_blocked);
             }
             renderAudit();
           }

@@ -58,6 +58,15 @@ pub fn suggest_for_audit_snapshot(entry: &AuditEntrySnapshot) -> String {
         return suggest_git(url, op, entry.git.as_ref(), &entry.reason);
     }
 
+    // If we observed a redirect target for this request, pre-fill
+    // `allow_redirects` with two alternatives: the exact target URL,
+    // and a host-wildcard form. The first form is what serde emits;
+    // the second is appended as a commented suggestion the user can
+    // un-comment.
+    let (allow_redirects_exact, allow_redirects_wildcard) = match entry.redirect_target.as_deref() {
+        Some(t) => (vec![t.to_string()], Some(host_wildcard_for(t))),
+        None => (Vec::new(), None),
+    };
     let host_wildcard_url = host_wildcard_for(url);
     let exact = format_rule_toml(&Rule {
         method: Some(method.to_string()),
@@ -65,7 +74,7 @@ pub fn suggest_for_audit_snapshot(entry: &AuditEntrySnapshot) -> String {
         websocket: false,
         git: None,
         branches: None,
-        allow_redirects: Vec::new(),
+        allow_redirects: allow_redirects_exact.clone(),
         log_body: false,
     });
 
@@ -75,12 +84,19 @@ pub fn suggest_for_audit_snapshot(entry: &AuditEntrySnapshot) -> String {
         websocket: false,
         git: None,
         branches: None,
-        allow_redirects: Vec::new(),
+        allow_redirects: allow_redirects_exact,
         log_body: false,
     });
     let broader_commented = comment_block(&broader);
 
-    format!("{}\n# Or, broader:\n{}", exact, broader_commented)
+    let mut out = format!("{}\n# Or, broader:\n{}", exact, broader_commented);
+    if let Some(wild) = allow_redirects_wildcard {
+        out.push_str(&format!(
+            "\n# Or, broaden the redirect target to all paths on its host:\n# allow_redirects = [{:?}]\n",
+            wild
+        ));
+    }
+    out
 }
 
 fn suggest_git(
