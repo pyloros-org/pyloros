@@ -47,7 +47,7 @@ fi
 BINARY=""
 MAIN_WORKTREE=""
 if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    MAIN_WORKTREE="$(git -C "$PROJECT_DIR" worktree list --porcelain | head -1 | sed 's/^worktree //')"
+    MAIN_WORKTREE="$(git -C "$PROJECT_DIR" worktree list --porcelain | awk 'NR==1{sub(/^worktree /,"");print}')"
 fi
 for search_dir in "$PROJECT_DIR" ${MAIN_WORKTREE:+"$MAIN_WORKTREE"}; do
     for candidate in \
@@ -133,7 +133,7 @@ fi
 # Test 2: Blocked URL returns 451
 echo "Test 2: Blocked URL returns HTTP 451"
 set +e
-run_bwrap curl -so /dev/null -w '%{http_code}' https://httpbin.org/get
+run_bwrap curl -so /dev/null -w '%{http_code}' https://blocked.invalid/get
 EXIT_CODE=$?
 set -e
 
@@ -208,7 +208,7 @@ fi
 # Test 5: Blocked host is not in /etc/hosts so DNS fails
 echo "Test 5: Blocked host fails to resolve (not in generated /etc/hosts)"
 set +e
-run_bwrap_direct curl --noproxy '*' --connect-timeout 3 -so /dev/null https://httpbin.org/get
+run_bwrap_direct curl --noproxy '*' --connect-timeout 3 -so /dev/null https://blocked.invalid/get
 EXIT_CODE=$?
 set -e
 

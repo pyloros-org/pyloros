@@ -47,7 +47,7 @@ fi
 
 # Find the pyloros binary: check PROJECT_DIR first, then the main git worktree
 BINARY=""
-MAIN_WORKTREE="$(git -C "$PROJECT_DIR" worktree list --porcelain | head -1 | sed 's/^worktree //')"
+MAIN_WORKTREE="$(git -C "$PROJECT_DIR" worktree list --porcelain | awk 'NR==1{sub(/^worktree /,"");print}')"
 for search_dir in "$PROJECT_DIR" "$MAIN_WORKTREE"; do
     for candidate in \
         "$search_dir/target/x86_64-unknown-linux-musl/release/pyloros" \
@@ -140,11 +140,11 @@ sandbox_exec_direct() {
 echo ""
 echo "Test 1: Allowed HTTPS request through proxy"
 set +e
-OUTPUT=$(sandbox_exec curl -sf https://httpbin.org/robots.txt 2>&1)
+OUTPUT=$(sandbox_exec curl -sf https://example.com/ 2>&1)
 EXIT_CODE=$?
 set -e
 
-if [[ $EXIT_CODE -eq 0 ]] && echo "$OUTPUT" | grep -q "Disallow"; then
+if [[ $EXIT_CODE -eq 0 ]] && echo "$OUTPUT" | grep -q "Example Domain"; then
     pass "Allowed HTTPS request succeeds and returns expected content"
 else
     fail "Allowed HTTPS request (exit=$EXIT_CODE)"
@@ -170,7 +170,7 @@ fi
 # Test 3: Blocked URL returns 451
 echo "Test 3: Blocked URL returns HTTP 451"
 set +e
-HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/get 2>&1)
+HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://blocked.invalid/get 2>&1)
 EXIT_CODE=$?
 set -e
 
@@ -228,11 +228,11 @@ fi
 # Test 6: Direct HTTPS allowed request (no HTTP_PROXY, DNS → proxy:443)
 echo "Test 6: Direct HTTPS allowed request (no proxy env)"
 set +e
-OUTPUT=$(sandbox_exec_direct curl -sf https://httpbin.org/robots.txt 2>&1)
+OUTPUT=$(sandbox_exec_direct curl -sf https://example.com/ 2>&1)
 EXIT_CODE=$?
 set -e
 
-if [[ $EXIT_CODE -eq 0 ]] && echo "$OUTPUT" | grep -q "Disallow"; then
+if [[ $EXIT_CODE -eq 0 ]] && echo "$OUTPUT" | grep -q "Example Domain"; then
     pass "Direct HTTPS allowed request succeeds without HTTP_PROXY"
 else
     fail "Direct HTTPS allowed request (exit=$EXIT_CODE)"
@@ -243,7 +243,7 @@ fi
 # Test 7: Direct HTTPS blocked URL still returns 451 (proxy enforces, not DNS)
 echo "Test 7: Direct HTTPS blocked URL returns HTTP 451"
 set +e
-HTTP_CODE=$(sandbox_exec_direct curl -so /dev/null -w '%{http_code}' https://httpbin.org/get 2>&1)
+HTTP_CODE=$(sandbox_exec_direct curl -so /dev/null -w '%{http_code}' https://blocked.invalid/get 2>&1)
 EXIT_CODE=$?
 set -e
 
@@ -297,14 +297,14 @@ wait_for_url() {
     return 1
 }
 
-# Sanity: httpbin.org/uuid is currently blocked (only /robots.txt is allowed)
+# Sanity: www.example.com is currently blocked (only example.com is allowed)
 echo ""
-echo "Test 9: Pre-reload, httpbin.org/uuid is blocked (HTTP 451)"
+echo "Test 9: Pre-reload, www.example.com is blocked (HTTP 451)"
 set +e
-HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
+HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://www.example.com/ 2>&1)
 set -e
 if [[ "$HTTP_CODE" == "451" ]]; then
-    pass "httpbin.org/uuid blocked before reload"
+    pass "www.example.com blocked before reload"
 else
     fail "Expected 451 before reload, got '$HTTP_CODE'"
 fi
@@ -318,17 +318,17 @@ cat >> "$TMP_CFG" <<'EOF'
 
 [[rules]]
 method = "GET"
-url = "https://httpbin.org/uuid"
+url = "https://www.example.com/"
 EOF
 mv -f "$TMP_CFG" "$CONFIG_FILE"
 
 set +e
-wait_for_url https://httpbin.org/uuid 200
+wait_for_url https://www.example.com/ 200
 RELOAD_RC=$?
-HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://httpbin.org/uuid 2>&1)
+HTTP_CODE=$(sandbox_exec curl -so /dev/null -w '%{http_code}' https://www.example.com/ 2>&1)
 set -e
 if [[ $RELOAD_RC -eq 0 && "$HTTP_CODE" == "200" ]]; then
-    pass "Atomic-rename edit triggered reload (httpbin.org/uuid now 200)"
+    pass "Atomic-rename edit triggered reload (www.example.com now 200)"
 else
     fail "Atomic-rename edit did not trigger reload (final HTTP=$HTTP_CODE, wait_rc=$RELOAD_RC)"
     echo "    --- proxy logs (last 30 lines) ---"

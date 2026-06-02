@@ -39,13 +39,13 @@ Use `scripts/pyloros-test-proxy.sh` to quickly test the proxy against real serve
 
 ```bash
 # Test curl through proxy
-scripts/pyloros-test-proxy.sh --rule 'GET https://httpbin.org/*' -- curl -sS https://httpbin.org/get
+scripts/pyloros-test-proxy.sh --rule 'GET https://example.com/*' -- curl -sS https://example.com/
 
 # Test wget through proxy
 scripts/pyloros-test-proxy.sh --rule 'GET https://www.google.com/*' -- wget -O /dev/null https://www.google.com/
 
 # Multiple rules
-scripts/pyloros-test-proxy.sh --rule 'GET https://api.github.com/*' --rule '* https://httpbin.org/*' \
+scripts/pyloros-test-proxy.sh --rule 'GET https://api.github.com/*' --rule '* https://example.com/*' \
   -- curl -sS https://api.github.com/zen
 
 # Interactive shell with proxy configured

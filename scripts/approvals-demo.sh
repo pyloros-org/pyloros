@@ -170,7 +170,7 @@ cat <<EOF
   browser, the agent's long-poll wakes up, and the rule is live.
 
   Try prompts like:
-    - "fetch https://httpbin.org/get and show me the JSON"
+    - "fetch https://example.com/ and show me the response"
     - "clone https://github.com/anthropics/anthropic-cookbook"
     - "curl https://api.github.com/zen"
 
