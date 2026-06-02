@@ -324,9 +324,6 @@ impl ApprovalManager {
             status,
         });
 
-        // `add_rules_internal` handles persistence, expiry scheduling,
-        // FilterEngine rebuild signaling, and the active-rules
-        // broadcast. Skipped for denials.
         if let Some(ttl) = approve_ttl {
             self.add_rules_internal(id.to_string(), parsed_rules, ttl);
         }
