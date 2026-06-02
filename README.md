@@ -439,7 +439,7 @@ cargo fmt --check             # Check formatting
 
 ```bash
 # Test with curl
-scripts/pyloros-test-proxy.sh --rule 'GET https://httpbin.org/*' -- curl -sS https://httpbin.org/get
+scripts/pyloros-test-proxy.sh --rule 'GET https://example.com/*' -- curl -sS https://example.com/
 
 # Test with wget
 scripts/pyloros-test-proxy.sh --rule 'GET https://www.google.com/*' -- wget -O /dev/null https://www.google.com/

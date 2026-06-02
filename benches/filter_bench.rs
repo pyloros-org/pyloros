@@ -69,7 +69,7 @@ fn build_rules() -> Vec<Rule> {
         "https://ifconfig.me/*",
         "https://checkip.amazonaws.com/*",
         "https://api.ipify.org/*",
-        "https://httpbin.org/get",
+        "https://example.com/get",
         "https://jsonplaceholder.typicode.com/*",
         "https://catfact.ninja/*",
     ];
