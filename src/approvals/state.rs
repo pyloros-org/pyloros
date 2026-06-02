@@ -146,8 +146,7 @@ impl ApprovalManager {
         }
     }
 
-    /// Borrow the attached audit logger (used by the dashboard to read
-    /// the recent-entries ring buffer).
+    /// Borrow the attached audit logger, if any.
     pub fn audit_logger_ref(&self) -> Option<&Arc<crate::audit::AuditLogger>> {
         self.audit_logger.get()
     }
@@ -330,10 +329,9 @@ impl ApprovalManager {
         Ok(())
     }
 
-    /// Add rules directly without an originating pending approval. Used
-    /// by the dashboard's "Create rule from blocked request" endpoint.
-    /// Validates each rule, generates a synthetic `rul_…` group id (used
-    /// later for revocation), and shares all bookkeeping with `resolve`.
+    /// Add rules directly without an originating pending approval.
+    /// Validates each rule and assigns a synthetic `rul_…` group id so
+    /// the resulting `ActiveApproval` entries can be revoked together.
     pub fn add_rules(
         self: &Arc<Self>,
         rules: Vec<Rule>,
@@ -351,9 +349,9 @@ impl ApprovalManager {
         Ok(group_id)
     }
 
-    /// Shared core: append rules to the active set, persist any
-    /// permanent ones, schedule expiry, signal a rebuild, and broadcast
-    /// the updated active-rules snapshot.
+    /// Append rules to the active set, persist any permanent ones,
+    /// schedule expiry, signal a rebuild, and broadcast the updated
+    /// active-rules snapshot.
     fn add_rules_internal(self: &Arc<Self>, group_id: String, rules: Vec<Rule>, ttl: Lifetime) {
         if rules.is_empty() {
             return;
@@ -540,7 +538,6 @@ impl ApprovalManager {
     }
 
     /// Is the dashboard-controlled permissive override currently active?
-    /// Cheap check used by the proxy on every blocked-request decision.
     pub fn is_permissive_active(&self) -> bool {
         let state = self.state.lock().unwrap();
         match state.permissive_until {

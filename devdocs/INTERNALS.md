@@ -248,15 +248,16 @@ not from the JSONL file on disk. Rationale:
 
 - Reuses the existing write site — the logger already serializes every decision,
   so we get the same data for free.
-- Keeps the JSONL file contract untouched: the file is still the
+- Keeps the JSONL file contract untouched: the file is the
   source-of-truth, append-only, exact bytes the user expects from `tail`.
 - Avoids parsing a potentially-large JSONL file on every dashboard load.
 - Memory is bounded (snapshots strip request/response bodies — only
   `event`, `decision`, `reason`, method, URL, host, timestamp, and any
   `permissive_*` fields are kept).
 
-The dashboard explicitly notes "older entries available in the audit log file
-at <path>" so users know the in-memory view is intentionally truncated.
+The dashboard footnotes the audit panel with "older entries available in
+the audit log file on disk" so users know the in-memory view is
+intentionally truncated.
 
 ## Timeboxed permissive mode
 
