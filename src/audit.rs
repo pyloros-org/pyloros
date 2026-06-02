@@ -286,12 +286,11 @@ impl AuditLogger {
     }
 
     /// Annotate the most recent matching ring-buffer entry with the
-    /// redirect target observed in its response. Used by the proxy on
-    /// every 3xx response so `/rules/suggest` can pre-fill
-    /// `allow_redirects` for the next hop. No-op if no matching entry
-    /// is found (the file is append-only and not updated either way —
-    /// the redirect target lives in the in-memory snapshot only, which
-    /// is what dashboards consume).
+    /// redirect target observed in its response. Post-hoc because the
+    /// audit entry is emitted at request time, while the `Location`
+    /// header is only known after the upstream responds. The append-only
+    /// JSONL file is left untouched; the field lives in the in-memory
+    /// snapshot only.
     pub fn record_redirect(&self, request_url: &str, target: &str) {
         let mut buf = self.recent.lock().unwrap();
         for e in buf.iter_mut().rev() {
