@@ -324,9 +324,9 @@ impl ApprovalManager {
             status,
         });
 
-        // If approved, share the rule-installation path with the
-        // dashboard's direct-add endpoint. Unwrap-or-empty is correct
-        // here because `parsed_rules` is empty unless we're approving.
+        // `add_rules_internal` handles persistence, expiry scheduling,
+        // FilterEngine rebuild signaling, and the active-rules
+        // broadcast. Skipped for denials.
         if let Some(ttl) = approve_ttl {
             self.add_rules_internal(id.to_string(), parsed_rules, ttl);
         }
