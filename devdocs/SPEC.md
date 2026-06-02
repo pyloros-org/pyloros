@@ -296,11 +296,11 @@ Without this section, the agent API returns 404 and no dashboard listener is bou
 - **Dashboard at `dashboard_bind`.** Its own dedicated listener, plain HTTP. Endpoints:
   - `GET /` — HTML page with several panels (see "Dashboard panels" below);
     fires browser notifications via the Notification API when new approvals arrive.
-  - `GET /events` — Server-Sent Events stream of pending/resolved approval events,
-    active-rule changes, permissive-mode changes, and audit-entry snapshots.
-  - `GET /state` — JSON snapshot of pending approvals, active timeboxed rules,
-    permissive-mode status, and the recent-audit ring buffer. Used as the
-    initial-load payload by the dashboard.
+  - `GET /events` — Server-Sent Events stream. The first frame is a full
+    snapshot of pending approvals, active timeboxed rules, permissive-mode
+    status, and the recent-audit ring buffer; subsequent frames are
+    pending/resolved approval events, active-rule changes, permissive-mode
+    changes, and audit-entry snapshots.
   - `POST /approvals/{id}/decision` — body: `{action, rules_applied?, ttl?, message?}`.
     The user may edit the proposed rules in the dashboard before submitting; the
     edited rules go in `rules_applied`.

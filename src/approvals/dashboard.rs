@@ -3,7 +3,6 @@
 //! Endpoints:
 //! - `GET /`                              — HTML page (inline JS for SSE + Notification API)
 //! - `GET /events`                        — Server-Sent Events stream
-//! - `GET /state`                         — JSON snapshot of pending + active + permissive + recent
 //! - `POST /approvals/{id}/decision`      — record a decision for the given approval id
 //! - `DELETE /approvals/{id}/rules`       — revoke the active rules from an approval
 //! - `POST /permissive`                   — set or clear the timeboxed permissive override
@@ -64,12 +63,10 @@ async fn dispatch(
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let query = req.uri().query().unwrap_or("").to_string();
 
     match (&method, path.as_str()) {
         (&Method::GET, "/") => serve_html(),
         (&Method::GET, "/events") => serve_events(manager),
-        (&Method::GET, "/state") => serve_state(manager, &query),
         (&Method::POST, "/permissive") => serve_permissive(manager, req).await,
         (&Method::POST, "/rules") => serve_add_rules(manager, req).await,
         (&Method::POST, "/rules/parse") => serve_rules_parse(req).await,
@@ -105,9 +102,9 @@ fn serve_html() -> Response<BoxBody<Bytes, hyper::Error>> {
         .unwrap()
 }
 
-/// Snapshot returned both as the initial SSE frame and as the body of
-/// `GET /state`. Keeping the shape identical means the dashboard JS
-/// has a single code path for rendering.
+/// Snapshot sent as the first SSE frame on `/events`. Dashboards
+/// receive this once on connect and then maintain state by reacting
+/// to subsequent `NotifierEvent` frames.
 #[derive(Serialize)]
 struct DashboardSnapshot {
     event: &'static str,
@@ -131,14 +128,6 @@ fn build_snapshot(manager: &ApprovalManager) -> DashboardSnapshot {
         recent_blocked,
         recent_all,
     }
-}
-
-fn serve_state(
-    manager: Arc<ApprovalManager>,
-    _query: &str,
-) -> Response<BoxBody<Bytes, hyper::Error>> {
-    let snapshot = build_snapshot(&manager);
-    json_response(StatusCode::OK, &snapshot)
 }
 
 fn serve_events(manager: Arc<ApprovalManager>) -> Response<BoxBody<Bytes, hyper::Error>> {

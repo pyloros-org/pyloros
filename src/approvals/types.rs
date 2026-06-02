@@ -105,8 +105,8 @@ pub enum DecisionAction {
 }
 
 /// Snapshot of an active (approved-and-still-effective) rule group, used
-/// by the dashboard "active timeboxed rules" panel and the `/state`
-/// endpoint. One snapshot per `ApprovalManager::ActiveApproval` entry.
+/// by the dashboard "active timeboxed rules" panel and the SSE
+/// snapshot frame. One snapshot per `ApprovalManager::ActiveApproval` entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveApprovalSnapshot {
     /// Group identifier — the originating approval id, or a synthetic

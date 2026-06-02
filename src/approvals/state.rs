@@ -552,7 +552,7 @@ impl ApprovalManager {
         }
     }
 
-    /// Snapshot of the permissive override (for `/state` and SSE).
+    /// Snapshot of the permissive override (for SSE consumers).
     pub fn permissive_status(&self) -> PermissiveStatus {
         let state = self.state.lock().unwrap();
         match state.permissive_until {
@@ -578,8 +578,8 @@ impl ApprovalManager {
     }
 
     /// Snapshot of currently active rule groups, with their remaining
-    /// time and a pre-formatted TOML representation. Used by the
-    /// dashboard `/state` endpoint and SSE broadcasts.
+    /// time and a pre-formatted TOML representation. Sent to dashboards
+    /// in the initial SSE frame and on every `ActiveRulesChanged` event.
     pub fn list_active(&self) -> Vec<ActiveApprovalSnapshot> {
         let now = Instant::now();
         let state = self.state.lock().unwrap();

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 /// Spin up a proxy with approvals + a fresh audit log file, return the
 /// proxy plus a tempfile keeping the path alive. The audit-log file is
-/// what the dashboard's `/state` endpoint reads through the ring buffer.
+/// what the dashboard reads through the SSE-snapshot ring buffer.
 async fn start_proxy(
     t: &common::TestReport,
     ca: &TestCa,
@@ -27,12 +27,30 @@ fn http_client() -> reqwest::Client {
     reqwest::Client::builder().build().unwrap()
 }
 
-async fn json_get(client: &reqwest::Client, url: String) -> (u16, Value) {
-    let resp = client.get(&url).send().await.unwrap();
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    let v = serde_json::from_str(&body).unwrap_or(Value::Null);
-    (status, v)
+/// Read the first SSE frame from `GET /events` and parse it as the
+/// dashboard snapshot. Used in place of a separate snapshot endpoint —
+/// SSE is the single source of truth for dashboard state.
+async fn fetch_snapshot(client: &reqwest::Client, dashboard: &str) -> Value {
+    let mut resp = client
+        .get(format!("{}/events", dashboard))
+        .send()
+        .await
+        .unwrap();
+    // The snapshot is the first `data: ...` line; read chunks until we
+    // have a complete one.
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        buf.extend_from_slice(&chunk);
+        if let Some(json) = buf
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .and_then(|end| std::str::from_utf8(&buf[..end]).ok())
+            .and_then(|s| s.strip_prefix("data: "))
+        {
+            return serde_json::from_str(json).unwrap();
+        }
+    }
+    panic!("SSE stream closed before a snapshot frame arrived");
 }
 
 async fn json_post(client: &reqwest::Client, url: String, body: Value) -> (u16, String) {
@@ -154,7 +172,7 @@ async fn test_permissive_clear_with_zero_duration() {
     .await;
     t.assert_eq("enable status", &s, &204u16);
 
-    let (_, state) = json_get(&http, format!("{}/state", dashboard)).await;
+    let state = fetch_snapshot(&http, &dashboard).await;
     t.assert_true(
         "state.permissive.active=true after enable",
         state["permissive"]["active"].as_bool().unwrap(),
@@ -168,7 +186,7 @@ async fn test_permissive_clear_with_zero_duration() {
     .await;
     t.assert_eq("clear status", &s, &204u16);
 
-    let (_, state) = json_get(&http, format!("{}/state", dashboard)).await;
+    let state = fetch_snapshot(&http, &dashboard).await;
     t.assert_true(
         "state.permissive.active=false after clear",
         !state["permissive"]["active"].as_bool().unwrap(),
@@ -383,10 +401,10 @@ async fn test_rules_suggest_branch_restriction_includes_branches_hint() {
 }
 
 /// POST /rules adds an active timeboxed rule that immediately unblocks a
-/// previously-blocked request and shows up in /state.active.
+/// previously-blocked request and shows up in active.
 #[tokio::test]
 async fn test_post_rules_adds_active_rule_and_unblocks() {
-    let t = test_report!("POST /rules adds an active rule, unblocks traffic, surfaces in /state");
+    let t = test_report!("POST /rules adds an active rule, unblocks traffic, surfaces in snapshot");
 
     let ca = TestCa::generate();
     let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
@@ -429,12 +447,12 @@ async fn test_post_rules_adds_active_rule_and_unblocks() {
         resp.status().as_u16() != 451,
     );
 
-    let (_, state) = json_get(&http, format!("{}/state", dashboard)).await;
+    let state = fetch_snapshot(&http, &dashboard).await;
     let actives = state["active"].as_array().unwrap();
     let found = actives
         .iter()
         .any(|a| a["approval_id"].as_str() == Some(approval_id.as_str()));
-    t.assert_true("rule listed in /state.active", found);
+    t.assert_true("rule listed in active", found);
 
     // DELETE revokes.
     let resp = http
@@ -516,11 +534,11 @@ async fn test_decision_with_edited_rules_applies_edited_version() {
     upstream.shutdown();
 }
 
-/// /state returns recent blocked entries after a blocked request, and
+/// Initial SSE snapshot includes recent blocked entries after a blocked request, and
 /// recent allowed entries surface in recent_all once a request matched.
 #[tokio::test]
 async fn test_state_includes_recent_audit_entries() {
-    let t = test_report!("GET /state returns recent audit entries split by blocked/all");
+    let t = test_report!("Initial SSE snapshot returns recent audit entries split by blocked/all");
 
     let ca = TestCa::generate();
     let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
@@ -551,7 +569,7 @@ async fn test_state_includes_recent_audit_entries() {
     // Allow the audit log to flush.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (_, state) = json_get(&http, format!("{}/state", dashboard)).await;
+    let state = fetch_snapshot(&http, &dashboard).await;
     let blocked = state["recent_blocked"].as_array().unwrap();
     let all = state["recent_all"].as_array().unwrap();
 
