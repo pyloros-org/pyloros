@@ -260,13 +260,13 @@ at <path>" so users know the in-memory view is intentionally truncated.
 
 ## Timeboxed permissive mode
 
-Permissive mode is now routed through `ApprovalManager` so the dashboard can
+Permissive mode is evaluated through `ApprovalManager` so the dashboard can
 toggle it at runtime without a config reload. `proxy.permissive = true` in
-the config file still works as a permanent override; the dashboard toggle
-layers on top via `ApprovalManager::is_permissive_active()`, which the
-proxy queries on each request decision (via the `TunnelHandler` / `ProxyHandler`
-factory). When the timer fires, the manager calls `request_rebuild()` on the
-same channel approval-rule changes use, so a new `TunnelHandler` gets
+the config file is a permanent override; the dashboard toggle layers on top
+via `ApprovalManager::is_permissive_active()`, which the proxy queries on
+each request decision (via the `TunnelHandler` / `ProxyHandler` factory).
+When the expiry timer fires, the manager calls `request_rebuild()` on the
+same channel approval-rule changes use, so a new `TunnelHandler` is
 broadcast and subsequent requests see the flipped flag.
 
 Permissive-mode toggles emit dedicated audit entries
