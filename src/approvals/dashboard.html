@@ -110,7 +110,9 @@
         permissiveDeadline: null, // millis when override expires (for live countdown)
         recent_blocked: [],
         recent_all: [],
-        showAllowed: false,
+        // Read the checkbox's current state: browsers preserve form
+        // state across reloads, so on F5 the box may already be checked.
+        showAllowed: document.getElementById('audit-include-allowed').checked,
         pendingToml: new Map(),   // id -> string (lazy-fetched server-formatted TOML)
       };
 
