@@ -7,22 +7,12 @@
 use crate::audit::{AuditEntrySnapshot, AuditEvent, AuditGitInfo, AuditReason};
 use crate::config::Rule;
 
-/// Format a single `Rule` as a `[[rules]]` TOML block. Falls back to a
+/// Format a list of rules as `[[rules]]` TOML blocks. The wrapper
+/// struct is required because `toml::to_string` only serializes
+/// top-level tables, not bare arrays. Falls back to a
 /// `# <serialization error>` comment if `toml::to_string` ever fails
 /// (which it should not for any rule that round-trips through
 /// `Rule::validate`).
-pub fn format_rule_toml(rule: &Rule) -> String {
-    #[derive(serde::Serialize)]
-    struct RulesWrapper<'a> {
-        rules: [&'a Rule; 1],
-    }
-    match toml::to_string(&RulesWrapper { rules: [rule] }) {
-        Ok(s) => s,
-        Err(e) => format!("# rule serialization error: {}\n", e),
-    }
-}
-
-/// Format a list of rules as multiple `[[rules]]` TOML blocks.
 pub fn format_rules_toml(rules: &[Rule]) -> String {
     #[derive(serde::Serialize)]
     struct RulesWrapper<'a> {
@@ -32,6 +22,11 @@ pub fn format_rules_toml(rules: &[Rule]) -> String {
         Ok(s) => s,
         Err(e) => format!("# rule serialization error: {}\n", e),
     }
+}
+
+/// Format a single `Rule` as a `[[rules]]` TOML block.
+pub fn format_rule_toml(rule: &Rule) -> String {
+    format_rules_toml(std::slice::from_ref(rule))
 }
 
 /// Suggest TOML for a "create rule from blocked request" flow given a
