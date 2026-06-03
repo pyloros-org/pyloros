@@ -73,6 +73,14 @@ jobs:
           path: |
             test-report.md
             test-report.html
+      # Reuse this binary in the browser-test job instead of recompiling there.
+      # `cargo test` above already built it; this is an incremental no-op.
+      - name: Build pyloros binary for browser E2E reuse
+        run: cargo build --bin pyloros
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pyloros-debug-bin
+          path: target/debug/pyloros
       - name: Run test-proxy.sh tests
         run: scripts/test-proxy.sh
       - name: Install musl tools
@@ -106,3 +114,38 @@ jobs:
         with:
           name: coverage-report
           path: lcov.info
+
+  browser-test:
+    name: Browser E2E (dashboard)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Reuse the debug binary built by the `test` job — no Rust toolchain here.
+      - uses: actions/download-artifact@v7
+        with:
+          name: pyloros-debug-bin
+          path: target/debug
+      - run: chmod +x target/debug/pyloros
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - name: Install e2e dependencies
+        run: npm ci
+        working-directory: e2e
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e
+      - name: Run Playwright tests
+        run: npx playwright test
+        working-directory: e2e
+        env:
+          PYLOROS_SKIP_BUILD: "1"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 7
