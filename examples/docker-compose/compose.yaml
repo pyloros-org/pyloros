@@ -106,9 +106,11 @@ services:
 
   sandbox:
     image: ${SANDBOX_IMAGE:-alpine:latest}
-    # Source the generated secrets env file so the sandbox has local credentials,
-    # then exec the desired command (default: sleep infinity).
-    command: ["sh", "-c", "set -a; . /run/pyloros/secrets.env; set +a; exec sleep infinity"]
+    # Source the generated secrets env file (if any credentials use
+    # local_generated) so the sandbox has local credentials, then exec the
+    # desired command (default: sleep infinity). The file is optional —
+    # configs without local_generated credentials never create it.
+    command: ["sh", "-c", "set -a; [ -f /run/pyloros/secrets.env ] && . /run/pyloros/secrets.env; set +a; exec sleep infinity"]
     depends_on:
       proxy:
         condition: service_healthy
