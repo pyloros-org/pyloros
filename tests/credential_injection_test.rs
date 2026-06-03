@@ -2,9 +2,9 @@
 
 mod common;
 
-use common::{echo_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, echo_handler, rule};
 use pyloros::config::Credential;
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 fn cred(url: &str, header: &str, value: &str) -> Credential {
     Credential::Header {
@@ -222,7 +222,8 @@ async fn test_no_injection_over_plain_http() {
 #[tokio::test]
 async fn test_credential_with_env_var() {
     let t = test_report!("Config with env var resolution");
-    std::env::set_var("TEST_CRED_E2E_SECRET", "env-resolved-value");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("TEST_CRED_E2E_SECRET", "env-resolved-value") };
 
     let ca = TestCa::generate();
     let upstream = TestUpstream::builder(&ca, echo_handler())
@@ -246,5 +247,6 @@ async fn test_credential_with_env_var() {
 
     proxy.shutdown();
     upstream.shutdown();
-    std::env::remove_var("TEST_CRED_E2E_SECRET");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("TEST_CRED_E2E_SECRET") };
 }

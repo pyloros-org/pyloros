@@ -3,7 +3,7 @@
 use hyper::header::HeaderMap;
 
 use super::matcher::UrlPattern;
-use crate::config::{resolve_credential_value, Credential};
+use crate::config::{Credential, resolve_credential_value};
 use crate::error::Result;
 use crate::filter::RequestInfo;
 
@@ -93,14 +93,14 @@ impl CredentialEngine {
     /// and must use `inject_with_body()` instead.
     pub fn inject(&self, request_info: &RequestInfo, headers: &mut HeaderMap) {
         for cred in &self.credentials {
-            if let ResolvedCredential::Header { header, value, .. } = cred {
-                if cred.matches(request_info) {
-                    tracing::debug!(header = %header, "Injecting credential");
-                    if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes()) {
-                        if let Ok(val) = hyper::header::HeaderValue::from_str(value) {
-                            headers.insert(name, val);
-                        }
-                    }
+            if let ResolvedCredential::Header { header, value, .. } = cred
+                && cred.matches(request_info)
+            {
+                tracing::debug!(header = %header, "Injecting credential");
+                if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes())
+                    && let Ok(val) = hyper::header::HeaderValue::from_str(value)
+                {
+                    headers.insert(name, val);
                 }
             }
         }
@@ -131,10 +131,10 @@ impl CredentialEngine {
             match cred {
                 ResolvedCredential::Header { header, value, .. } => {
                     tracing::debug!(header = %header, "Injecting credential");
-                    if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes()) {
-                        if let Ok(val) = hyper::header::HeaderValue::from_str(value) {
-                            headers.insert(name, val);
-                        }
+                    if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes())
+                        && let Ok(val) = hyper::header::HeaderValue::from_str(value)
+                    {
+                        headers.insert(name, val);
                     }
                 }
                 ResolvedCredential::AwsSigV4 {
@@ -203,10 +203,9 @@ impl CredentialEngine {
                     for (name, value) in new_headers {
                         if let Ok(header_name) =
                             hyper::header::HeaderName::from_bytes(name.as_bytes())
+                            && let Ok(header_value) = hyper::header::HeaderValue::from_str(&value)
                         {
-                            if let Ok(header_value) = hyper::header::HeaderValue::from_str(&value) {
-                                headers.insert(header_name, header_value);
-                            }
+                            headers.insert(header_name, header_value);
                         }
                     }
                 }

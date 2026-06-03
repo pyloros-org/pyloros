@@ -6,8 +6,9 @@
 mod common;
 
 use common::{
-    create_test_repo, git_cgi_handler, git_http_backend_path, git_rule, git_rule_with_branches,
-    ok_handler, run_command_reported, ReportingClient, RequestLog, TestCa, TestProxy, TestUpstream,
+    ReportingClient, RequestLog, TestCa, TestProxy, TestUpstream, create_test_repo,
+    git_cgi_handler, git_http_backend_path, git_rule, git_rule_with_branches, ok_handler,
+    run_command_reported,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};

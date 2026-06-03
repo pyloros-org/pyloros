@@ -1210,16 +1210,19 @@ secret_access_key = "SECRET"
     #[test]
     fn test_resolve_credential_value_env_var() {
         let t = test_report!("${ENV_VAR} resolution works");
-        std::env::set_var("TEST_CRED_KEY_ABC", "resolved-value");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("TEST_CRED_KEY_ABC", "resolved-value") };
         let result = resolve_credential_value("${TEST_CRED_KEY_ABC}").unwrap();
         t.assert_eq("resolved", &result.as_str(), &"resolved-value");
-        std::env::remove_var("TEST_CRED_KEY_ABC");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("TEST_CRED_KEY_ABC") };
     }
 
     #[test]
     fn test_resolve_credential_value_unset_var() {
         let t = test_report!("${UNSET_VAR} fails with descriptive error");
-        std::env::remove_var("TEST_CRED_UNSET_XYZ");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("TEST_CRED_UNSET_XYZ") };
         let result = resolve_credential_value("${TEST_CRED_UNSET_XYZ}");
         t.assert_true("error", result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1229,10 +1232,12 @@ secret_access_key = "SECRET"
     #[test]
     fn test_resolve_credential_value_mixed() {
         let t = test_report!("Mixed literal + env var resolves correctly");
-        std::env::set_var("TEST_CRED_TOKEN_MIX", "tok123");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("TEST_CRED_TOKEN_MIX", "tok123") };
         let result = resolve_credential_value("Bearer ${TEST_CRED_TOKEN_MIX}").unwrap();
         t.assert_eq("resolved", &result.as_str(), &"Bearer tok123");
-        std::env::remove_var("TEST_CRED_TOKEN_MIX");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("TEST_CRED_TOKEN_MIX") };
     }
 
     #[test]
@@ -1332,7 +1337,8 @@ auth_password = "secret"
     #[test]
     fn test_resolved_auth_env_var() {
         let t = test_report!("resolved_auth resolves ${ENV_VAR} in password");
-        std::env::set_var("TEST_PROXY_AUTH_PW_123", "resolved-pw");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("TEST_PROXY_AUTH_PW_123", "resolved-pw") };
         let toml = r#"
 [proxy]
 auth_username = "user1"
@@ -1345,7 +1351,8 @@ auth_password = "${TEST_PROXY_AUTH_PW_123}"
             &auth,
             &Some(("user1".to_string(), "resolved-pw".to_string())),
         );
-        std::env::remove_var("TEST_PROXY_AUTH_PW_123");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("TEST_PROXY_AUTH_PW_123") };
     }
 
     #[test]

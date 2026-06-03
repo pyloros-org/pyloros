@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 /// An `https://` rule must not match a plain-HTTP request through the proxy.
 #[tokio::test]
