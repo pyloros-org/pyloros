@@ -183,7 +183,7 @@ cat <<EOF
                                 ring buffer; older entries on disk.
 
   Try prompts like:
-    - "fetch https://httpbin.org/get and show me the JSON"
+    - "fetch https://example.com/ and show me the response"
        (then "Create rule" from the blocked row in the dashboard
         instead of waiting for the agent to ask)
     - "clone https://github.com/anthropics/anthropic-cookbook"

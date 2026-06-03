@@ -58,7 +58,7 @@ fi
 echo "Test 2: Blocked URL returns HTTP 451"
 set +e
 HTTP_CODE=$(timeout 30 "$TEST_PROXY_SCRIPT" --rule 'GET https://example.com/*' \
-    -- curl -so /dev/null -w '%{http_code}' https://httpbin.org/get 2>/dev/null)
+    -- curl -so /dev/null -w '%{http_code}' https://blocked.invalid/get 2>/dev/null)
 EXIT_CODE=$?
 set -e
 
@@ -74,9 +74,9 @@ fi
 echo "Test 3: Multiple rules"
 set +e
 OUTPUT=$(timeout 30 "$TEST_PROXY_SCRIPT" \
+    --rule 'GET https://blocked.invalid/*' \
     --rule 'GET https://example.com/*' \
-    --rule 'GET https://httpbin.org/*' \
-    -- curl -sf https://httpbin.org/robots.txt 2>/dev/null)
+    -- curl -sf https://example.com/ 2>/dev/null)
 EXIT_CODE=$?
 set -e
 

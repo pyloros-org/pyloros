@@ -35,7 +35,7 @@ pub enum AuditReason {
     BodyInspectionRequiresHttps,
     BranchRestriction,
     LfsOperationNotAllowed,
-    NonHttpsConnect,
+    UnsupportedConnectPort,
     AuthFailed,
     /// Request was allowed because its URL is in the short-lived redirect whitelist
     /// (i.e., an earlier rule-matched request returned a 3xx Location pointing here).
@@ -540,7 +540,10 @@ mod tests {
                 AuditReason::LfsOperationNotAllowed,
                 "\"lfs_operation_not_allowed\"",
             ),
-            (AuditReason::NonHttpsConnect, "\"non_https_connect\""),
+            (
+                AuditReason::UnsupportedConnectPort,
+                "\"unsupported_connect_port\"",
+            ),
             (AuditReason::AuthFailed, "\"auth_failed\""),
         ];
         for (reason, expected) in reasons {

@@ -507,8 +507,13 @@ impl ProxyServer {
             tracing::warn!("direct_http_bind changed but requires restart to take effect");
         }
 
-        // Compile new filter engine
-        let new_filter = match FilterEngine::new(new_config.rules.clone()) {
+        // Compile new filter engine from the reloaded base rules and the active
+        // approval rules (which live in the ApprovalManager, not the config file).
+        let mut combined = new_config.rules.clone();
+        if let Some(ref manager) = self.approvals {
+            combined.extend(manager.active_rules());
+        }
+        let new_filter = match FilterEngine::new(combined) {
             Ok(f) => Arc::new(f),
             Err(e) => {
                 tracing::error!(error = %e, "Config reload failed: rule compilation error");

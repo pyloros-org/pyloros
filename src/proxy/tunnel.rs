@@ -313,9 +313,14 @@ impl TunnelHandler {
                     };
                 *req.uri_mut() = new_uri;
 
-                // Reuse the plain-HTTP handler used by the explicit proxy listener.
-                // Auth is intentionally None: direct-HTTP clients connect to what they
-                // think is the origin server, so Proxy-Authorization is not expected.
+                // Reuse the plain-HTTP forwarder from the explicit-proxy handler.
+                // We call `handle_http` directly rather than the top-level `handle`:
+                //  - Auth is already taken care of (direct-HTTP clients think they
+                //    are talking to the origin so they don't send Proxy-Auth; port-80
+                //    CONNECT tunnels already authenticated on the CONNECT itself).
+                //  - Routing CONNECT here is meaningless (origin servers don't speak
+                //    CONNECT) and, for the port-80 CONNECT path, would form an
+                //    infinite recursive future type that fails the Send check.
                 let handler = super::handler::ProxyHandler::new(
                     Arc::clone(&self_arc),
                     self_arc.filter_engine.clone(),
@@ -329,7 +334,7 @@ impl TunnelHandler {
                 .with_permissive(self_arc.logger.permissive_base)
                 .with_approvals(self_arc.logger.approvals.clone())
                 .with_max_body_log_size(self_arc.max_body_log_size);
-                handler.handle(req).await
+                handler.handle_http(req).await
             }
         });
 

@@ -20,7 +20,7 @@
 #   pyloros-test-proxy.sh --rule 'GET https://www.google.com/*' -- wget -O /dev/null https://www.google.com/
 #
 #   # Test curl against multiple sites
-#   pyloros-test-proxy.sh --rule 'GET https://api.github.com/*' --rule 'GET https://httpbin.org/*' \
+#   pyloros-test-proxy.sh --rule 'GET https://api.github.com/*' --rule 'GET https://example.com/*' \
 #     -- curl -sS https://api.github.com/zen
 #
 #   # Interactive shell with proxy configured
@@ -71,7 +71,7 @@ if [[ -z "$PYLOROS" ]]; then
         PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
         MAIN_WORKTREE=""
         if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-            MAIN_WORKTREE="$(git -C "$PROJECT_DIR" worktree list --porcelain | head -1 | sed 's/^worktree //')"
+            MAIN_WORKTREE="$(git -C "$PROJECT_DIR" worktree list --porcelain | awk 'NR==1{sub(/^worktree /,"");print}')"
         fi
         for search_dir in "$PROJECT_DIR" ${MAIN_WORKTREE:+"$MAIN_WORKTREE"}; do
             for candidate in \

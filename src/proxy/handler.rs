@@ -171,9 +171,12 @@ impl ProxyHandler {
 
         tracing::debug!(host = %host, port = %port, "CONNECT request");
 
-        // Only allow HTTPS (port 443 or explicit https)
-        if port != 443 {
-            tracing::warn!(host = %host, port = %port, "Blocking non-HTTPS CONNECT");
+        // CONNECT is supported on port 443 (MITM as HTTPS) and port 80 (serve the
+        // tunneled bytes as plain HTTP via the direct-HTTP code path). Other ports
+        // are opaque to us, so we cannot apply filter rules and they are blocked
+        // — see SPEC.md "default-deny for unverifiable restrictions".
+        if port != 443 && port != 80 {
+            tracing::warn!(host = %host, port = %port, "Blocking CONNECT to unsupported port");
             let url = format!("{}:{}", host, port);
             self.logger.emit_audit(AuditEntry {
                 timestamp: crate::audit::now_iso8601(),
@@ -184,7 +187,7 @@ impl ProxyHandler {
                 scheme: "unknown".to_string(),
                 protocol: "unknown".to_string(),
                 decision: AuditDecision::Blocked,
-                reason: AuditReason::NonHttpsConnect,
+                reason: AuditReason::UnsupportedConnectPort,
                 credential: None,
                 git: None,
                 request_body: None,
@@ -215,6 +218,19 @@ impl ProxyHandler {
                 }
             };
 
+            if port == 80 {
+                // The client wants to speak plain HTTP through the tunnel. Hand the
+                // upgraded byte stream to the same code that serves the direct-HTTP
+                // listener — it rewrites origin-form requests to absolute-form and
+                // reuses the explicit-proxy plain-HTTP handler, so filtering, audit,
+                // redirect-whitelisting and body-inspection blocking all behave
+                // identically to a direct `http://` request.
+                tunnel_handler
+                    .serve_direct_http(hyper_util::rt::TokioIo::new(upgraded))
+                    .await;
+                return;
+            }
+
             if let Err(e) = tunnel_handler.run_mitm_tunnel(upgraded, &host, port).await {
                 // Don't log connection closed errors
                 let err_str = e.to_string();
@@ -231,7 +247,7 @@ impl ProxyHandler {
             .unwrap())
     }
 
-    async fn handle_http(
+    pub(super) async fn handle_http(
         self,
         req: Request<Incoming>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
