@@ -62,6 +62,7 @@ services:
       - ${CONFIG_DIR:-./conf}:/etc/pyloros/conf:ro
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.crt:/etc/pyloros/ca.crt:ro
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.key:/etc/pyloros/ca.key:ro
+      - secrets:/run/pyloros
     command:
       - run
       - --config
@@ -105,7 +106,11 @@ services:
 
   sandbox:
     image: ${SANDBOX_IMAGE:-alpine:latest}
-    command: sleep infinity
+    # Source the generated secrets env file (if any credentials use
+    # local_generated) so the sandbox has local credentials, then exec the
+    # desired command (default: sleep infinity). The file is optional —
+    # configs without local_generated credentials never create it.
+    command: ["sh", "-c", "set -a; [ -f /run/pyloros/secrets.env ] && . /run/pyloros/secrets.env; set +a; exec sleep infinity"]
     depends_on:
       proxy:
         condition: service_healthy
@@ -126,6 +131,7 @@ services:
       - REQUESTS_CA_BUNDLE=/etc/pyloros/ca.crt
     volumes:
       - ${CA_DIR:?Set CA_DIR to absolute path of CA certificate directory}/ca.crt:/etc/pyloros/ca.crt:ro
+      - secrets:/run/pyloros:ro
     networks:
       - internal
 
@@ -137,3 +143,6 @@ networks:
     ipam:
       config:
         - subnet: ${PYLOROS_SUBNET:-172.30.0.0/24}
+
+volumes:
+  secrets:
