@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    create_test_repo, git_cgi_handler, git_http_backend_path, git_rule, run_command_reported,
-    RequestLog, TestCa, TestProxy, TestUpstream,
+    create_test_repo, git_cgi_handler, git_http_backend_path, git_rule, git_rule_with_branches,
+    run_command_reported, RequestLog, TestCa, TestProxy, TestUpstream,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -30,16 +30,14 @@ fn run_git(args: &[&str], cwd: &Path) {
     );
 }
 
-/// Clone the repo, create a commit and a tag, then push the tag.
-/// Returns the bare repo path so the caller can verify the tag landed.
-async fn clone_commit_and_push_tag(
+/// Clone the repo through the proxy, make a commit, and create an annotated
+/// tag `v1.0` pointing at it. Returns the clone directory.
+async fn clone_and_create_tag(
     t: &common::TestReport,
     proxy_url: &str,
     ca: &TestCa,
     tmp: &TempDir,
-    bare_repo: &Path,
-) {
-    // Clone through proxy
+) -> std::path::PathBuf {
     let clone_dir = tmp.path().join("cloned");
     let output = run_command_reported(
         t,
@@ -55,7 +53,6 @@ async fn clone_commit_and_push_tag(
     );
     t.assert_eq("git clone exit code", &output.status.code().unwrap(), &0);
 
-    // Make a commit and create an annotated tag pointing at it
     run_git(&["config", "user.email", "test@test.com"], &clone_dir);
     run_git(&["config", "user.name", "Test User"], &clone_dir);
     std::fs::write(clone_dir.join("tagged.txt"), "tagged content\n").unwrap();
@@ -64,26 +61,50 @@ async fn clone_commit_and_push_tag(
     run_git(&["tag", "-a", "v1.0", "-m", "Release v1.0"], &clone_dir);
     t.action("Created annotated tag v1.0");
 
-    // Push the tag through the proxy
-    let output = run_command_reported(
+    clone_dir
+}
+
+/// Push tag `v1.0` to origin through the proxy. Returns the command output so
+/// callers can assert success or failure.
+fn push_tag(
+    t: &common::TestReport,
+    proxy_url: &str,
+    ca: &TestCa,
+    clone_dir: &Path,
+) -> std::process::Output {
+    run_command_reported(
         t,
         std::process::Command::new("git")
             .args(["push", "origin", "v1.0"])
-            .current_dir(&clone_dir)
+            .current_dir(clone_dir)
             .env("HTTPS_PROXY", proxy_url)
             .env("GIT_SSL_CAINFO", &ca.cert_path)
             .env("GIT_TERMINAL_PROMPT", "0"),
-    );
-    t.assert_eq("git push tag exit code", &output.status.code().unwrap(), &0);
+    )
+}
 
-    // Verify the bare repo received the tag ref
+/// Whether the bare repo holds a tag named `v1.0`.
+fn bare_repo_has_v1_tag(bare_repo: &Path) -> bool {
     let verify = std::process::Command::new("git")
         .args(["tag", "-l"])
         .current_dir(bare_repo)
         .output()
         .unwrap();
-    let tags = String::from_utf8_lossy(&verify.stdout);
-    t.assert_contains("bare repo has v1.0 tag", &tags, "v1.0");
+    String::from_utf8_lossy(&verify.stdout).contains("v1.0")
+}
+
+/// Clone, create the tag, push it, and assert it landed in the bare repo.
+async fn clone_commit_and_push_tag(
+    t: &common::TestReport,
+    proxy_url: &str,
+    ca: &TestCa,
+    tmp: &TempDir,
+    bare_repo: &Path,
+) {
+    let clone_dir = clone_and_create_tag(t, proxy_url, ca, tmp).await;
+    let output = push_tag(t, proxy_url, ca, &clone_dir);
+    t.assert_eq("git push tag exit code", &output.status.code().unwrap(), &0);
+    t.assert_true("bare repo has v1.0 tag", bare_repo_has_v1_tag(bare_repo));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -176,6 +197,117 @@ async fn test_git_push_tag_permissive() {
     let proxy_url = format!("http://127.0.0.1:{}", proxy.addr().port());
 
     clone_commit_and_push_tag(&t, &proxy_url, &ca, &tmp, &bare_repo).await;
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_git_push_tag_blocked_by_branch_restriction() {
+    let backend_path = git_http_backend_path();
+
+    let t = test_report!("Bare branch restriction (feature/*) blocks a tag push");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let tmp = TempDir::new().unwrap();
+    let repos_dir = create_test_repo(tmp.path(), "repo.git");
+    let bare_repo = repos_dir.join("repo.git");
+    run_git(&["config", "http.receivepack", "true"], &bare_repo);
+    t.setup("Created test repo with receivepack enabled");
+
+    let request_log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+
+    let upstream = TestUpstream::builder(
+        &ca,
+        git_cgi_handler(backend_path, repos_dir, request_log.clone()),
+    )
+    .report(&t, "git http-backend CGI")
+    .start()
+    .await;
+
+    // Push allowed only to feature/* branches. A bare pattern matches only
+    // refs/heads/*, so a tag push (refs/tags/v1.0) must NOT match and is blocked.
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule_with_branches(
+            "*",
+            "https://localhost/*",
+            &["feature/*"],
+        )],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.addr().port());
+
+    let clone_dir = clone_and_create_tag(&t, &proxy_url, &ca, &tmp).await;
+    let output = push_tag(&t, &proxy_url, &ca, &clone_dir);
+
+    t.assert_true(
+        "git push tag fails (blocked by branch restriction)",
+        output.status.code().unwrap() != 0,
+    );
+    t.assert_true(
+        "bare repo did NOT receive the v1.0 tag",
+        !bare_repo_has_v1_tag(&bare_repo),
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_git_push_tag_allowed_by_refs_tags_pattern() {
+    let backend_path = git_http_backend_path();
+
+    let t = test_report!("Explicit refs/tags/* restriction allows a tag push");
+    let ca = TestCa::generate();
+    t.setup("Generated test CA");
+
+    let tmp = TempDir::new().unwrap();
+    let repos_dir = create_test_repo(tmp.path(), "repo.git");
+    let bare_repo = repos_dir.join("repo.git");
+    run_git(&["config", "http.receivepack", "true"], &bare_repo);
+    t.setup("Created test repo with receivepack enabled");
+
+    let request_log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+
+    let upstream = TestUpstream::builder(
+        &ca,
+        git_cgi_handler(backend_path, repos_dir, request_log.clone()),
+    )
+    .report(&t, "git http-backend CGI")
+    .start()
+    .await;
+
+    // A `refs/`-prefixed pattern is matched literally, so refs/tags/* allows
+    // tag pushes (and excludes branch pushes).
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule_with_branches(
+            "*",
+            "https://localhost/*",
+            &["refs/tags/*"],
+        )],
+        upstream.port(),
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.addr().port());
+
+    let clone_dir = clone_and_create_tag(&t, &proxy_url, &ca, &tmp).await;
+    let output = push_tag(&t, &proxy_url, &ca, &clone_dir);
+
+    t.assert_eq("git push tag exit code", &output.status.code().unwrap(), &0);
+    t.assert_true(
+        "bare repo received the v1.0 tag",
+        bare_repo_has_v1_tag(&bare_repo),
+    );
 
     proxy.shutdown();
     upstream.shutdown();
