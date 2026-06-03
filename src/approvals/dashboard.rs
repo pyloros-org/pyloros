@@ -1,28 +1,43 @@
 //! Human-facing dashboard served on the dedicated `dashboard_bind` listener.
 //!
 //! Endpoints:
-//! - `GET /`                           — HTML page (includes inline JS for SSE + Notification API)
-//! - `GET /events`                     — Server-Sent Events stream
-//! - `POST /approvals/{id}/decision`   — record a decision for the given approval id
+//! - `GET /`                              — HTML page (inline JS for SSE + Notification API)
+//! - `GET /events`                        — Server-Sent Events stream; first frame is the
+//!   snapshot used by the dashboard UI to initialize state
+//! - `POST /approvals/{id}/decision`      — record a decision for the given approval id
+//! - `DELETE /approvals/{id}/rules`       — revoke the active rules from an approval
+//! - `POST /permissive`                   — set or clear the timeboxed permissive override
+//! - `POST /rules`                        — add rules directly (no upstream approval)
+//! - `POST /rules/parse`                  — parse TOML rule text → structured rules
+//! - `POST /rules/suggest`                — server-built TOML pre-fill for a blocked
+//!   audit entry or a re-format of existing rules
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures_util::stream::{self, StreamExt};
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use futures_util::stream::{self, Stream, StreamExt};
+use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use serde::Serialize;
+use hyper_util::service::TowerToHyperService;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
+use super::rule_suggest;
 use super::state::ApprovalManager;
 use super::types::{
-    ApprovalDecision, ApprovalRequest, ApprovalStatus, DecisionAction, Lifetime, NotifierEvent,
+    ActiveApprovalSnapshot, ApprovalDecision, ApprovalRequest, ApprovalStatus, DecisionAction,
+    Lifetime, NotifierEvent, PermissiveStatus,
 };
+use crate::audit::AuditEntrySnapshot;
+use crate::config::Rule;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
@@ -31,14 +46,21 @@ pub async fn serve_connection<S>(manager: Arc<ApprovalManager>, stream: S)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req: Request<Incoming>| {
-        let manager = Arc::clone(&manager);
-        async move { Ok::<_, hyper::Error>(dispatch(manager, req).await) }
-    });
+    let app: Router = Router::new()
+        .route("/", get(serve_html))
+        .route("/events", get(serve_events))
+        .route("/permissive", post(serve_permissive))
+        .route("/rules", post(serve_add_rules))
+        .route("/rules/parse", post(serve_rules_parse))
+        .route("/rules/suggest", post(serve_rules_suggest))
+        .route("/approvals/{id}/decision", post(serve_decision))
+        .route("/approvals/{id}/rules", delete(serve_revoke))
+        .with_state(manager);
 
     let io = TokioIo::new(stream);
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder.http1().preserve_header_case(true).half_close(true);
+    let service = TowerToHyperService::new(app.into_service::<Incoming>());
     if let Err(e) = builder.serve_connection(io, service).await {
         let err_str = e.to_string();
         if !err_str.contains("connection closed") && !err_str.contains("early eof") {
@@ -47,119 +69,71 @@ where
     }
 }
 
-async fn dispatch(
-    manager: Arc<ApprovalManager>,
-    req: Request<Incoming>,
-) -> Response<BoxBody<Bytes, hyper::Error>> {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
+// ---------- routes ----------
 
-    match (&method, path.as_str()) {
-        (&Method::GET, "/") => serve_html(),
-        (&Method::GET, "/events") => serve_events(manager),
-        (&Method::POST, p) if p.starts_with("/approvals/") && p.ends_with("/decision") => {
-            let id = p
-                .trim_start_matches("/approvals/")
-                .trim_end_matches("/decision")
-                .to_string();
-            serve_decision(manager, &id, req).await
-        }
-        _ => not_found(),
+async fn serve_html() -> Html<&'static str> {
+    Html(DASHBOARD_HTML)
+}
+
+/// Snapshot sent as the first SSE frame on `/events`. Dashboards
+/// receive this once on connect and then maintain state by reacting
+/// to subsequent `NotifierEvent` frames.
+#[derive(Serialize)]
+struct DashboardSnapshot {
+    event: &'static str,
+    pending: Vec<ApprovalRequest>,
+    active: Vec<ActiveApprovalSnapshot>,
+    permissive: PermissiveStatus,
+    recent_blocked: Vec<AuditEntrySnapshot>,
+    recent_all: Vec<AuditEntrySnapshot>,
+}
+
+fn build_snapshot(manager: &ApprovalManager) -> DashboardSnapshot {
+    let (recent_blocked, recent_all) = match manager.audit_logger_ref() {
+        Some(l) => (l.recent_entries(false), l.recent_entries(true)),
+        None => (Vec::new(), Vec::new()),
+    };
+    DashboardSnapshot {
+        event: "snapshot",
+        pending: manager.list_pending(),
+        active: manager.list_active(),
+        permissive: manager.permissive_status(),
+        recent_blocked,
+        recent_all,
     }
 }
 
-fn serve_html() -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .body(
-            Full::new(Bytes::from_static(DASHBOARD_HTML.as_bytes()))
-                .map_err(|e| match e {})
-                .boxed(),
-        )
-        .unwrap()
-}
-
-/// SSE event payload sent on stream open: the current set of pending approvals.
-#[derive(Serialize)]
-struct Snapshot<'a> {
-    event: &'static str,
-    approvals: &'a [ApprovalRequest],
-}
-
-fn serve_events(manager: Arc<ApprovalManager>) -> Response<BoxBody<Bytes, hyper::Error>> {
+async fn serve_events(
+    State(manager): State<Arc<ApprovalManager>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = manager.subscribe_events();
-    let pending = manager.list_pending();
-
-    // First frame: snapshot of current pending approvals so a reconnecting
-    // dashboard immediately sees state without waiting for the next event.
-    let snapshot = Snapshot {
-        event: "snapshot",
-        approvals: &pending,
-    };
-    let initial = Bytes::from(format!(
-        "data: {}\n\n",
-        serde_json::to_string(&snapshot).unwrap()
-    ));
-
-    let initial_stream =
-        stream::once(async move { Ok::<Frame<Bytes>, hyper::Error>(Frame::data(initial)) });
-
-    let event_stream = stream::unfold(
+    let snapshot = build_snapshot(&manager);
+    let initial = stream::once(async move { Ok(Event::default().json_data(&snapshot).unwrap()) });
+    let live = stream::unfold(
         rx,
         |mut rx: broadcast::Receiver<NotifierEvent>| async move {
             match rx.recv().await {
-                Ok(ev) => {
-                    let payload = serde_json::to_string(&ev).unwrap();
-                    let line = format!("data: {}\n\n", payload);
-                    Some((
-                        Ok::<Frame<Bytes>, hyper::Error>(Frame::data(Bytes::from(line))),
-                        rx,
-                    ))
-                }
+                Ok(ev) => Some((Ok(Event::default().json_data(&ev).unwrap()), rx)),
                 // Closed → channel dropped, stop. Lagged → drop this connection;
                 // the dashboard JS reconnects and gets a fresh snapshot.
                 Err(_) => None,
             }
         },
     );
-
-    let body = StreamBody::new(initial_stream.chain(event_stream));
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "keep-alive")
-        // X-Accel-Buffering disables proxy buffering (nginx); harmless otherwise.
-        .header("X-Accel-Buffering", "no")
-        .body(BodyExt::boxed(body))
-        .unwrap()
+    Sse::new(initial.chain(live)).keep_alive(KeepAlive::default())
 }
 
 async fn serve_decision(
-    manager: Arc<ApprovalManager>,
-    id: &str,
-    req: Request<Incoming>,
-) -> Response<BoxBody<Bytes, hyper::Error>> {
-    let body = match req.into_body().collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) => return bad_request(&format!("failed to read body: {}", e)),
-    };
-    let decision: ApprovalDecision = match serde_json::from_slice(&body) {
-        Ok(d) => d,
-        Err(e) => return bad_request(&format!("invalid decision JSON: {}", e)),
-    };
-
+    State(manager): State<Arc<ApprovalManager>>,
+    Path(id): Path<String>,
+    Json(decision): Json<ApprovalDecision>,
+) -> Result<StatusCode, AppError> {
     // Snapshot the pending approval to pick up the agent's proposed rules
     // as the default when the user didn't edit them.
-    let snap = manager.snapshot_pending(id);
-    let proposed_rules = match snap {
-        Some(req) => req.rules,
-        None => {
-            return not_found();
-        }
-    };
+    let proposed_rules = manager
+        .snapshot_pending(&id)
+        .map(|req| req.rules)
+        .ok_or(AppError::NotFound)?;
 
     let status = match decision.action {
         DecisionAction::Approve => ApprovalStatus::Approved {
@@ -171,40 +145,136 @@ async fn serve_decision(
         },
     };
 
-    match manager.resolve(id, status) {
-        Ok(()) => Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
-            .unwrap(),
-        Err(super::types::ApprovalError::NotFound) => not_found(),
-        Err(e) => bad_request(&format!("{}", e)),
+    match manager.resolve(&id, status) {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(super::types::ApprovalError::NotFound) => Err(AppError::NotFound),
+        Err(e) => Err(AppError::bad_request(e.to_string())),
     }
 }
 
-fn not_found() -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header("Content-Type", "text/plain")
-        .body(
-            Full::new(Bytes::from_static(b"not found\n"))
-                .map_err(|e| match e {})
-                .boxed(),
-        )
-        .unwrap()
+async fn serve_revoke(
+    State(manager): State<Arc<ApprovalManager>>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    manager.revoke_approval(&id);
+    StatusCode::NO_CONTENT
 }
 
-fn bad_request(msg: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
-    let body = format!("bad request: {}\n", msg);
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .header("Content-Type", "text/plain")
-        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
-        .unwrap()
+#[derive(Deserialize)]
+struct PermissiveBody {
+    duration_secs: u64,
 }
 
-// NotifierEvent is only referenced via type inference on the broadcast
-// channel; the import must remain so `subscribe_events`'s return type
-// is in scope. Keep Lifetime import explicit since it's constructed
-// in `serve_decision`.
-#[allow(dead_code)]
-fn _type_refs(_: Option<NotifierEvent>, _: Option<Lifetime>) {}
+async fn serve_permissive(
+    State(manager): State<Arc<ApprovalManager>>,
+    Json(body): Json<PermissiveBody>,
+) -> StatusCode {
+    if body.duration_secs == 0 {
+        manager.clear_permissive();
+    } else {
+        manager.set_permissive(std::time::Duration::from_secs(body.duration_secs));
+    }
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct AddRulesBody {
+    rules: Vec<Rule>,
+    ttl: Lifetime,
+}
+
+#[derive(Serialize)]
+struct AddRulesResponse {
+    approval_id: String,
+}
+
+async fn serve_add_rules(
+    State(manager): State<Arc<ApprovalManager>>,
+    Json(body): Json<AddRulesBody>,
+) -> Result<Json<AddRulesResponse>, AppError> {
+    let approval_id = manager
+        .add_rules(body.rules, body.ttl)
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(AddRulesResponse { approval_id }))
+}
+
+#[derive(Deserialize)]
+struct RulesParseBody {
+    toml: String,
+}
+
+#[derive(Deserialize)]
+struct RulesWrapper {
+    #[serde(default)]
+    rules: Vec<Rule>,
+}
+
+#[derive(Serialize)]
+struct RulesParseResponse {
+    rules: Vec<Rule>,
+}
+
+async fn serve_rules_parse(
+    Json(body): Json<RulesParseBody>,
+) -> Result<Json<RulesParseResponse>, AppError> {
+    // Accept either a single `[[rules]]` table-array form or a bare rule
+    // table. Try the wrapper form first, then a bare table as fallback.
+    let rules = match toml::from_str::<RulesWrapper>(&body.toml) {
+        Ok(w) if !w.rules.is_empty() => w.rules,
+        _ => match toml::from_str::<Rule>(&body.toml) {
+            Ok(r) => vec![r],
+            Err(e) => return Err(AppError::bad_request(format!("TOML parse error: {}", e))),
+        },
+    };
+    for r in &rules {
+        r.validate()
+            .map_err(|e| AppError::bad_request(format!("invalid rule: {}", e)))?;
+    }
+    Ok(Json(RulesParseResponse { rules }))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RulesSuggestBody {
+    AuditEntry { audit: Box<AuditEntrySnapshot> },
+    RawRules { rules: Vec<Rule> },
+}
+
+#[derive(Serialize)]
+struct RulesSuggestResponse {
+    toml: String,
+}
+
+async fn serve_rules_suggest(Json(body): Json<RulesSuggestBody>) -> Json<RulesSuggestResponse> {
+    let toml_str = match body {
+        RulesSuggestBody::AuditEntry { audit } => {
+            rule_suggest::suggest_for_audit_snapshot(audit.as_ref())
+        }
+        RulesSuggestBody::RawRules { rules } => rule_suggest::format_rules_toml(&rules),
+    };
+    Json(RulesSuggestResponse { toml: toml_str })
+}
+
+// ---------- error mapping ----------
+
+enum AppError {
+    NotFound,
+    BadRequest(String),
+}
+
+impl AppError {
+    fn bad_request(msg: impl Into<String>) -> Self {
+        AppError::BadRequest(msg.into())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        match self {
+            AppError::NotFound => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+            AppError::BadRequest(m) => {
+                (StatusCode::BAD_REQUEST, format!("bad request: {}\n", m)).into_response()
+            }
+        }
+    }
+}

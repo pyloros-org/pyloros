@@ -1,20 +1,25 @@
 //! Structured JSONL audit logging for request decisions.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Event type for an audit entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEvent {
     RequestAllowed,
     RequestBlocked,
     RequestPermitted,
     AuthFailed,
+    /// Dashboard-triggered timeboxed permissive mode was enabled.
+    PermissiveEnabled,
+    /// Dashboard-triggered timeboxed permissive mode was disabled
+    /// (manually cleared or auto-expired).
+    PermissiveDisabled,
 }
 
 /// Decision outcome.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditDecision {
     Allowed,
@@ -22,7 +27,7 @@ pub enum AuditDecision {
 }
 
 /// Reason for the decision.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditReason {
     RuleMatched,
@@ -38,6 +43,8 @@ pub enum AuditReason {
     /// Request was allowed because its (method, URL) was advertised as an LFS action
     /// in a recent successful Git-LFS batch response.
     LfsActionWhitelisted,
+    /// Marker for permissive-mode toggle audit entries; not a request decision.
+    PermissiveToggle,
 }
 
 /// Credential info attached to an audit entry.
@@ -49,7 +56,7 @@ pub struct AuditCredential {
 }
 
 /// Git-specific info attached to an audit entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditGitInfo {
     pub blocked_refs: Vec<String>,
 }
@@ -80,6 +87,74 @@ pub struct AuditEntry {
     pub response_body_encoding: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_truncated: Option<bool>,
+    /// For `PermissiveEnabled` entries: how long the override was set for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_duration_secs: Option<u64>,
+    /// For `PermissiveEnabled` / `PermissiveDisabled` entries: who/what
+    /// triggered the toggle (`"dashboard"`, `"dashboard_clear"`, `"expired"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_source: Option<String>,
+    /// If the response to this request was a 3xx with a resolvable
+    /// `Location`, the absolute target URL. Captured opportunistically
+    /// on every forwarded response; surfaces in `/rules/suggest` as a
+    /// pre-filled `allow_redirects` entry. Single-hop only; multi-hop
+    /// chains would need cross-entry correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_target: Option<String>,
+}
+
+impl AuditEntry {
+    /// Build a permissive-mode-enabled audit entry. Method/URL/host are
+    /// `"-"` placeholders since this entry is not tied to a single
+    /// request — see INTERNALS.md "Timeboxed permissive mode".
+    pub fn permissive_enabled(duration_secs: u64, source: &str) -> Self {
+        Self {
+            timestamp: now_iso8601(),
+            event: AuditEvent::PermissiveEnabled,
+            method: "-".to_string(),
+            url: "-".to_string(),
+            host: "-".to_string(),
+            scheme: "-".to_string(),
+            protocol: "-".to_string(),
+            decision: AuditDecision::Allowed,
+            reason: AuditReason::PermissiveToggle,
+            credential: None,
+            git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
+            permissive_duration_secs: Some(duration_secs),
+            permissive_source: Some(source.to_string()),
+            redirect_target: None,
+        }
+    }
+
+    /// Build a permissive-mode-disabled audit entry.
+    pub fn permissive_disabled(source: &str) -> Self {
+        Self {
+            timestamp: now_iso8601(),
+            event: AuditEvent::PermissiveDisabled,
+            method: "-".to_string(),
+            url: "-".to_string(),
+            host: "-".to_string(),
+            scheme: "-".to_string(),
+            protocol: "-".to_string(),
+            decision: AuditDecision::Blocked,
+            reason: AuditReason::PermissiveToggle,
+            credential: None,
+            git: None,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: Some(source.to_string()),
+            redirect_target: None,
+        }
+    }
 }
 
 /// Encode a body for inclusion in an audit entry.
@@ -115,6 +190,76 @@ pub fn now_iso8601() -> String {
 /// and fast, avoiding the need for tokio's `fs` feature.
 pub struct AuditLogger {
     writer: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+    /// In-memory ring buffer of recent entries (snapshots only, bodies
+    /// stripped) so the dashboard can show recent activity without
+    /// re-parsing the JSONL file. Bounded to `RECENT_BUFFER_CAPACITY`.
+    recent: std::sync::Mutex<std::collections::VecDeque<AuditEntrySnapshot>>,
+    /// Optional callback fired after every entry is recorded — used
+    /// by `ApprovalManager` to forward the snapshot to dashboard SSE
+    /// subscribers. Wrapped in a Mutex so it can be set after construction.
+    subscriber: std::sync::Mutex<Option<AuditSubscriber>>,
+}
+
+/// Callback type for `AuditLogger::set_subscriber`. Boxed once at
+/// registration; clippy flagged the inline form as too complex.
+pub type AuditSubscriber = Arc<dyn Fn(&AuditEntrySnapshot) + Send + Sync>;
+
+/// Capacity of the in-memory audit ring buffer. ~500 entries keeps
+/// memory tiny while covering the recent-history window the dashboard
+/// shows.
+pub const RECENT_BUFFER_CAPACITY: usize = 500;
+
+use std::sync::Arc;
+
+/// Lightweight snapshot of an audit entry for dashboard display.
+/// Drops request/response bodies to keep the in-memory buffer small,
+/// while keeping the fields users actually scan: method, URL, host,
+/// reason, and the permissive-toggle metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuditEntrySnapshot {
+    pub timestamp: String,
+    pub event: AuditEvent,
+    pub method: String,
+    pub url: String,
+    pub host: String,
+    pub scheme: String,
+    pub protocol: String,
+    pub decision: AuditDecision,
+    pub reason: AuditReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<AuditGitInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_duration_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissive_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_target: Option<String>,
+}
+
+impl AuditEntrySnapshot {
+    fn from_entry(e: &AuditEntry) -> Self {
+        Self {
+            timestamp: e.timestamp.clone(),
+            event: e.event.clone(),
+            method: e.method.clone(),
+            url: e.url.clone(),
+            host: e.host.clone(),
+            scheme: e.scheme.clone(),
+            protocol: e.protocol.clone(),
+            decision: e.decision.clone(),
+            reason: e.reason.clone(),
+            git: e.git.clone(),
+            permissive_duration_secs: e.permissive_duration_secs,
+            permissive_source: e.permissive_source.clone(),
+            redirect_target: e.redirect_target.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogger").finish_non_exhaustive()
+    }
 }
 
 impl AuditLogger {
@@ -126,7 +271,76 @@ impl AuditLogger {
             .open(path)?;
         Ok(Self {
             writer: std::sync::Mutex::new(std::io::BufWriter::new(file)),
+            recent: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                RECENT_BUFFER_CAPACITY,
+            )),
+            subscriber: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Register a callback fired on every recorded entry. Used by
+    /// `ApprovalManager` to broadcast audit snapshots over the dashboard
+    /// SSE channel. Replaces any previously-registered callback.
+    pub fn set_subscriber(&self, cb: AuditSubscriber) {
+        *self.subscriber.lock().unwrap() = Some(cb);
+    }
+
+    /// Annotate the most recent matching ring-buffer entry with the
+    /// redirect target observed in its response. Post-hoc because the
+    /// audit entry is emitted at request time, while the `Location`
+    /// header is only known after the upstream responds. The append-only
+    /// JSONL file is left untouched; the field lives in the in-memory
+    /// snapshot only.
+    pub fn record_redirect(&self, request_url: &str, target: &str) {
+        let mut buf = self.recent.lock().unwrap();
+        for e in buf.iter_mut().rev() {
+            if e.url == request_url
+                && matches!(
+                    e.event,
+                    AuditEvent::RequestAllowed
+                        | AuditEvent::RequestPermitted
+                        | AuditEvent::RequestBlocked
+                )
+            {
+                e.redirect_target = Some(target.to_string());
+                // Re-fire the subscriber so SSE consumers see the
+                // updated entry. Clone the snapshot to drop the buffer
+                // lock before firing.
+                let snap = e.clone();
+                drop(buf);
+                if let Some(cb) = self.subscriber.lock().unwrap().as_ref() {
+                    cb(&snap);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Most recent entries, newest first. With `include_allowed = false`
+    /// returns the entries the user typically acts on: blocked,
+    /// auth-failed, permitted (unmatched but let through by permissive
+    /// mode — the "discover rules while permissive" workflow), and
+    /// permissive-mode toggle markers. `include_allowed = true` also
+    /// returns the `RequestAllowed` rows that matched an explicit rule.
+    pub fn recent_entries(&self, include_allowed: bool) -> Vec<AuditEntrySnapshot> {
+        let buf = self.recent.lock().unwrap();
+        buf.iter()
+            .rev()
+            .filter(|e| {
+                if include_allowed {
+                    return true;
+                }
+                matches!(
+                    e.event,
+                    AuditEvent::RequestBlocked
+                        | AuditEvent::AuthFailed
+                        | AuditEvent::RequestPermitted
+                        | AuditEvent::PermissiveEnabled
+                        | AuditEvent::PermissiveDisabled
+                )
+            })
+            .cloned()
+            .collect()
     }
 
     /// Write an audit entry as a JSON line. Errors are logged but never propagated.
@@ -149,10 +363,23 @@ impl AuditLogger {
         };
         if let Err(e) = writeln!(writer, "{}", json) {
             tracing::error!(error = %e, "Failed to write audit entry");
-            return;
-        }
-        if let Err(e) = writer.flush() {
+        } else if let Err(e) = writer.flush() {
             tracing::error!(error = %e, "Failed to flush audit log");
+        }
+        drop(writer);
+
+        // Push into the in-memory ring buffer and fire the subscriber
+        // (if any) so dashboards update live.
+        let snapshot = AuditEntrySnapshot::from_entry(entry);
+        {
+            let mut buf = self.recent.lock().unwrap();
+            if buf.len() >= RECENT_BUFFER_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(snapshot.clone());
+        }
+        if let Some(cb) = self.subscriber.lock().unwrap().as_ref() {
+            cb(&snapshot);
         }
     }
 }
@@ -182,6 +409,9 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
+            redirect_target: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_contains("has event", &json, "\"event\":\"request_allowed\"");
@@ -212,6 +442,9 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
+            redirect_target: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         t.assert_true("no credential field", !json.contains("\"credential\""));
@@ -243,6 +476,9 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
+            redirect_target: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -340,6 +576,9 @@ mod tests {
             response_body: None,
             response_body_encoding: None,
             body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
+            redirect_target: None,
         };
         logger.log(&entry);
 

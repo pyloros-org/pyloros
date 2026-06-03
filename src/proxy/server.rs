@@ -243,6 +243,9 @@ impl ProxyServer {
 
     /// Set the audit logger for structured request logging.
     pub fn with_audit_logger(mut self, logger: Arc<AuditLogger>) -> Self {
+        if let Some(ref manager) = self.approvals {
+            manager.attach_audit_logger(Arc::clone(&logger));
+        }
         self.audit_logger = Some(logger);
         self
     }
@@ -545,7 +548,11 @@ impl ProxyServer {
                 Some(path) => match AuditLogger::open(path) {
                     Ok(logger) => {
                         tracing::info!(path = %path, "Audit log path updated");
-                        self.audit_logger = Some(Arc::new(logger));
+                        let logger = Arc::new(logger);
+                        if let Some(ref manager) = self.approvals {
+                            manager.attach_audit_logger(Arc::clone(&logger));
+                        }
+                        self.audit_logger = Some(logger);
                     }
                     Err(e) => {
                         tracing::error!(error = %e, path = %path, "Config reload failed: cannot open audit log");
@@ -597,6 +604,7 @@ impl ProxyServer {
         let log_blocked = self.config.logging.log_blocked_requests;
         let audit_logger = self.audit_logger.clone();
         let permissive = self.config.proxy.permissive;
+        let approvals = self.approvals.clone();
         let max_body_log_size = self.config.logging.max_body_log_size;
 
         tokio::spawn(async move {
@@ -612,6 +620,7 @@ impl ProxyServer {
                 .with_auth(auth.clone())
                 .with_audit_logger(audit_logger.clone())
                 .with_permissive(permissive)
+                .with_approvals(approvals.clone())
                 .with_max_body_log_size(max_body_log_size);
                 async move { handler.handle(req).await }
             });

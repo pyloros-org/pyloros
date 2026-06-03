@@ -11,8 +11,8 @@
 # Options:
 #   --no-browser   Don't try to open the dashboard URL in a browser
 #   --keep         Keep the temp dir (CA, config, permanent-rules file, proxy log) on exit
-#   --no-claude    Don't launch claude — just run the proxy + dashboard
-#                  (use raw curl from another terminal, like the old demo)
+#   --no-claude    Drop into an interactive shell inside the sandbox env
+#                  (with HTTP(S)_PROXY etc. set) instead of launching claude
 #   -h, --help     Show this help
 #
 # Anything after `--` is forwarded to the `claude` command.
@@ -77,6 +77,7 @@ CA_KEY="$TMPDIR_BASE/ca.key"
 PROXY_BIND="127.0.0.1:7777"
 DASH_BIND="127.0.0.1:7778"
 PERMANENT_RULES="$TMPDIR_BASE/approvals-permanent-rules.toml"
+AUDIT_LOG="$TMPDIR_BASE/audit.jsonl"
 CONFIG="$TMPDIR_BASE/config.toml"
 
 # Pre-allow Anthropic so Claude Code itself can talk to its own backend.
@@ -90,6 +91,7 @@ ca_key  = "$CA_KEY"
 [logging]
 level = "info"
 log_requests = true
+audit_log = "$AUDIT_LOG"
 
 [approvals]
 permanent_rules_file   = "$PERMANENT_RULES"
@@ -159,20 +161,42 @@ cat <<EOF
   Dashboard    $DASHBOARD_URL  (open in your browser)
   CA cert      $CA_CERT
   Rules file   $PERMANENT_RULES  (permanent approvals persist here)
+  Audit log    $AUDIT_LOG  (JSONL; tail -f to watch)
   Proxy log    $TMPDIR_BASE/proxy.log
   Workspace    $WORKSPACE  (claude runs here; CLAUDE.md primes the agent)
 
   Pre-allowed: *.anthropic.com
   Everything else: blocked (451) until approved via the dashboard.
 
-  When Claude needs network access for a tool call, it should hit a
-  451 and POST to https://pyloros.internal/approvals. Approve in the
-  browser, the agent's long-poll wakes up, and the rule is live.
+  Dashboard panels to explore:
+    1. Permissive-mode bar    — flip "permissive mode" on for 5/15/60
+                                min to unblock everything temporarily.
+                                Auto-expires; recorded in the audit log.
+    2. Pending approvals      — edit the rule TOML before approving
+                                (typo fix, widen URL, change git op).
+    3. Active timeboxed rules — see what's currently allowed and a
+                                Revoke button per group.
+    4. Recent blocked         — each row has a "Create rule" button
+                                that pre-fills exact + commented
+                                broader TOML (git-shape aware).
+    5. Audit log              — toggleable browser over the in-memory
+                                ring buffer; older entries on disk.
 
   Try prompts like:
     - "fetch https://example.com/ and show me the response"
+       (then "Create rule" from the blocked row in the dashboard
+        instead of waiting for the agent to ask)
     - "clone https://github.com/anthropics/anthropic-cookbook"
+       (watch the git=fetch suggestion appear in the rule editor)
     - "curl https://api.github.com/zen"
+
+  Try from the dashboard directly:
+    - Enable permissive mode for 5 min and re-run any blocked agent
+      step — it goes through (and a permissive_enabled entry appears
+      in the audit panel).
+    - Click "Create rule" on a blocked row, tweak the TOML, hit Add
+      with a 1-hour TTL; watch it show up in "Active timeboxed rules"
+      with a countdown.
 
   Press Ctrl-C to stop everything.
 ================================================================
@@ -187,36 +211,40 @@ if [[ "$NO_BROWSER" == "false" ]]; then
     fi
 fi
 
-if [[ "$NO_CLAUDE" == "true" ]]; then
-    echo "Running with --no-claude; press Ctrl-C to stop the proxy." >&2
-    wait "$PROXY_PID"
-    exit 0
-fi
-
-# Launch Claude with proxy env vars set. NODE_EXTRA_CA_CERTS makes the
-# bundled Node runtime trust our test CA. NO_PROXY keeps Claude's own
+# Launch the foreground process (claude or an interactive shell) with
+# the sandbox env vars set. NODE_EXTRA_CA_CERTS makes the bundled Node
+# runtime trust our test CA. NO_PROXY keeps Claude's own
 # api.anthropic.com traffic off the proxy as a belt-and-suspenders
 # fallback (we also allowlist anthropic in the proxy config above).
-echo "Launching claude (Ctrl-D or /exit to quit)..." >&2
-echo >&2
+if [[ "$NO_CLAUDE" == "true" ]]; then
+    SHELL_BIN="${SHELL:-/bin/bash}"
+    echo "Launching $SHELL_BIN inside sandbox env (exit to quit)..." >&2
+    echo "Try: curl https://httpbin.org/get   (will 451 until you approve via the dashboard)" >&2
+    echo >&2
+else
+    echo "Launching claude (Ctrl-D or /exit to quit)..." >&2
+    echo >&2
+fi
+
+export HTTP_PROXY="$PROXY_URL"
+export HTTPS_PROXY="$PROXY_URL"
+export http_proxy="$PROXY_URL"
+export https_proxy="$PROXY_URL"
+export SSL_CERT_FILE="$CA_CERT"
+export CURL_CA_BUNDLE="$CA_CERT"
+export NODE_EXTRA_CA_CERTS="$CA_CERT"
+export REQUESTS_CA_BUNDLE="$CA_CERT"
+export NO_PROXY="api.anthropic.com,.anthropic.com,localhost,127.0.0.1"
+export no_proxy="api.anthropic.com,.anthropic.com,localhost,127.0.0.1"
 
 set +e
-(
-    cd "$WORKSPACE" && \
-    HTTP_PROXY="$PROXY_URL" \
-    HTTPS_PROXY="$PROXY_URL" \
-    http_proxy="$PROXY_URL" \
-    https_proxy="$PROXY_URL" \
-    SSL_CERT_FILE="$CA_CERT" \
-    CURL_CA_BUNDLE="$CA_CERT" \
-    NODE_EXTRA_CA_CERTS="$CA_CERT" \
-    REQUESTS_CA_BUNDLE="$CA_CERT" \
-    NO_PROXY="api.anthropic.com,.anthropic.com,localhost,127.0.0.1" \
-    no_proxy="api.anthropic.com,.anthropic.com,localhost,127.0.0.1" \
-        claude --dangerously-skip-permissions \
-               "${CLAUDE_ARGS[@]}"
-)
-CLAUDE_RC=$?
+cd "$WORKSPACE"
+if [[ "$NO_CLAUDE" == "true" ]]; then
+    "$SHELL_BIN" -i
+else
+    claude --dangerously-skip-permissions "${CLAUDE_ARGS[@]}"
+fi
+RC=$?
 set -e
 
-exit "$CLAUDE_RC"
+exit "$RC"

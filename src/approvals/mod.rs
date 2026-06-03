@@ -10,6 +10,7 @@
 pub mod api;
 pub mod dashboard;
 pub mod dedup;
+pub mod rule_suggest;
 pub mod state;
 pub mod storage;
 pub mod types;

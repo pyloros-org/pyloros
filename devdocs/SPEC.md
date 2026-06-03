@@ -294,12 +294,55 @@ Without this section, the agent API returns 404 and no dashboard listener is bou
   the full smart-HTTP + LFS endpoint set, just like in the TOML config).
 
 - **Dashboard at `dashboard_bind`.** Its own dedicated listener, plain HTTP. Endpoints:
-  - `GET /` — HTML page listing pending approvals; fires browser notifications via the
-    Notification API when new approvals arrive.
-  - `GET /events` — Server-Sent Events stream of pending/resolved approval events.
+  - `GET /` — HTML page with several panels (see "Dashboard panels" below);
+    fires browser notifications via the Notification API when new approvals arrive.
+  - `GET /events` — Server-Sent Events stream. The first frame is a full
+    snapshot of pending approvals, active timeboxed rules, permissive-mode
+    status, and the recent-audit ring buffer; subsequent frames are
+    pending/resolved approval events, active-rule changes, permissive-mode
+    changes, and audit-entry snapshots.
   - `POST /approvals/{id}/decision` — body: `{action, rules_applied?, ttl?, message?}`.
+    The user may edit the proposed rules in the dashboard before submitting; the
+    edited rules go in `rules_applied`.
+  - `DELETE /approvals/{id}/rules` — revoke an active group of rules previously
+    approved (timeboxed or permanent).
+  - `POST /rules` — body `{rules, ttl}`. Add rules directly without an upstream
+    approval request (used by the dashboard's "Create rule from blocked request"
+    button). Wraps the same `add_rules` helper the decision endpoint uses.
+  - `POST /rules/parse` — body `{toml}`. Parses one or more `[[rules]]` tables
+    into structured rules using the same TOML schema as the config file. Returns
+    `{rules}` on success or `{error}` with a parser message.
+  - `POST /rules/suggest` — body is an audit-entry snapshot (recent blocked
+    request) or `{rules}` for re-formatting existing rules. Returns
+    `{toml}` containing a pre-fill: exact-match `[[rules]]` block plus a
+    commented broader alternative; for git-shaped blocks emits a `git = "..."`
+    rule with optional `branches = [...]` commented in for branch_restriction
+    blocks. All TOML formatting happens server-side via `toml::to_string` so
+    the schema stays single-sourced.
+  - `POST /permissive` — body `{duration_secs}`. Enable a timeboxed permissive
+    mode override for `duration_secs` seconds (or `0` to clear immediately).
+    Auto-expires; logs `permissive_enabled` / `permissive_disabled` audit
+    entries for traceability.
 
-**Lifetimes** (chosen at decision time): `session`, `1h`, `1d`, `permanent`. The dashboard form
+**Dashboard panels:**
+
+1. **Permissive-mode bar.** Current status, a select with `5m / 15m / 1h`
+   (default `15m`), and enable/disable buttons. While active, shows a live
+   countdown.
+2. **Pending approvals.** One card per pending request; the rule shown as
+   editable TOML. On approve, the textarea contents go through `/rules/parse`
+   and the resulting rules become `rules_applied`.
+3. **Active timeboxed rules.** Lists `OneHour` / `OneDay` approval groups with
+   their remaining time and a Revoke button. The active permissive-mode
+   override appears here as a synthetic row when active.
+4. **Recent blocked requests.** Newest-first from the audit ring buffer, each
+   with a "Create rule" button that opens the TOML editor pre-filled via
+   `/rules/suggest`.
+5. **Audit log browser.** Toggle to also include allowed/permitted entries
+   interleaved with blocked ones. Bounded by the in-memory ring buffer; older
+   entries live only in the audit log file on disk.
+
+**Lifetimes** (chosen at decision time): `1h`, `1d`, `permanent`. The dashboard form
 defaults to `permanent` — in steady-state projects nearly every approval is something the user
 will need every time, and forcing them to flip the dropdown for the common case is the wrong
 default. The agent's `suggested_ttl` overrides the form default if present. Permanent rules go
@@ -342,7 +385,12 @@ subcommands:
 
 When deploying pyloros for the first time, operators may not know what rules they need. Permissive mode provides a "learning" phase where unmatched requests are allowed through but logged distinctly, so operators can discover traffic patterns and build rules from the audit log. Named after SELinux's permissive mode.
 
-- Enabled via `permissive = true` in `[proxy]` (default: `false`)
+- Enabled via `permissive = true` in `[proxy]` (default: `false`), or temporarily
+  via the dashboard's `POST /permissive {duration_secs}` endpoint (default
+  duration in the UI is 15m; available choices are 5m / 15m / 1h). The dashboard
+  override auto-expires and emits `permissive_enabled` and `permissive_disabled`
+  audit entries (the latter with `permissive_source` of `dashboard_clear` or
+  `expired`) so toggles are traceable
 - Only converts `FilterResult::Blocked` (no matching rule) to allow-through
 - All other block reasons (branch restriction, LFS check, body-inspection-requires-HTTPS, unsupported CONNECT port, auth failure) still block — those represent matched rules with failed constraints
 - Permitted requests emit a distinct audit event `"request_permitted"` with `decision: "allowed"`, `reason: "no_matching_rule"` — easy to grep, distinct from `"request_allowed"` (which means a rule matched)

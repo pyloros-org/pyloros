@@ -131,7 +131,7 @@ async fn test_post_approve_roundtrip_via_resolve_for_test() {
             &id,
             ApprovalStatus::Approved {
                 rules_applied: rules.clone(),
-                ttl: Lifetime::Session,
+                ttl: Lifetime::OneHour,
             },
         )
         .expect("resolve succeeds");
@@ -249,7 +249,7 @@ async fn test_long_poll_wakes_on_resolution() {
                 &id_for_resolver,
                 ApprovalStatus::Approved {
                     rules_applied: vec![method_rule("GET", "https://x/*")],
-                    ttl: Lifetime::Session,
+                    ttl: Lifetime::OneHour,
                 },
             )
             .unwrap();
@@ -493,7 +493,7 @@ async fn test_dashboard_sse_streams_pending_and_resolved() {
             &id,
             ApprovalStatus::Approved {
                 rules_applied: vec![method_rule("GET", "https://api.foo.com/*")],
-                ttl: Lifetime::Session,
+                ttl: Lifetime::OneHour,
             },
         )
         .unwrap();
@@ -596,7 +596,7 @@ async fn test_approved_session_rule_unblocks_traffic() {
             &req.id,
             ApprovalStatus::Approved {
                 rules_applied: vec![method_rule("GET", "https://localhost/*")],
-                ttl: Lifetime::Session,
+                ttl: Lifetime::OneHour,
             },
         )
         .unwrap();
@@ -656,7 +656,7 @@ async fn test_approve_invalid_rule_rejected() {
             &req.id,
             ApprovalStatus::Approved {
                 rules_applied: vec![invalid],
-                ttl: Lifetime::Session,
+                ttl: Lifetime::OneHour,
             },
         )
         .unwrap_err();
@@ -778,7 +778,7 @@ async fn test_revoke_removes_active_rule() {
             &req.id,
             ApprovalStatus::Approved {
                 rules_applied: vec![method_rule("GET", "https://localhost/*")],
-                ttl: Lifetime::Session,
+                ttl: Lifetime::OneHour,
             },
         )
         .unwrap();
@@ -1079,7 +1079,7 @@ async fn test_git_fetch_rule_roundtrip() {
         &"fetch",
     );
 
-    // Resolve as approved (session lifetime).
+    // Resolve as approved.
     manager
         .resolve(
             &id,
@@ -1093,7 +1093,7 @@ async fn test_git_fetch_rule_roundtrip() {
                     allow_redirects: Vec::new(),
                     log_body: false,
                 }],
-                ttl: Lifetime::Session,
+                ttl: Lifetime::OneHour,
             },
         )
         .unwrap();

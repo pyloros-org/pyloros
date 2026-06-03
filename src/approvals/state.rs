@@ -14,7 +14,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::config::{ApprovalsConfig, Rule};
 
 use super::types::{
-    ApprovalError, ApprovalRequest, ApprovalStatus, Lifetime, NotifierEvent, TriggeredBy,
+    ActiveApprovalSnapshot, ApprovalError, ApprovalRequest, ApprovalStatus, Lifetime,
+    NotifierEvent, PermissiveSource, PermissiveStatus, TriggeredBy,
 };
 
 /// Capacity for the dashboard notifier broadcast channel. Each dashboard
@@ -29,11 +30,15 @@ pub struct ApprovalManager {
     config: ApprovalsConfig,
     state: Mutex<State>,
     id_counter: AtomicU64,
+    rule_counter: AtomicU64,
     notifier: broadcast::Sender<NotifierEvent>,
     /// Signal channel for the proxy's main select loop to rebuild the
     /// effective FilterEngine when the set of active approval rules
     /// changes. Set once by `ProxyServer::serve` via `attach_rebuild_tx`.
     rebuild_tx: OnceLock<mpsc::Sender<()>>,
+    /// Audit logger, attached at server-startup time. Used to record
+    /// permissive-mode toggles so they appear in the JSONL log.
+    audit_logger: OnceLock<Arc<crate::audit::AuditLogger>>,
 }
 
 /// A currently-active approval rule.
@@ -44,6 +49,8 @@ pub struct ActiveApproval {
     /// The approval id this rule came from. Used by TTL expiry timers
     /// to find all rules from a single approval and remove them together.
     pub approval_id: String,
+    /// When this rule expires, or `None` for `Permanent`.
+    pub expires_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -60,6 +67,9 @@ struct State {
     /// Timestamps of recent POST /approvals calls, for sliding-window
     /// rate limiting.
     recent_posts: VecDeque<Instant>,
+    /// Deadline at which the dashboard-controlled permissive override
+    /// expires. `None` means inactive.
+    permissive_until: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -87,6 +97,7 @@ impl ApprovalManager {
                         rule,
                         lifetime: Lifetime::Permanent,
                         approval_id: String::new(), // permanent rules loaded from disk have no originating approval id
+                        expires_at: None,
                     });
                 }
                 if !state.active.is_empty() {
@@ -109,9 +120,35 @@ impl ApprovalManager {
             config,
             state: Mutex::new(state),
             id_counter: AtomicU64::new(1),
+            rule_counter: AtomicU64::new(1),
             notifier,
             rebuild_tx: OnceLock::new(),
+            audit_logger: OnceLock::new(),
         })
+    }
+
+    /// Attach the audit logger so permissive-toggle entries can be recorded
+    /// and audit snapshots forwarded to dashboard SSE subscribers. Silent
+    /// no-op if already attached.
+    pub fn attach_audit_logger(self: &Arc<Self>, logger: Arc<crate::audit::AuditLogger>) {
+        let notifier = self.notifier.clone();
+        logger.set_subscriber(Arc::new(move |snapshot| {
+            let _ = notifier.send(NotifierEvent::Audit {
+                entry: snapshot.clone(),
+            });
+        }));
+        let _ = self.audit_logger.set(logger);
+    }
+
+    fn audit(&self, entry: crate::audit::AuditEntry) {
+        if let Some(logger) = self.audit_logger.get() {
+            logger.log(&entry);
+        }
+    }
+
+    /// Borrow the attached audit logger, if any.
+    pub fn audit_logger_ref(&self) -> Option<&Arc<crate::audit::AuditLogger>> {
+        self.audit_logger.get()
     }
 
     /// Attach the mpsc channel that the proxy's main select loop listens
@@ -271,42 +308,78 @@ impl ApprovalManager {
             None
         };
 
-        let (final_status, rebuilt, permanent_snapshot) = {
+        // Move the request from pending → resolved and notify waiters.
+        {
             let mut state = self.state.lock().unwrap();
             let entry = state.pending.remove(id).ok_or(ApprovalError::NotFound)?;
             let mut req = entry.request;
             req.status = status.clone();
             let _ = entry.status_tx.send(status.clone());
             state.resolved.insert(id.to_string(), req);
-            let mut rebuilt = false;
-            let mut permanent_snapshot: Option<Vec<Rule>> = None;
-            if let Some(ttl) = approve_ttl {
-                for rule in parsed_rules {
-                    state.active.push(ActiveApproval {
-                        rule,
-                        lifetime: ttl,
-                        approval_id: id.to_string(),
-                    });
-                }
-                rebuilt = true;
-                if ttl.is_permanent() {
-                    permanent_snapshot = Some(
-                        state
-                            .active
-                            .iter()
-                            .filter(|a| a.lifetime.is_permanent())
-                            .map(|a| a.rule.clone())
-                            .collect(),
-                    );
-                }
-            }
-            (status, rebuilt, permanent_snapshot)
-        };
+        }
 
         let _ = self.notifier.send(NotifierEvent::Resolved {
             id: id.to_string(),
-            status: final_status,
+            status,
         });
+
+        if let Some(ttl) = approve_ttl {
+            self.add_rules_internal(id.to_string(), parsed_rules, ttl);
+        }
+        Ok(())
+    }
+
+    /// Add rules directly without an originating pending approval.
+    /// Validates each rule and assigns a synthetic `rul_…` group id so
+    /// the resulting `ActiveApproval` entries can be revoked together.
+    pub fn add_rules(
+        self: &Arc<Self>,
+        rules: Vec<Rule>,
+        ttl: Lifetime,
+    ) -> Result<String, ApprovalError> {
+        for r in &rules {
+            r.validate()
+                .map_err(|e| ApprovalError::InvalidRule(format!("{}", e)))?;
+        }
+        let group_id = format!(
+            "rul_{:010}",
+            self.rule_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        self.add_rules_internal(group_id.clone(), rules, ttl);
+        Ok(group_id)
+    }
+
+    /// Append rules to the active set, persist any permanent ones,
+    /// schedule expiry, signal a rebuild, and broadcast the updated
+    /// active-rules snapshot.
+    fn add_rules_internal(self: &Arc<Self>, group_id: String, rules: Vec<Rule>, ttl: Lifetime) {
+        if rules.is_empty() {
+            return;
+        }
+        let expires_at = ttl.duration().map(|d| Instant::now() + d);
+        let permanent_snapshot = {
+            let mut state = self.state.lock().unwrap();
+            for rule in rules {
+                state.active.push(ActiveApproval {
+                    rule,
+                    lifetime: ttl,
+                    approval_id: group_id.clone(),
+                    expires_at,
+                });
+            }
+            if ttl.is_permanent() {
+                Some(
+                    state
+                        .active
+                        .iter()
+                        .filter(|a| a.lifetime.is_permanent())
+                        .map(|a| a.rule.clone())
+                        .collect::<Vec<Rule>>(),
+                )
+            } else {
+                None
+            }
+        };
 
         if let Some(snapshot) = permanent_snapshot {
             if let Err(e) =
@@ -320,18 +393,20 @@ impl ApprovalManager {
             }
         }
 
-        // Schedule expiry for timed lifetimes. Permanent never expires
-        // automatically; Session is dropped on process exit.
-        if let Some(ttl) = approve_ttl {
-            if let Some(duration) = ttl.duration() {
-                self.spawn_expiry_timer(id.to_string(), duration);
-            }
+        if let Some(duration) = ttl.duration() {
+            self.spawn_expiry_timer(group_id.clone(), duration);
         }
 
-        if rebuilt {
-            self.request_rebuild();
-        }
-        Ok(())
+        self.request_rebuild();
+        self.broadcast_active_rules();
+    }
+
+    /// Broadcast the current active-rules snapshot to dashboard subscribers.
+    fn broadcast_active_rules(&self) {
+        let rules = self.list_active();
+        let _ = self
+            .notifier
+            .send(NotifierEvent::ActiveRulesChanged { rules });
     }
 
     /// Revoke all rules from a previously approved approval. Removes them
@@ -369,6 +444,7 @@ impl ApprovalManager {
 
         if removed_any {
             self.request_rebuild();
+            self.broadcast_active_rules();
         }
     }
 
@@ -378,6 +454,145 @@ impl ApprovalManager {
             tokio::time::sleep(duration).await;
             this.revoke_approval(&approval_id);
         });
+    }
+
+    // ----- Dashboard-controlled permissive override ---------------------
+
+    /// Enable timeboxed permissive mode for `duration`. Replaces any
+    /// existing override deadline. Records a `PermissiveEnabled` audit
+    /// entry and broadcasts the new status to dashboard subscribers.
+    /// Spawns an expiry task that calls `clear_permissive` once the
+    /// deadline passes (unless re-enabled or cleared in the meantime).
+    pub fn set_permissive(self: &Arc<Self>, duration: Duration) {
+        let until = Instant::now() + duration;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.permissive_until = Some(until);
+        }
+        let secs = duration.as_secs();
+        self.audit(crate::audit::AuditEntry::permissive_enabled(
+            secs,
+            PermissiveSource::Dashboard.as_str(),
+        ));
+        let _ = self.notifier.send(NotifierEvent::PermissiveChanged {
+            status: PermissiveStatus {
+                active: true,
+                remaining_secs: Some(secs),
+            },
+        });
+        self.request_rebuild();
+
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            this.expire_permissive_if(until);
+        });
+    }
+
+    /// Manually clear the dashboard-controlled permissive override.
+    /// No-op if already inactive.
+    pub fn clear_permissive(self: &Arc<Self>) {
+        let was_active = {
+            let mut state = self.state.lock().unwrap();
+            state.permissive_until.take().is_some()
+        };
+        if was_active {
+            self.audit(crate::audit::AuditEntry::permissive_disabled(
+                PermissiveSource::DashboardClear.as_str(),
+            ));
+            let _ = self.notifier.send(NotifierEvent::PermissiveChanged {
+                status: PermissiveStatus {
+                    active: false,
+                    remaining_secs: None,
+                },
+            });
+            self.request_rebuild();
+        }
+    }
+
+    /// Internal expiry callback. Only clears state if the deadline
+    /// still matches `expected` — a fresh `set_permissive` may have
+    /// replaced it in the meantime.
+    fn expire_permissive_if(self: &Arc<Self>, expected: Instant) {
+        let cleared = {
+            let mut state = self.state.lock().unwrap();
+            if state.permissive_until == Some(expected) {
+                state.permissive_until = None;
+                true
+            } else {
+                false
+            }
+        };
+        if cleared {
+            self.audit(crate::audit::AuditEntry::permissive_disabled(
+                PermissiveSource::Expired.as_str(),
+            ));
+            let _ = self.notifier.send(NotifierEvent::PermissiveChanged {
+                status: PermissiveStatus {
+                    active: false,
+                    remaining_secs: None,
+                },
+            });
+            self.request_rebuild();
+        }
+    }
+
+    /// Is the dashboard-controlled permissive override currently active?
+    pub fn is_permissive_active(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        match state.permissive_until {
+            Some(deadline) => Instant::now() < deadline,
+            None => false,
+        }
+    }
+
+    /// Snapshot of the permissive override (for SSE consumers).
+    pub fn permissive_status(&self) -> PermissiveStatus {
+        let state = self.state.lock().unwrap();
+        match state.permissive_until {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now < deadline {
+                    PermissiveStatus {
+                        active: true,
+                        remaining_secs: Some((deadline - now).as_secs()),
+                    }
+                } else {
+                    PermissiveStatus {
+                        active: false,
+                        remaining_secs: None,
+                    }
+                }
+            }
+            None => PermissiveStatus {
+                active: false,
+                remaining_secs: None,
+            },
+        }
+    }
+
+    /// Snapshot of currently active rule groups, with their remaining
+    /// time and a pre-formatted TOML representation. Sent to dashboards
+    /// in the initial SSE frame and on every `ActiveRulesChanged` event.
+    pub fn list_active(&self) -> Vec<ActiveApprovalSnapshot> {
+        let now = Instant::now();
+        let state = self.state.lock().unwrap();
+        state
+            .active
+            .iter()
+            .map(|a| {
+                let remaining_secs =
+                    a.expires_at
+                        .map(|t| if t > now { (t - now).as_secs() } else { 0 });
+                ActiveApprovalSnapshot {
+                    approval_id: a.approval_id.clone(),
+                    rule: a.rule.clone(),
+                    lifetime: a.lifetime,
+                    remaining_secs,
+                    toml: super::rule_suggest::format_rule_toml(&a.rule),
+                }
+            })
+            .collect()
     }
 
     /// Test-only: resolve without going through the dashboard API.
