@@ -3,13 +3,13 @@
 
 mod common;
 
-use common::{ok_handler, TestCa, TestReport, TestUpstream};
+use common::{TestCa, TestReport, TestUpstream, ok_handler};
 use std::io::{BufRead, BufReader, Read as _};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -84,11 +84,9 @@ fn spawn_proxy(config_path: &Path) -> (Child, u16) {
                 Ok(l) => l,
                 Err(_) => break,
             };
-            if !sent {
-                if let Some(port) = parse_listening_port(&line) {
-                    let _ = tx.send(port);
-                    sent = true;
-                }
+            if !sent && let Some(port) = parse_listening_port(&line) {
+                let _ = tx.send(port);
+                sent = true;
             }
         }
     });
@@ -130,11 +128,9 @@ fn spawn_proxy_with_logs(config_path: &Path) -> (Child, u16, Arc<Mutex<Vec<Strin
                 Ok(l) => l,
                 Err(_) => break,
             };
-            if !sent {
-                if let Some(port) = parse_listening_port(&line) {
-                    let _ = tx.send(port);
-                    sent = true;
-                }
+            if !sent && let Some(port) = parse_listening_port(&line) {
+                let _ = tx.send(port);
+                sent = true;
             }
             logs_clone.lock().unwrap().push(line);
         }

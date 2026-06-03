@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ok_handler, ReportingClient, TestCa, TestProxy, TestUpstream};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, ok_handler};
 use pyloros::approvals::{ApprovalStatus, Lifetime};
 use pyloros::config::Rule;
 use serde_json::json;
@@ -453,10 +453,10 @@ async fn test_dashboard_sse_streams_pending_and_resolved() {
         while let Some(chunk) = resp.chunk().await.unwrap() {
             let s = String::from_utf8_lossy(&chunk).to_string();
             for line in s.split("\n\n") {
-                if let Some(rest) = line.strip_prefix("data: ") {
-                    if ev_tx.send(rest.to_string()).await.is_err() {
-                        return;
-                    }
+                if let Some(rest) = line.strip_prefix("data: ")
+                    && ev_tx.send(rest.to_string()).await.is_err()
+                {
+                    return;
                 }
             }
         }

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ok_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream, UpstreamHandler};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, UpstreamHandler, ok_handler, rule};
 
 // ---------------------------------------------------------------------------
 // HTTP/2 tests

@@ -2,8 +2,8 @@
 
 mod common;
 
-use common::{ok_handler, ReportingClient, TestCa, TestProxy, TestUpstream};
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, ok_handler};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 /// Helper: attempt an HTTPS GET and return either the response or the error debug string.
 /// reqwest surfaces 407 on CONNECT as a connection error, not an HTTP response.

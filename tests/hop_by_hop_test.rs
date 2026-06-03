@@ -1,6 +1,6 @@
 mod common;
 
-use common::{echo_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, echo_handler, rule};
 
 // ---------------------------------------------------------------------------
 // Hop-by-hop header stripping tests

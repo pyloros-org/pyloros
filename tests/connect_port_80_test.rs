@@ -6,11 +6,11 @@
 
 mod common;
 
-use common::{read_audit_entries, rule, TestCa, TestProxy};
+use common::{TestCa, TestProxy, read_audit_entries, rule};
 use pyloros::config::Credential;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 /// Open a CONNECT tunnel to the proxy and return the live stream after the
 /// proxy replies `HTTP/1.1 200`. The `tunnel_target` is the `host:port`

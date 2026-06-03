@@ -2,13 +2,13 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    ok_handler, read_audit_entries, rule, rule_with_body_log, ReportingClient, TestCa, TestProxy,
-    TestUpstream,
+    ReportingClient, TestCa, TestProxy, TestUpstream, ok_handler, read_audit_entries, rule,
+    rule_with_body_log,
 };
 use http_body_util::{BodyExt, Full};
-use hyper::{body::Incoming, Request, Response};
+use hyper::{Request, Response, body::Incoming};
 use std::sync::Arc;
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 // ---------------------------------------------------------------------------
 // HTTPS body logging

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ok_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, ok_handler, rule};
 
 // ---------------------------------------------------------------------------
 // Core e2e tests — allowed/blocked flow

@@ -45,18 +45,18 @@ fn create_mitm_reported(t: &TestReport, ca: CertificateAuthority) -> MitmCertifi
     MitmCertificateGenerator::new(ca)
 }
 
-fn get_cert_reported(t: &TestReport, gen: &MitmCertificateGenerator, host: &str) {
+fn get_cert_reported(t: &TestReport, generator: &MitmCertificateGenerator, host: &str) {
     t.action(format!("Get cert for {}", host));
-    let _ = gen.get_cert_for_host(host).unwrap();
+    let _ = generator.get_cert_for_host(host).unwrap();
 }
 
 fn server_config_reported(
     t: &TestReport,
-    gen: &MitmCertificateGenerator,
+    generator: &MitmCertificateGenerator,
     host: &str,
 ) -> rustls::ServerConfig {
     t.action(format!("Create server config for {}", host));
-    gen.server_config_for_host(host).unwrap()
+    generator.server_config_for_host(host).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -148,18 +148,26 @@ fn test_mitm_generator_caching() {
 
     let generated = generate_ca_reported(&t);
     let ca = load_ca_from_pem_reported(&t, &generated);
-    let gen = create_mitm_reported(&t, ca);
+    let generator = create_mitm_reported(&t, ca);
 
-    t.assert_eq("Initial cache size", &gen.cache_size(), &0usize);
+    t.assert_eq("Initial cache size", &generator.cache_size(), &0usize);
 
-    get_cert_reported(&t, &gen, "example.com");
-    t.assert_eq("Cache size after first host", &gen.cache_size(), &1usize);
+    get_cert_reported(&t, &generator, "example.com");
+    t.assert_eq(
+        "Cache size after first host",
+        &generator.cache_size(),
+        &1usize,
+    );
 
-    get_cert_reported(&t, &gen, "example.com");
-    t.assert_eq("Cache size unchanged", &gen.cache_size(), &1usize);
+    get_cert_reported(&t, &generator, "example.com");
+    t.assert_eq("Cache size unchanged", &generator.cache_size(), &1usize);
 
-    get_cert_reported(&t, &gen, "other.com");
-    t.assert_eq("Cache size after second host", &gen.cache_size(), &2usize);
+    get_cert_reported(&t, &generator, "other.com");
+    t.assert_eq(
+        "Cache size after second host",
+        &generator.cache_size(),
+        &2usize,
+    );
 }
 
 #[test]
@@ -170,14 +178,18 @@ fn test_mitm_generator_cache_capacity() {
     let ca = load_ca_from_pem_reported(&t, &generated);
 
     t.action("Create MITM generator with capacity=2");
-    let gen = MitmCertificateGenerator::with_cache(ca, 2, Duration::from_secs(3600));
+    let generator = MitmCertificateGenerator::with_cache(ca, 2, Duration::from_secs(3600));
 
-    get_cert_reported(&t, &gen, "one.com");
-    get_cert_reported(&t, &gen, "two.com");
-    t.assert_eq("Cache full at 2", &gen.cache_size(), &2usize);
+    get_cert_reported(&t, &generator, "one.com");
+    get_cert_reported(&t, &generator, "two.com");
+    t.assert_eq("Cache full at 2", &generator.cache_size(), &2usize);
 
-    get_cert_reported(&t, &gen, "three.com");
-    t.assert_eq("Cache still at capacity 2", &gen.cache_size(), &2usize);
+    get_cert_reported(&t, &generator, "three.com");
+    t.assert_eq(
+        "Cache still at capacity 2",
+        &generator.cache_size(),
+        &2usize,
+    );
 }
 
 #[test]
@@ -188,9 +200,9 @@ fn test_server_config_generation() {
 
     let generated = generate_ca_reported(&t);
     let ca = load_ca_from_pem_reported(&t, &generated);
-    let gen = create_mitm_reported(&t, ca);
+    let generator = create_mitm_reported(&t, ca);
 
-    let config = server_config_reported(&t, &gen, "example.com");
+    let config = server_config_reported(&t, &generator, "example.com");
 
     t.assert_eq(
         "ALPN protocols",
@@ -205,9 +217,9 @@ fn test_ca_cert_der() {
 
     let generated = generate_ca_reported(&t);
     let ca = load_ca_from_pem_reported(&t, &generated);
-    let gen = create_mitm_reported(&t, ca);
+    let generator = create_mitm_reported(&t, ca);
 
-    let ca_der = gen.ca_cert_der();
+    let ca_der = generator.ca_cert_der();
     t.assert_true("CA DER not empty", !ca_der.is_empty());
 }
 
