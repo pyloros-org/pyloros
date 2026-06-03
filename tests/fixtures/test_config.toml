@@ -10,16 +10,16 @@ log_requests = true
 # Test rules
 [[rules]]
 method = "GET"
-url = "https://httpbin.org/get"
+url = "https://example.com/get"
 
 [[rules]]
 method = "POST"
-url = "https://httpbin.org/post"
+url = "https://example.com/post"
 
 [[rules]]
 method = "*"
-url = "https://httpbin.org/anything/*"
+url = "https://example.com/anything/*"
 
 [[rules]]
 method = "GET"
-url = "https://httpbin.org/status/*"
+url = "https://example.com/status/*"

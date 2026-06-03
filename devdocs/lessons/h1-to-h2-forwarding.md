@@ -1,5 +1,8 @@
 # HTTP/1.1 to HTTP/2 Forwarding in CONNECT Tunnels
 
+See `h2-to-h1-forwarding.md` for the inverse direction (h2 client →
+h1-only upstream needs Host *added*, not stripped).
+
 ## Problem
 
 When an HTTP/1.1 client (wget, `curl --http1.1`) sends requests inside a CONNECT tunnel and the upstream server negotiates HTTP/2, the proxy must translate between protocols correctly.

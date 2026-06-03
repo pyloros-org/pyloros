@@ -406,33 +406,38 @@ impl<'de> Deserialize<'de> for LoggingConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Rule {
     /// HTTP method to match (or "*" for any). Required for HTTP rules, absent for git rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
 
     /// URL pattern to match (supports wildcards)
     pub url: String,
 
     /// Whether this rule applies to WebSocket connections
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub websocket: bool,
 
     /// Git operation: "fetch", "push", or "*". Mutually exclusive with `method`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<String>,
 
     /// Branch patterns for git push restriction. Only valid with git = "push" or git = "*".
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branches: Option<Vec<String>>,
 
     /// URL patterns for redirect targets that should be temporarily whitelisted
     /// when a rule-matched request returns a 3xx response with a matching `Location`.
     /// Use `["*"]` to accept any redirect target. Empty/omitted = redirects not followed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_redirects: Vec<String>,
 
     /// Log request and response bodies in the audit log when this rule matches.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub log_body: bool,
+}
+
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Rule {

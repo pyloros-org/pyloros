@@ -4,28 +4,52 @@
     <meta charset="utf-8" />
     <title>pyloros approvals</title>
     <style>
-      body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem; color: #222; max-width: 880px; }
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem; color: #222; max-width: 980px; }
       h1 { font-size: 1.4rem; margin: 0 0 1rem; }
-      .bar { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; }
+      h2 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; color: #444; border-bottom: 1px solid #e0e0e0; padding-bottom: .25rem; }
+      .bar { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
       .bar .status { color: #666; margin-left: auto; font-size: 0.9em; }
-      button { font: inherit; padding: .35rem .8rem; cursor: pointer; }
-      .empty { color: #888; padding: 1rem; border: 1px dashed #ccc; text-align: center; border-radius: 4px; }
+      button { font: inherit; padding: .35rem .8rem; cursor: pointer; border-radius: 4px; border: 1px solid #ccc; background: #fff; }
+      button:hover { background: #f5f5f5; }
+      .empty { color: #888; padding: .75rem; border: 1px dashed #ccc; text-align: center; border-radius: 4px; margin-bottom: 1rem; }
       .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; background: #fafafa; }
-      .card h2 { font-size: 1.05rem; margin: 0 0 .5rem; }
-      .rules { background: #fff; padding: .5rem .75rem; border-radius: 4px; border: 1px solid #eee; font-family: ui-monospace, monospace; font-size: .9em; margin-bottom: .5rem; }
-      .rules code { display: block; }
+      .card h3 { font-size: 1rem; margin: 0 0 .5rem; }
       .reason { color: #555; margin-bottom: .5rem; font-style: italic; }
       .triggered { color: #666; font-size: .85em; margin-bottom: .75rem; }
-      .controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
-      .controls select, .controls textarea { font: inherit; padding: .3rem; }
-      .controls textarea { flex: 1; min-width: 220px; height: 2.2em; resize: vertical; }
-      .approve { background: #1b8f3a; color: #fff; border: 0; border-radius: 4px; }
-      .deny { background: #c13030; color: #fff; border: 0; border-radius: 4px; }
+      .controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-top: .5rem; }
+      .controls select, .controls input, .controls textarea { font: inherit; padding: .3rem; border: 1px solid #ccc; border-radius: 3px; }
+      .deny-msg { flex: 1; min-width: 220px; height: 2.2em; resize: vertical; }
+      .rule-toml { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: .85em; padding: .5rem; border: 1px solid #ddd; border-radius: 4px; min-height: 9em; resize: vertical; }
+      .parse-error { color: #c13030; font-size: .85em; margin-top: .25rem; white-space: pre-wrap; font-family: ui-monospace, monospace; display: none; }
+      .approve { background: #1b8f3a; color: #fff; border-color: #1b8f3a; }
+      .deny { background: #c13030; color: #fff; border-color: #c13030; }
+      .revoke { background: #fff; color: #c13030; border-color: #c13030; }
+      .small { background: #fff; padding: .25rem .5rem; font-size: .85em; }
       .resolved { opacity: 0.55; }
       .resolved .controls { display: none; }
       .tag { display: inline-block; padding: 0 .4rem; border-radius: 3px; font-size: .78em; vertical-align: middle; margin-left: .4rem; }
       .tag.approved { background: #d5f0dd; color: #175f27; }
       .tag.denied { background: #f5d5d5; color: #772020; }
+      .tag.lifetime { background: #e5e5f0; color: #333; }
+      .perm-bar { background: #fff7e0; border: 1px solid #d6c590; border-radius: 6px; padding: .6rem .8rem; margin-bottom: 1rem; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+      .perm-bar.active { background: #ffeed0; border-color: #c9a350; }
+      .perm-status { font-weight: 600; }
+      .audit-list { font-family: ui-monospace, monospace; font-size: .85em; max-height: 18em; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 0; margin-bottom: .5rem; background: #fff; }
+      .audit-row { padding: .25rem .5rem; border-bottom: 1px solid #f0f0f0; display: flex; gap: .5rem; align-items: baseline; }
+      .audit-row:last-child { border-bottom: 0; }
+      .audit-row .ts { color: #888; }
+      .audit-row .method { font-weight: 600; min-width: 4em; }
+      .audit-row .url { color: #333; flex: 1; word-break: break-all; }
+      .audit-row .reason { color: #666; font-size: .85em; font-style: normal; margin: 0; }
+      .audit-row.blocked .method { color: #c13030; }
+      .audit-row.allowed .method { color: #1b8f3a; }
+      .audit-row.permitted .method { color: #b07a18; }
+      .audit-row .createrule { margin-left: auto; }
+      label.inline { font-size: .9em; color: #555; }
+      .filebrk { color: #888; font-size: .85em; margin-top: .25rem; }
+      .editor-row { display: flex; gap: .5rem; align-items: flex-end; margin-bottom: .25rem; }
+      .editor-row textarea { flex: 1; }
+      .editor-row .editor-buttons { display: flex; flex-direction: column; gap: .25rem; }
     </style>
   </head>
   <body>
@@ -34,192 +58,474 @@
       <button id="notify-btn">Enable notifications</button>
       <span class="status" id="stream-status">connecting…</span>
     </div>
-    <div id="list"></div>
+
+    <!-- Permissive-mode bar -->
+    <div class="perm-bar" id="perm-bar">
+      <span class="perm-status" id="perm-status">permissive mode: off</span>
+      <label class="inline">duration:
+        <select id="perm-duration">
+          <option value="300">5 min</option>
+          <option value="900" selected>15 min</option>
+          <option value="3600">1 hour</option>
+        </select>
+      </label>
+      <button id="perm-enable">Enable</button>
+      <button id="perm-disable" style="display:none">Disable</button>
+    </div>
+
+    <h2>Pending approvals</h2>
+    <div id="pending-list"></div>
+
+    <h2>Active timeboxed rules</h2>
+    <div id="active-list"></div>
+
+    <h2>Audit log
+      <label class="inline" style="font-weight: normal; margin-left: .5rem;">
+        <input type="checkbox" id="audit-include-allowed" />
+        also show allowed (rule-matched) requests
+      </label>
+    </h2>
+    <div id="audit-list"></div>
+    <div class="filebrk">Older entries available in the audit log file on disk.</div>
 
     <script>
-      const list = document.getElementById('list');
-      const statusEl = document.getElementById('stream-status');
-      const notifyBtn = document.getElementById('notify-btn');
-      const approvals = new Map(); // id -> approval
+      const els = {
+        pending: document.getElementById('pending-list'),
+        active: document.getElementById('active-list'),
+        audit: document.getElementById('audit-list'),
+        permBar: document.getElementById('perm-bar'),
+        permStatus: document.getElementById('perm-status'),
+        permEnable: document.getElementById('perm-enable'),
+        permDisable: document.getElementById('perm-disable'),
+        permDuration: document.getElementById('perm-duration'),
+        streamStatus: document.getElementById('stream-status'),
+        notifyBtn: document.getElementById('notify-btn'),
+        auditIncludeAllowed: document.getElementById('audit-include-allowed'),
+      };
 
-      function render() {
-        if (approvals.size === 0) {
-          list.innerHTML = '<div class="empty">No pending approvals.</div>';
-          return;
-        }
-        list.innerHTML = '';
-        for (const [id, a] of approvals) {
-          list.appendChild(renderCard(id, a));
-        }
-      }
+      const state = {
+        pending: new Map(),       // id -> ApprovalRequest
+        active: [],               // ActiveApprovalSnapshot[]
+        permissive: { active: false, remaining_secs: null },
+        permissiveDeadline: null, // millis when override expires (for live countdown)
+        recent_blocked: [],
+        recent_all: [],
+        // Read the checkbox's current state: browsers preserve form
+        // state across reloads, so on F5 the box may already be checked.
+        showAllowed: document.getElementById('audit-include-allowed').checked,
+        pendingToml: new Map(),   // id -> string (lazy-fetched server-formatted TOML)
+      };
 
+      // ---------- helpers ----------
       function escapeHtml(s) {
         return (s || '').replace(/[&<>"']/g, c => ({
           '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
         }[c]));
       }
 
-      // Format a Rule object the same way it reads in the TOML config:
-      //   {method, url}                  -> "GET https://api.foo.com/*"
-      //   {git, url}                     -> "git=fetch https://github.com/foo/bar.git"
-      //   {git, url, branches}           -> "git=push https://x   branches=[main, !release/*]"
-      // Extra flags (websocket, log_body, allow_redirects) are tacked on as
-      // suffixes so a glance reveals everything the rule says.
-      function formatRule(r) {
-        const parts = [];
-        if (r.git) {
-          parts.push(`git=${r.git}`);
-        } else if (r.method) {
-          parts.push(r.method);
-        } else {
-          parts.push('?');
-        }
-        parts.push(r.url || '');
-        const flags = [];
-        if (r.branches && r.branches.length) flags.push(`branches=[${r.branches.join(', ')}]`);
-        if (r.websocket) flags.push('websocket');
-        if (r.log_body) flags.push('log_body');
-        if (r.allow_redirects && r.allow_redirects.length) {
-          flags.push(`allow_redirects=[${r.allow_redirects.join(', ')}]`);
-        }
-        if (flags.length) parts.push('  ' + flags.join(' '));
-        return parts.join(' ');
+      function fmtRemaining(secs) {
+        if (secs == null) return '';
+        if (secs < 60) return `${secs}s`;
+        const m = Math.floor(secs / 60);
+        if (m < 60) return `${m}m ${secs % 60}s`;
+        const h = Math.floor(m / 60);
+        return `${h}h ${m % 60}m`;
       }
 
-      function renderCard(id, a) {
+      async function postJson(path, body) {
+        const resp = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        return resp;
+      }
+
+      async function fetchSuggestForRules(rules) {
+        const resp = await postJson('/rules/suggest', { rules });
+        if (!resp.ok) return rules.map(r => '# ' + JSON.stringify(r)).join('\n');
+        const j = await resp.json();
+        return j.toml;
+      }
+
+      async function fetchSuggestForAudit(entry) {
+        const resp = await postJson('/rules/suggest', { audit: entry });
+        if (!resp.ok) return '# (server suggestion failed)\n';
+        const j = await resp.json();
+        return j.toml;
+      }
+
+      // ---------- permissive bar ----------
+      function renderPermissive() {
+        const p = state.permissive;
+        if (p.active) {
+          els.permBar.classList.add('active');
+          let remaining = p.remaining_secs ?? 0;
+          if (state.permissiveDeadline) {
+            remaining = Math.max(0, Math.round((state.permissiveDeadline - Date.now()) / 1000));
+          }
+          els.permStatus.textContent = `permissive mode: ON — expires in ${fmtRemaining(remaining)}`;
+          els.permEnable.style.display = 'none';
+          els.permDisable.style.display = '';
+        } else {
+          els.permBar.classList.remove('active');
+          els.permStatus.textContent = 'permissive mode: off';
+          els.permEnable.style.display = '';
+          els.permDisable.style.display = 'none';
+          state.permissiveDeadline = null;
+        }
+      }
+      setInterval(renderPermissive, 1000);
+
+      els.permEnable.addEventListener('click', async () => {
+        const dur = parseInt(els.permDuration.value, 10);
+        const resp = await postJson('/permissive', { duration_secs: dur });
+        if (!resp.ok) alert(`Enable failed: ${resp.status} ${await resp.text()}`);
+      });
+      els.permDisable.addEventListener('click', async () => {
+        const resp = await postJson('/permissive', { duration_secs: 0 });
+        if (!resp.ok) alert(`Disable failed: ${resp.status} ${await resp.text()}`);
+      });
+
+      // ---------- pending approvals ----------
+      async function renderPending() {
+        if (state.pending.size === 0) {
+          els.pending.innerHTML = '<div class="empty">No pending approvals.</div>';
+          return;
+        }
+        els.pending.innerHTML = '';
+        for (const [id, a] of state.pending) {
+          els.pending.appendChild(await renderPendingCard(id, a));
+        }
+      }
+
+      async function renderPendingCard(id, a) {
         const card = document.createElement('div');
         const resolved = a.status && a.status !== 'pending';
         card.className = 'card' + (resolved ? ' resolved' : '');
         card.dataset.id = id;
 
-        const rules = (a.rules || [])
-          .map(r => `<code>${escapeHtml(formatRule(r))}</code>`)
-          .join('');
+        // Lazy-fetch server-formatted TOML; cache by id.
+        let toml = state.pendingToml.get(id);
+        if (toml === undefined) {
+          toml = await fetchSuggestForRules(a.rules || []);
+          state.pendingToml.set(id, toml);
+        }
+
         const reason = a.reason ? `<div class="reason">${escapeHtml(a.reason)}</div>` : '';
         const triggered = a.triggered_by
           ? `<div class="triggered">triggered by <code>${escapeHtml(a.triggered_by.method)} ${escapeHtml(a.triggered_by.url)}</code></div>`
           : '';
-        // Default to "permanent": in steady-state projects nearly every
-        // approval is something the user wants every time. Honor the
-        // agent's suggested_ttl if it sent one.
         const ttlDefault = a.suggested_ttl || 'permanent';
         let tag = '';
         if (a.status === 'approved') tag = '<span class="tag approved">approved</span>';
         if (a.status === 'denied') tag = '<span class="tag denied">denied</span>';
 
         card.innerHTML = `
-          <h2>${escapeHtml(id)}${tag}</h2>
-          <div class="rules">${rules}</div>
+          <h3>${escapeHtml(id)}${tag}</h3>
           ${reason}
           ${triggered}
+          <div class="editor-row">
+            <textarea class="rule-toml">${escapeHtml(toml)}</textarea>
+          </div>
+          <div class="parse-error"></div>
           <div class="controls">
-            <label>Lifetime:
+            <label class="inline">Lifetime:
               <select>
-                <option value="session" ${ttlDefault==='session'?'selected':''}>session</option>
                 <option value="one_hour" ${ttlDefault==='one_hour'?'selected':''}>1 hour</option>
                 <option value="one_day" ${ttlDefault==='one_day'?'selected':''}>1 day</option>
                 <option value="permanent" ${ttlDefault==='permanent'?'selected':''}>permanent</option>
               </select>
             </label>
-            <textarea placeholder="Deny message (optional)"></textarea>
+            <textarea class="deny-msg" placeholder="Deny message (optional)"></textarea>
             <button class="approve">Approve</button>
             <button class="deny">Deny</button>
           </div>
         `;
 
-        const ttlSel = card.querySelector('select');
-        const msgEl = card.querySelector('textarea');
-        card.querySelector('.approve').addEventListener('click', () => {
-          decide(id, { action: 'approve', ttl: ttlSel.value });
+        const ttlSel = card.querySelector('.controls select');
+        const tomlEl = card.querySelector('.rule-toml');
+        const errEl = card.querySelector('.parse-error');
+        const msgEl = card.querySelector('.deny-msg');
+        card.querySelector('.approve').addEventListener('click', async () => {
+          errEl.style.display = 'none';
+          const parsed = await postJson('/rules/parse', { toml: tomlEl.value });
+          if (!parsed.ok) {
+            errEl.style.display = '';
+            errEl.textContent = await parsed.text();
+            return;
+          }
+          const { rules } = await parsed.json();
+          const resp = await postJson(`/approvals/${encodeURIComponent(id)}/decision`, {
+            action: 'approve', ttl: ttlSel.value, rules_applied: rules,
+          });
+          if (!resp.ok) {
+            errEl.style.display = '';
+            errEl.textContent = await resp.text();
+          }
         });
-        card.querySelector('.deny').addEventListener('click', () => {
+        card.querySelector('.deny').addEventListener('click', async () => {
           const m = msgEl.value.trim();
-          decide(id, { action: 'deny', message: m || null });
+          const resp = await postJson(`/approvals/${encodeURIComponent(id)}/decision`, {
+            action: 'deny', message: m || null,
+          });
+          if (!resp.ok) alert(`Deny failed: ${resp.status} ${await resp.text()}`);
         });
+        // Cache invalidation: if user edits, forget the cached server fetch.
+        tomlEl.addEventListener('input', () => state.pendingToml.set(id, tomlEl.value));
         return card;
       }
 
-      async function decide(id, body) {
-        const resp = await fetch(`/approvals/${encodeURIComponent(id)}/decision`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        if (!resp.ok) {
-          alert(`Decision failed: ${resp.status} ${await resp.text()}`);
+      // ---------- active timeboxed rules ----------
+      function renderActive() {
+        const rows = state.active.filter(r => r.remaining_secs !== undefined && r.remaining_secs !== null);
+        // Also synthesize a permissive-mode row when active.
+        const items = [];
+        if (state.permissive.active) {
+          items.push({
+            kind: 'permissive',
+            label: 'permissive mode (timeboxed override)',
+            remaining_secs: state.permissive.remaining_secs,
+          });
+        }
+        for (const r of rows) {
+          items.push({
+            kind: 'rule',
+            approval_id: r.approval_id,
+            lifetime: r.lifetime,
+            remaining_secs: r.remaining_secs,
+            toml: r.toml,
+          });
+        }
+        if (items.length === 0) {
+          els.active.innerHTML = '<div class="empty">No timeboxed rules active.</div>';
+          return;
+        }
+        els.active.innerHTML = '';
+        for (const it of items) {
+          const card = document.createElement('div');
+          card.className = 'card';
+          if (it.kind === 'permissive') {
+            card.innerHTML = `
+              <h3>${escapeHtml(it.label)} <span class="tag lifetime">${fmtRemaining(it.remaining_secs)} left</span></h3>
+              <div class="controls">
+                <button class="revoke">Disable now</button>
+              </div>
+            `;
+            card.querySelector('.revoke').addEventListener('click', async () => {
+              await postJson('/permissive', { duration_secs: 0 });
+            });
+          } else {
+            card.innerHTML = `
+              <h3>${escapeHtml(it.approval_id)} <span class="tag lifetime">${escapeHtml(it.lifetime)} — ${fmtRemaining(it.remaining_secs)} left</span></h3>
+              <textarea class="rule-toml" readonly>${escapeHtml(it.toml)}</textarea>
+              <div class="controls">
+                <button class="revoke">Revoke</button>
+              </div>
+            `;
+            card.querySelector('.revoke').addEventListener('click', async () => {
+              const resp = await fetch(`/approvals/${encodeURIComponent(it.approval_id)}/rules`, { method: 'DELETE' });
+              if (!resp.ok) alert(`Revoke failed: ${resp.status} ${await resp.text()}`);
+            });
+          }
+          els.active.appendChild(card);
         }
       }
 
+      // ---------- audit list ----------
+      function renderAudit() {
+        const src = state.showAllowed ? state.recent_all : state.recent_blocked;
+        const items = src.slice(0, 100);
+        if (items.length === 0) {
+          els.audit.innerHTML = '<div class="empty">No audit entries.</div>';
+          return;
+        }
+        els.audit.innerHTML = '<div class="audit-list"></div>';
+        const list = els.audit.firstElementChild;
+        for (const e of items) list.appendChild(auditRow(e));
+      }
+
+      // Events where "Create rule" makes sense: a real request that
+      // either was blocked, was let through only because permissive
+      // mode was on (so the user likely wants a permanent rule), or
+      // failed auth.
+      const RULE_EVENTS = new Set(['request_blocked', 'request_permitted', 'auth_failed']);
+
+      function auditRow(e) {
+        const row = document.createElement('div');
+        const cls = e.event === 'request_blocked' ? 'blocked'
+                  : e.event === 'request_permitted' ? 'permitted'
+                  : e.event === 'request_allowed' ? 'allowed' : '';
+        row.className = `audit-row ${cls}`;
+        const ts = (e.timestamp || '').replace('T', ' ').replace('Z', '');
+        const ev = e.event === 'permissive_enabled'
+          ? `<span class="method">PERMISSIVE ON</span><span class="url">duration=${e.permissive_duration_secs}s source=${escapeHtml(e.permissive_source || '')}</span>`
+          : e.event === 'permissive_disabled'
+          ? `<span class="method">PERMISSIVE OFF</span><span class="url">source=${escapeHtml(e.permissive_source || '')}</span>`
+          : `<span class="method">${escapeHtml(e.method)}</span><span class="url">${escapeHtml(e.url)}</span>`;
+        const reason = e.reason ? `<span class="reason">${escapeHtml(e.reason)}</span>` : '';
+        row.innerHTML = `<span class="ts">${escapeHtml(ts)}</span>${ev}${reason}`;
+        if (RULE_EVENTS.has(e.event)) {
+          const btn = document.createElement('button');
+          btn.className = 'small createrule';
+          btn.textContent = 'Create rule';
+          btn.addEventListener('click', () => openCreateRule(e));
+          row.appendChild(btn);
+        }
+        return row;
+      }
+
+      els.auditIncludeAllowed.addEventListener('change', () => {
+        state.showAllowed = els.auditIncludeAllowed.checked;
+        renderAudit();
+      });
+
+      // ---------- create-rule modal (inline insertion above the audit list) ----------
+      async function openCreateRule(entry) {
+        const toml = await fetchSuggestForAudit(entry);
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `
+          <h3>Create rule from blocked request</h3>
+          <div class="triggered"><code>${escapeHtml(entry.method)} ${escapeHtml(entry.url)}</code></div>
+          <textarea class="rule-toml">${escapeHtml(toml)}</textarea>
+          <div class="parse-error"></div>
+          <div class="controls">
+            <label class="inline">Lifetime:
+              <select>
+                <option value="one_hour">1 hour</option>
+                <option value="one_day">1 day</option>
+                <option value="permanent" selected>permanent</option>
+              </select>
+            </label>
+            <button class="approve">Add rule</button>
+            <button class="cancel">Cancel</button>
+          </div>
+        `;
+        const tomlEl = card.querySelector('.rule-toml');
+        const errEl = card.querySelector('.parse-error');
+        const ttlSel = card.querySelector('select');
+        card.querySelector('.approve').addEventListener('click', async () => {
+          errEl.style.display = 'none';
+          const parsed = await postJson('/rules/parse', { toml: tomlEl.value });
+          if (!parsed.ok) {
+            errEl.style.display = '';
+            errEl.textContent = await parsed.text();
+            return;
+          }
+          const { rules } = await parsed.json();
+          const resp = await postJson('/rules', { rules, ttl: ttlSel.value });
+          if (!resp.ok) {
+            errEl.style.display = '';
+            errEl.textContent = await resp.text();
+          } else {
+            card.remove();
+          }
+        });
+        card.querySelector('.cancel').addEventListener('click', () => card.remove());
+        els.audit.parentElement.insertBefore(card, els.audit);
+      }
+
+      // ---------- notifications ----------
       function maybeNotify(a) {
         if (!('Notification' in window) || Notification.permission !== 'granted') return;
-        const body = (a.rules || []).map(formatRule).join('\n')
+        const body = (a.rules || []).map(r => JSON.stringify(r)).join('\n')
           + (a.reason ? `\n— ${a.reason}` : '');
         try {
-          // requireInteraction: keep the toast visible until the user
-          // dismisses it (Chrome/Edge honor this; Firefox/Safari often
-          // ignore it and use the system default duration).
           const n = new Notification('pyloros approval requested', {
-            body,
-            tag: a.id,            // collapse duplicates if we re-emit
-            requireInteraction: true,
+            body, tag: a.id, requireInteraction: true,
           });
-          n.onclick = () => {
-            window.focus();
-            n.close();
-          };
-        } catch (e) {
-          console.warn('Notification failed', e);
-        }
+          n.onclick = () => { window.focus(); n.close(); };
+        } catch (e) { console.warn('Notification failed', e); }
       }
 
-      notifyBtn.addEventListener('click', async () => {
+      els.notifyBtn.addEventListener('click', async () => {
         if (!('Notification' in window)) {
-          notifyBtn.textContent = 'Notifications unsupported';
-          notifyBtn.disabled = true;
+          els.notifyBtn.textContent = 'Notifications unsupported';
+          els.notifyBtn.disabled = true;
           return;
         }
         const res = await Notification.requestPermission();
-        notifyBtn.textContent = res === 'granted' ? 'Notifications on' : `Notifications: ${res}`;
-        notifyBtn.disabled = true;
-        if (res === 'granted') {
-          try {
-            new Notification('pyloros notifications enabled', {
-              body: 'You will be notified when an approval is requested.',
-            });
-          } catch (e) {
-            console.warn('Test notification failed', e);
-          }
-        }
+        els.notifyBtn.textContent = res === 'granted' ? 'Notifications on' : `Notifications: ${res}`;
+        els.notifyBtn.disabled = true;
       });
       if ('Notification' in window && Notification.permission === 'granted') {
-        notifyBtn.textContent = 'Notifications on';
-        notifyBtn.disabled = true;
+        els.notifyBtn.textContent = 'Notifications on';
+        els.notifyBtn.disabled = true;
+      }
+
+      // ---------- SSE ----------
+      function applySnapshot(msg) {
+        state.pending.clear();
+        state.pendingToml.clear();
+        for (const a of (msg.pending || [])) state.pending.set(a.id, a);
+        state.active = msg.active || [];
+        state.permissive = msg.permissive || { active: false };
+        if (state.permissive.active && state.permissive.remaining_secs != null) {
+          state.permissiveDeadline = Date.now() + state.permissive.remaining_secs * 1000;
+        }
+        state.recent_blocked = msg.recent_blocked || [];
+        state.recent_all = msg.recent_all || [];
+        renderPermissive();
+        renderPending();
+        renderActive();
+        renderAudit();
       }
 
       function connect() {
         const es = new EventSource('/events');
-        es.onopen = () => { statusEl.textContent = 'connected'; };
-        es.onerror = () => { statusEl.textContent = 'disconnected — retrying'; };
+        es.onopen = () => { els.streamStatus.textContent = 'connected'; };
+        es.onerror = () => { els.streamStatus.textContent = 'disconnected — retrying'; };
         es.onmessage = (ev) => {
           const msg = JSON.parse(ev.data);
           if (msg.event === 'snapshot') {
-            approvals.clear();
-            for (const a of msg.approvals) approvals.set(a.id, a);
-            render();
+            applySnapshot(msg);
           } else if (msg.event === 'pending') {
-            approvals.set(msg.approval.id, msg.approval);
-            render();
+            state.pending.set(msg.approval.id, msg.approval);
+            state.pendingToml.delete(msg.approval.id);
+            renderPending();
             maybeNotify(msg.approval);
           } else if (msg.event === 'resolved') {
-            const a = approvals.get(msg.id);
+            const a = state.pending.get(msg.id);
             if (a) {
               a.status = msg.status;
               if (msg.rules_applied) a.rules_applied = msg.rules_applied;
               if (msg.message) a.message = msg.message;
-              render();
-              // Drop resolved cards after a short delay so users can see the result.
-              setTimeout(() => { approvals.delete(msg.id); render(); }, 3000);
+              renderPending();
+              setTimeout(() => { state.pending.delete(msg.id); renderPending(); }, 3000);
             }
+          } else if (msg.event === 'permissive_changed') {
+            state.permissive = msg.status;
+            if (msg.status.active && msg.status.remaining_secs != null) {
+              state.permissiveDeadline = Date.now() + msg.status.remaining_secs * 1000;
+            } else {
+              state.permissiveDeadline = null;
+            }
+            renderPermissive();
+            renderActive();
+          } else if (msg.event === 'active_rules_changed') {
+            state.active = msg.rules || [];
+            renderActive();
+          } else if (msg.event === 'audit') {
+            const e = msg.entry;
+            // The server re-fires the SSE audit callback when an
+            // existing entry is mutated (e.g. redirect_target attached
+            // after the response arrives). Replace in place if we
+            // already have an entry with the same timestamp+url+event;
+            // otherwise prepend.
+            const sameKey = x => x.timestamp === e.timestamp && x.url === e.url && x.event === e.event;
+            const upsert = (arr) => {
+              const i = arr.findIndex(sameKey);
+              if (i >= 0) arr[i] = e; else arr.unshift(e);
+              if (arr.length > 500) arr.pop();
+            };
+            upsert(state.recent_all);
+            if (e.event === 'request_blocked' || e.event === 'auth_failed'
+                || e.event === 'request_permitted'
+                || e.event === 'permissive_enabled' || e.event === 'permissive_disabled') {
+              upsert(state.recent_blocked);
+            }
+            renderAudit();
           }
         };
       }
