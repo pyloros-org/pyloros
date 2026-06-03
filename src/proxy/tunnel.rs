@@ -500,6 +500,9 @@ impl TunnelHandler {
                         response_body: None,
                         response_body_encoding: None,
                         body_truncated: None,
+                        permissive_duration_secs: None,
+                        permissive_source: None,
+                        redirect_target: None,
                     });
                     return Ok(local_credential_mismatch_response(&method, &full_url));
                 }
@@ -621,6 +624,9 @@ impl TunnelHandler {
                         response_body: None,
                         response_body_encoding: None,
                         body_truncated: None,
+                        permissive_duration_secs: None,
+                        permissive_source: None,
+                        redirect_target: None,
                     });
                     return Ok(local_credential_mismatch_response(&method, &full_url));
                 }
@@ -736,6 +742,9 @@ impl TunnelHandler {
                 response_body: None,
                 response_body_encoding: None,
                 body_truncated: None,
+                permissive_duration_secs: None,
+                permissive_source: None,
+                redirect_target: None,
             });
             return Ok(local_credential_mismatch_response(&method, &full_url));
         }
@@ -802,6 +811,9 @@ impl TunnelHandler {
                     response_body: None,
                     response_body_encoding: None,
                     body_truncated: None,
+                    permissive_duration_secs: None,
+                    permissive_source: None,
+                    redirect_target: None,
                 });
                 return Ok(local_credential_mismatch_response(&method, &full_url));
             }
