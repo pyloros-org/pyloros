@@ -157,6 +157,7 @@ across parallel worktrees:
 - `cli_test.rs` — CLI subcommand validation
 - `git_smart_http_test.rs` — git clone/push through proxy (basic e2e)
 - `git_rules_test.rs` — git rule filtering: operation type, repo URL, branch restrictions
+- `git_tag_push_test.rs` — pushing a git tag (refs/tags/*): with a plain push rule and in permissive mode
 - `git_lfs_test.rs` — Git-LFS batch endpoint filtering: operation checks, merged-scan, plain HTTP blocking
 - `audit_log_test.rs` — Structured JSONL audit log: allowed/blocked/auth entries, credential info, HTTP vs HTTPS
 
