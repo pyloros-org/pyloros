@@ -514,9 +514,19 @@ impl Config {
     /// Returns `None` if auth is not configured.
     /// Resolves `${ENV_VAR}` placeholders in `auth_password`.
     pub fn resolved_auth(&self) -> Result<Option<(String, String)>> {
+        self.resolved_auth_with(|name| std::env::var(name).ok())
+    }
+
+    /// Like [`Config::resolved_auth`], but with an injectable variable lookup so
+    /// tests can resolve `${ENV_VAR}` placeholders without mutating the process
+    /// environment. See [`resolve_credential_value_with`] for why that matters.
+    pub fn resolved_auth_with(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<(String, String)>> {
         match (&self.proxy.auth_username, &self.proxy.auth_password) {
             (Some(username), Some(password)) => {
-                let resolved_password = resolve_credential_value(password)?;
+                let resolved_password = resolve_credential_value_with(password, lookup)?;
                 Ok(Some((username.clone(), resolved_password)))
             }
             _ => Ok(None),
@@ -605,6 +615,20 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 /// Replaces all `${...}` patterns with the corresponding environment variable value.
 /// Returns an error if any referenced variable is not set.
 pub fn resolve_credential_value(value: &str) -> Result<String> {
+    resolve_credential_value_with(value, |name| std::env::var(name).ok())
+}
+
+/// Like [`resolve_credential_value`], but with an injectable variable lookup.
+///
+/// Production code uses the [`resolve_credential_value`] wrapper, which reads the
+/// process environment. Tests pass an in-memory `lookup` so they never mutate the
+/// global environment — mutating `environ` (`set_var`/`remove_var`) is `unsafe`
+/// under Rust 2024 because it races with concurrent reads from other test threads
+/// (libtest runs tests in parallel; the tokio/DNS/TLS machinery calls `getenv`).
+pub fn resolve_credential_value_with(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
     let mut result = String::with_capacity(value.len());
     let mut rest = value;
 
@@ -618,7 +642,7 @@ pub fn resolve_credential_value(value: &str) -> Result<String> {
         if var_name.is_empty() {
             return Err(Error::config("empty variable name in ${} placeholder"));
         }
-        let var_value = std::env::var(var_name).map_err(|_| {
+        let var_value = lookup(var_name).ok_or_else(|| {
             Error::config(format!(
                 "environment variable '{}' is not set (required by credential)",
                 var_name
@@ -1210,20 +1234,17 @@ secret_access_key = "SECRET"
     #[test]
     fn test_resolve_credential_value_env_var() {
         let t = test_report!("${ENV_VAR} resolution works");
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("TEST_CRED_KEY_ABC", "resolved-value") };
-        let result = resolve_credential_value("${TEST_CRED_KEY_ABC}").unwrap();
+        // Inject the lookup instead of mutating process env: set_var/remove_var
+        // are unsafe under Rust 2024 and race with parallel test threads.
+        let lookup = |name: &str| (name == "TEST_CRED_KEY_ABC").then(|| "resolved-value".into());
+        let result = resolve_credential_value_with("${TEST_CRED_KEY_ABC}", lookup).unwrap();
         t.assert_eq("resolved", &result.as_str(), &"resolved-value");
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("TEST_CRED_KEY_ABC") };
     }
 
     #[test]
     fn test_resolve_credential_value_unset_var() {
         let t = test_report!("${UNSET_VAR} fails with descriptive error");
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("TEST_CRED_UNSET_XYZ") };
-        let result = resolve_credential_value("${TEST_CRED_UNSET_XYZ}");
+        let result = resolve_credential_value_with("${TEST_CRED_UNSET_XYZ}", |_| None);
         t.assert_true("error", result.is_err());
         let err = result.unwrap_err().to_string();
         t.assert_contains("names the variable", &err, "TEST_CRED_UNSET_XYZ");
@@ -1232,18 +1253,16 @@ secret_access_key = "SECRET"
     #[test]
     fn test_resolve_credential_value_mixed() {
         let t = test_report!("Mixed literal + env var resolves correctly");
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("TEST_CRED_TOKEN_MIX", "tok123") };
-        let result = resolve_credential_value("Bearer ${TEST_CRED_TOKEN_MIX}").unwrap();
+        let lookup = |name: &str| (name == "TEST_CRED_TOKEN_MIX").then(|| "tok123".into());
+        let result =
+            resolve_credential_value_with("Bearer ${TEST_CRED_TOKEN_MIX}", lookup).unwrap();
         t.assert_eq("resolved", &result.as_str(), &"Bearer tok123");
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("TEST_CRED_TOKEN_MIX") };
     }
 
     #[test]
     fn test_resolve_credential_value_literal_only() {
         let t = test_report!("Plain literal with no placeholders passes through");
-        let result = resolve_credential_value("just-a-literal").unwrap();
+        let result = resolve_credential_value_with("just-a-literal", |_| None).unwrap();
         t.assert_eq("passthrough", &result.as_str(), &"just-a-literal");
     }
 
@@ -1337,22 +1356,20 @@ auth_password = "secret"
     #[test]
     fn test_resolved_auth_env_var() {
         let t = test_report!("resolved_auth resolves ${ENV_VAR} in password");
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("TEST_PROXY_AUTH_PW_123", "resolved-pw") };
         let toml = r#"
 [proxy]
 auth_username = "user1"
 auth_password = "${TEST_PROXY_AUTH_PW_123}"
 "#;
         let config = Config::parse(toml).unwrap();
-        let auth = config.resolved_auth().unwrap();
+        // Inject the lookup instead of mutating process env (see resolve_credential_value_with).
+        let lookup = |name: &str| (name == "TEST_PROXY_AUTH_PW_123").then(|| "resolved-pw".into());
+        let auth = config.resolved_auth_with(lookup).unwrap();
         t.assert_eq(
             "resolved auth",
             &auth,
             &Some(("user1".to_string(), "resolved-pw".to_string())),
         );
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("TEST_PROXY_AUTH_PW_123") };
     }
 
     #[test]

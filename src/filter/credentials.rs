@@ -3,7 +3,7 @@
 use hyper::header::HeaderMap;
 
 use super::matcher::UrlPattern;
-use crate::config::{Credential, resolve_credential_value};
+use crate::config::{Credential, resolve_credential_value_with};
 use crate::error::Result;
 use crate::filter::RequestInfo;
 
@@ -46,11 +46,22 @@ pub struct CredentialEngine {
 impl CredentialEngine {
     /// Create a new credential engine, resolving env vars and compiling URL patterns.
     pub fn new(credentials: Vec<Credential>) -> Result<Self> {
+        Self::new_with_lookup(credentials, |name| std::env::var(name).ok())
+    }
+
+    /// Like [`CredentialEngine::new`], but with an injectable variable lookup so
+    /// tests can resolve `${ENV_VAR}` placeholders without mutating the process
+    /// environment (which is `unsafe` under Rust 2024 and races with parallel test
+    /// threads — see `config::resolve_credential_value_with`).
+    pub fn new_with_lookup(
+        credentials: Vec<Credential>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
         let mut resolved = Vec::with_capacity(credentials.len());
         for cred in &credentials {
             match cred {
                 Credential::Header { url, header, value } => {
-                    let value = resolve_credential_value(value)?;
+                    let value = resolve_credential_value_with(value, &lookup)?;
                     let url_pattern = UrlPattern::new(url)?;
                     resolved.push(ResolvedCredential::Header {
                         url_pattern,
@@ -65,11 +76,12 @@ impl CredentialEngine {
                     secret_access_key,
                     session_token,
                 } => {
-                    let access_key_id = resolve_credential_value(access_key_id)?;
-                    let secret_access_key = resolve_credential_value(secret_access_key)?;
+                    let access_key_id = resolve_credential_value_with(access_key_id, &lookup)?;
+                    let secret_access_key =
+                        resolve_credential_value_with(secret_access_key, &lookup)?;
                     let session_token = session_token
                         .as_deref()
-                        .map(resolve_credential_value)
+                        .map(|t| resolve_credential_value_with(t, &lookup))
                         .transpose()?;
                     let url_pattern = UrlPattern::new(url)?;
                     resolved.push(ResolvedCredential::AwsSigV4 {

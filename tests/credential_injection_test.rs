@@ -219,34 +219,32 @@ async fn test_no_injection_over_plain_http() {
     proxy.shutdown();
 }
 
-#[tokio::test]
-async fn test_credential_with_env_var() {
+#[test]
+fn test_credential_with_env_var() {
     let t = test_report!("Config with env var resolution");
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("TEST_CRED_E2E_SECRET", "env-resolved-value") };
-
-    let ca = TestCa::generate();
-    let upstream = TestUpstream::builder(&ca, echo_handler())
-        .report(&t, "echo")
-        .start()
-        .await;
-    let proxy = TestProxy::builder(&ca, vec![rule("*", "https://localhost/*")], upstream.port())
-        .credentials(vec![cred(
+    // The other tests in this file already prove the full proxy injects credential
+    // headers e2e; what's unique here is that a `${VAR}` placeholder gets resolved.
+    // We exercise that via the engine's injectable lookup rather than mutating the
+    // process environment — set_var/remove_var are unsafe under Rust 2024 and race
+    // with the parallel test threads (libtest + tokio/DNS/TLS getenv calls).
+    let lookup = |name: &str| (name == "TEST_CRED_E2E_SECRET").then(|| "env-resolved-value".into());
+    let engine = pyloros::CredentialEngine::new_with_lookup(
+        vec![cred(
             "https://localhost/*",
             "x-api-key",
             "${TEST_CRED_E2E_SECRET}",
-        )])
-        .report(&t)
-        .start()
-        .await;
-    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+        )],
+        lookup,
+    )
+    .unwrap();
 
-    let resp = client.get("https://localhost/test").await;
-    let body = resp.text().await.unwrap();
-    t.assert_contains("env var resolved", &body, "x-api-key: env-resolved-value");
+    let ri = pyloros::RequestInfo::http("GET", "https", "localhost", None, "/test", None);
+    let mut headers = hyper::header::HeaderMap::new();
+    engine.inject(&ri, &mut headers);
 
-    proxy.shutdown();
-    upstream.shutdown();
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("TEST_CRED_E2E_SECRET") };
+    t.assert_eq(
+        "env var resolved into header",
+        &headers.get("x-api-key").unwrap().to_str().unwrap(),
+        &"env-resolved-value",
+    );
 }
