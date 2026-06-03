@@ -56,3 +56,15 @@ export function uniqueHost(label = 'h'): string {
   hostCounter += 1;
   return `t${hostCounter}-${label}.example.com`;
 }
+
+let pathCounter = 0;
+
+/**
+ * A unique path segment, used to build dedup-safe rules against a real
+ * reachable host (`example.com`). A fresh segment each call means CI retries
+ * never hit the "already covered → 200 approved, no pending card" dedup path.
+ */
+export function uniquePath(label = 'p'): string {
+  pathCounter += 1;
+  return `e2e-${label}-${pathCounter}`;
+}
