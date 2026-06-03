@@ -15,7 +15,7 @@
 mod common;
 
 use bytes::Bytes;
-use common::{git_rule, TestCa, TestProxy, TestUpstream, UpstreamHandler};
+use common::{TestCa, TestProxy, TestUpstream, UpstreamHandler, git_rule};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};

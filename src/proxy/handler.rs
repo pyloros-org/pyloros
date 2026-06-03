@@ -1,7 +1,7 @@
 //! HTTP request handler for the proxy
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -12,7 +12,7 @@ use super::response::{auth_required_response, blocked_response, error_response};
 use super::tunnel::TunnelHandler;
 use super::{RequestContext, RequestLogger};
 use crate::audit::{AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason};
-use crate::filter::dynamic_whitelist::{maybe_whitelist_redirect, DynamicWhitelist};
+use crate::filter::dynamic_whitelist::{DynamicWhitelist, maybe_whitelist_redirect};
 use crate::filter::matcher::UrlPattern;
 use crate::filter::{FilterEngine, FilterResult, RequestInfo};
 
@@ -411,35 +411,32 @@ impl ProxyHandler {
                     .headers()
                     .get(hyper::header::LOCATION)
                     .and_then(|v| v.to_str().ok());
-                if let Some(patterns) = redirect_patterns.as_ref() {
-                    if let Some(target) = maybe_whitelist_redirect(
+                if let Some(patterns) = redirect_patterns.as_ref()
+                    && let Some(target) = maybe_whitelist_redirect(
                         status,
                         location,
                         &full_url,
                         patterns,
                         &self.dynamic_whitelist,
-                    ) {
-                        tracing::info!(
-                            from = %full_url,
-                            to = %target,
-                            status = %status,
-                            "REDIRECT whitelisted (HTTP)"
-                        );
-                    }
+                    )
+                {
+                    tracing::info!(
+                        from = %full_url,
+                        to = %target,
+                        status = %status,
+                        "REDIRECT whitelisted (HTTP)"
+                    );
                 }
                 // Annotate the audit entry with the redirect target
                 // regardless of allow_redirects pattern matching, so
                 // `/rules/suggest` can pre-fill `allow_redirects` for
                 // permissive-mode / blocked-rule / rule-matched alike.
-                if (300..400).contains(&status) {
-                    if let (Some(loc), Some(logger)) = (location, self.logger.audit_logger.as_ref())
-                    {
-                        if let Some(target) =
-                            crate::filter::dynamic_whitelist::resolve_location(&full_url, loc)
-                        {
-                            logger.record_redirect(&full_url, &target);
-                        }
-                    }
+                if (300..400).contains(&status)
+                    && let (Some(loc), Some(logger)) = (location, self.logger.audit_logger.as_ref())
+                    && let Some(target) =
+                        crate::filter::dynamic_whitelist::resolve_location(&full_url, loc)
+                {
+                    logger.record_redirect(&full_url, &target);
                 }
                 Ok(resp)
             }

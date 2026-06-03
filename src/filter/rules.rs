@@ -382,10 +382,10 @@ impl CompiledRule {
         }
 
         // Check method
-        if let Some(ref method_matcher) = self.method {
-            if !method_matcher.matches(request.method) {
-                return false;
-            }
+        if let Some(ref method_matcher) = self.method
+            && !method_matcher.matches(request.method)
+        {
+            return false;
         }
 
         // Check URL

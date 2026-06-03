@@ -307,8 +307,8 @@ mod tests {
     #[test]
     fn test_parse_encoded_gzip() {
         let t = test_report!("parse_lfs_batch_response_encoded gunzips Content-Encoding: gzip");
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         let raw = br#"{"objects":[{"actions":{"download":{"href":"https://x/y"}}}]}"#;
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());

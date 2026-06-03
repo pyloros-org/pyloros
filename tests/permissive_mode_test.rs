@@ -4,10 +4,10 @@
 mod common;
 
 use common::{
-    git_rule_with_branches, ok_handler, read_audit_entries, rule, ReportingClient, TestCa,
-    TestProxy, TestUpstream,
+    ReportingClient, TestCa, TestProxy, TestUpstream, git_rule_with_branches, ok_handler,
+    read_audit_entries, rule,
 };
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 // ---------------------------------------------------------------------------
 // Test 1: Permissive mode allows unmatched HTTPS requests

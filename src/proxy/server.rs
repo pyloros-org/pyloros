@@ -375,19 +375,18 @@ impl ProxyServer {
 
         // Spawn dashboard listener if bound (independent of tunnel_handler; only
         // needs the approvals manager).
-        if let Some(dashboard_listener) = self.dashboard_listener.take() {
-            if let Some(ref manager) = self.approvals {
-                spawn_dashboard_accept_loop(dashboard_listener, manager.clone());
-            }
+        if let Some(dashboard_listener) = self.dashboard_listener.take()
+            && let Some(ref manager) = self.approvals
+        {
+            spawn_dashboard_accept_loop(dashboard_listener, manager.clone());
         }
 
         // Set up reload channel. We always create one so the select! branch blocks.
         // If an external trigger was set up via reload_trigger(), use that channel.
         // Otherwise create a fresh one.
-        let (reload_tx, mut reload_rx) = if let Some(rx) = self.reload_rx.take() {
-            (self.reload_tx.take().unwrap(), rx)
-        } else {
-            tokio::sync::mpsc::channel(1)
+        let (reload_tx, mut reload_rx) = match self.reload_rx.take() {
+            Some(rx) => (self.reload_tx.take().unwrap(), rx),
+            _ => tokio::sync::mpsc::channel(1),
         };
 
         // Approvals rebuild channel: ApprovalManager sends `()` when the
@@ -631,10 +630,9 @@ impl ProxyServer {
                 .serve_connection(io, service)
                 .with_upgrades()
                 .await
+                && !e.to_string().contains("connection closed")
             {
-                if !e.to_string().contains("connection closed") {
-                    tracing::debug!(client = %client_addr, error = %e, "Connection error");
-                }
+                tracing::debug!(client = %client_addr, error = %e, "Connection error");
             }
         });
     }

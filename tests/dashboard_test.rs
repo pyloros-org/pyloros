@@ -1,7 +1,7 @@
 mod common;
 
-use common::{ok_handler, ReportingClient, TestCa, TestProxy, TestUpstream};
-use serde_json::{json, Value};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, ok_handler};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 /// Spin up a proxy with approvals + a fresh audit log file, return the

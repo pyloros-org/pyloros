@@ -1,7 +1,7 @@
 //! CONNECT tunnel handling with TLS MITM
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -20,7 +20,7 @@ use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
 };
 use crate::error::{Error, Result};
-use crate::filter::dynamic_whitelist::{maybe_whitelist_redirect, DynamicWhitelist};
+use crate::filter::dynamic_whitelist::{DynamicWhitelist, maybe_whitelist_redirect};
 
 /// Buffer cap for LFS batch response inspection. Responses larger than this
 /// are forwarded unchanged with no whitelisting. Real LFS batch responses are
