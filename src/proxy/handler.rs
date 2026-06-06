@@ -173,11 +173,57 @@ impl ProxyHandler {
 
         // CONNECT is supported on port 443 (MITM as HTTPS) and port 80 (serve the
         // tunneled bytes as plain HTTP via the direct-HTTP code path). Other ports
-        // are opaque to us, so we cannot apply filter rules and they are blocked
-        // — see SPEC.md "default-deny for unverifiable restrictions".
+        // are opaque to us, so we cannot apply filter rules.
         if port != 443 && port != 80 {
-            tracing::warn!(host = %host, port = %port, "Blocking CONNECT to unsupported port");
             let url = format!("{}:{}", host, port);
+            if self.logger.is_permissive_now() {
+                // Permissive mode behaves as if there were no proxy: we can't MITM
+                // this port, so blind-tunnel raw TCP bytes through. We still record a
+                // request_permitted audit entry (with the unsupported_connect_port
+                // reason) so the traffic remains visible.
+                let ctx = RequestContext {
+                    method: "CONNECT",
+                    url: &url,
+                    host: &host,
+                    scheme: "unknown",
+                    protocol: "unknown",
+                    credential: None,
+                    label: " (blind tunnel)",
+                };
+                self.logger.log_permitted_with_reason(
+                    &ctx,
+                    AuditReason::UnsupportedConnectPort,
+                    None,
+                );
+
+                let upgrade = hyper::upgrade::on(req);
+                let tunnel_handler = self.tunnel_handler.clone();
+                tokio::spawn(async move {
+                    let upgraded = match upgrade.await {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::error!(host = %host, error = %e, "Failed to upgrade connection");
+                            return;
+                        }
+                    };
+                    if let Err(e) = tunnel_handler.run_blind_tunnel(upgraded, &host, port).await {
+                        let err_str = e.to_string();
+                        if !err_str.contains("connection closed") && !err_str.contains("early eof")
+                        {
+                            tracing::error!(host = %host, port = %port, error = %e, "Blind tunnel error");
+                        }
+                    }
+                });
+
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())
+                    .unwrap());
+            }
+
+            // Enforcing mode: block — see SPEC.md "default-deny for unverifiable
+            // restrictions".
+            tracing::warn!(host = %host, port = %port, "Blocking CONNECT to unsupported port");
             self.logger.emit_audit(AuditEntry {
                 timestamp: crate::audit::now_iso8601(),
                 event: AuditEvent::RequestBlocked,

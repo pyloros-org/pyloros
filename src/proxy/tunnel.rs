@@ -229,6 +229,40 @@ impl TunnelHandler {
         Ok(())
     }
 
+    /// Run a blind raw-TCP tunnel on an upgraded CONNECT connection.
+    ///
+    /// Used only in permissive mode for CONNECT requests to ports we can't MITM
+    /// (anything other than 443/80). Since we can't inspect the traffic, we behave
+    /// as if there were no proxy: copy bytes verbatim in both directions between the
+    /// client and the upstream `host:port`. No TLS, no filtering, no credential
+    /// injection. Honors the upstream host/port overrides used elsewhere for testing.
+    pub async fn run_blind_tunnel(
+        self: &Arc<Self>,
+        upgraded: hyper::upgrade::Upgraded,
+        host: &str,
+        port: u16,
+    ) -> Result<()> {
+        let connect_port = self.upstream_port_override.unwrap_or(port);
+        let connect_host = self
+            .upstream_host_override
+            .as_deref()
+            .unwrap_or(host)
+            .to_string();
+        let addr = format!("{}:{}", connect_host, connect_port);
+        let mut upstream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| Error::proxy(format!("Failed to connect to {}: {}", addr, e)))?;
+
+        let mut client_io = TokioIo::new(upgraded);
+        if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await {
+            let err_str = e.to_string();
+            if !err_str.contains("connection closed") && !err_str.contains("early eof") {
+                tracing::debug!(host = %host, port = %port, error = %e, "Blind tunnel ended");
+            }
+        }
+        Ok(())
+    }
+
     /// Serve HTTP requests over an established TLS connection.
     ///
     /// Shared by CONNECT tunnel (after MITM handshake) and direct HTTPS listener
