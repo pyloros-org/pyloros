@@ -249,6 +249,11 @@ export class PylorosInstance {
 
   // ---------- lifecycle ----------
 
+  /** Whether the spawned process is still running (hasn't crashed/exited). */
+  isAlive(): boolean {
+    return this.child.exitCode === null && this.child.signalCode === null;
+  }
+
   async stop(): Promise<void> {
     this.child.kill('SIGTERM');
     await new Promise<void>((resolve) => {

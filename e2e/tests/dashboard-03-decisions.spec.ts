@@ -1,115 +1,61 @@
-import { test, expect, uniqueHost, uniquePath } from '../fixtures';
+import { test, expect, uniqueHost } from '../fixtures';
 
-/** Approve / deny decision flows, including editing the rule TOML. */
 test.describe('decisions', () => {
-  test('approve (unedited TOML) makes the rule live; traffic reaches the upstream', async ({
-    page,
+  test('approve (unedited TOML) makes the rule live; traffic reaches the origin', async ({
+    dashboard,
     pyloros,
   }) => {
-    // Unique path on a real, reachable host so this is dedup-safe across
-    // retries while still proving the request traverses the proxy.
-    const seg = uniquePath('approve');
-    const ruleUrl = `https://example.com/${seg}/*`;
-    const probeUrl = `https://example.com/${seg}/ok`;
+    const s = await dashboard.seedPending({ reason: 'fetch example', reachable: true });
+    await expect(pyloros).toBlock(s.probe);
 
-    const approval = await pyloros.createApproval([{ method: 'GET', url: ruleUrl }], {
-      reason: 'fetch example',
-    });
+    await s.card.approve();
+    await s.card.expectResolvedAs('approved');
 
-    // Blocked before approval.
-    expect(await pyloros.sendRequest('GET', probeUrl)).toBe(451);
-
-    await page.goto(pyloros.dashboardUrl);
-    const card = page.locator(`#pending-list .card[data-id="${approval.id}"]`);
-    await expect(card).toBeVisible();
-    await card.locator('.approve').click();
-
-    // Resolved → approved tag, then auto-removed after ~3s.
-    await expect(card.locator('.tag.approved')).toHaveText('approved');
-    await expect(page.locator(`#pending-list .card[data-id="${approval.id}"]`)).toHaveCount(0);
-
-    // Agent long-poll sees the approval.
-    const decision = await pyloros.waitForDecision(approval.id);
-    expect(decision.status).toBe('approved');
-
-    // Now the request reaches example.com (404 from the origin for an unknown
-    // path — a proxy block would be 451). Poll: FilterEngine rebuild is async.
-    await expect
-      .poll(async () => pyloros.sendRequest('GET', probeUrl), { timeout: 10_000 })
-      .toBe(404);
+    expect((await pyloros.waitForDecision(s.id)).status).toBe('approved');
+    await expect(pyloros).toReachOrigin(s.probe);
   });
 
   test('approve with edited TOML applies the edited rule, not the proposed one', async ({
-    page,
+    dashboard,
     pyloros,
   }) => {
-    const wrong = uniqueHost('wrong');
+    const s = await dashboard.seedPending({ reason: 'agent proposed the wrong host' });
     const right = uniqueHost('right');
-    const approval = await pyloros.createApproval(
-      [{ method: 'GET', url: `https://${wrong}/*` }],
-      { reason: 'agent proposed the wrong host' },
-    );
 
-    await page.goto(pyloros.dashboardUrl);
-    const card = page.locator(`#pending-list .card[data-id="${approval.id}"]`);
-    await expect(card).toBeVisible();
+    await s.card.editRule(`[[rules]]\nmethod = "GET"\nurl = "https://${right}/*"\n`);
+    await s.card.approve();
+    await s.card.expectResolvedAs('approved');
 
-    // User corrects the host in the editable TOML, then approves.
-    await card
-      .locator('.rule-toml')
-      .fill(`[[rules]]\nmethod = "GET"\nurl = "https://${right}/*"\n`);
-    await card.locator('.approve').click();
-    await expect(card.locator('.tag.approved')).toHaveText('approved');
-
-    expect((await pyloros.waitForDecision(approval.id)).status).toBe('approved');
-
-    // The proposed (wrong) host stays blocked; the edited (right) host matches.
-    expect(await pyloros.sendRequest('GET', `https://${wrong}/x`)).toBe(451);
-    await expect
-      .poll(async () => pyloros.sendRequest('GET', `https://${right}/x`), { timeout: 10_000 })
-      .not.toBe(451);
+    expect((await pyloros.waitForDecision(s.id)).status).toBe('approved');
+    await expect(pyloros).toBlock(`https://${s.host}/x`);
+    await expect(pyloros).toRouteThrough(`https://${right}/x`);
   });
 
   test('invalid TOML shows an inline parse error and leaves the approval pending', async ({
-    page,
-    pyloros,
+    dashboard,
   }) => {
-    const host = uniqueHost('badtoml');
-    const approval = await pyloros.createApproval([{ method: 'GET', url: `https://${host}/*` }]);
+    const s = await dashboard.seedPending();
 
-    await page.goto(pyloros.dashboardUrl);
-    const card = page.locator(`#pending-list .card[data-id="${approval.id}"]`);
-    await expect(card).toBeVisible();
+    await s.card.editRule('this is not valid toml ~~~');
+    await s.card.approve();
 
-    await card.locator('.rule-toml').fill('this is not valid toml ~~~');
-    await card.locator('.approve').click();
-
-    const err = card.locator('.parse-error');
-    await expect(err).toBeVisible();
-    await expect(err).toContainText('TOML parse error');
-
-    // No decision was sent: still pending (no tag), and the long-poll times out.
-    await expect(card.locator('.tag')).toHaveCount(0);
-    await expect(card).toBeVisible();
+    await expect(s.card.parseError).toBeVisible();
+    await expect(s.card.parseError).toContainText('TOML parse error');
+    // No decision was sent: still pending (no tag).
+    await expect(s.card.root.locator('.tag')).toHaveCount(0);
+    await expect(s.card.root).toBeVisible();
   });
 
   test('deny with message resolves denied and returns the message to the agent', async ({
-    page,
+    dashboard,
     pyloros,
   }) => {
-    const host = uniqueHost('deny');
-    const approval = await pyloros.createApproval([{ method: 'GET', url: `https://${host}/*` }]);
+    const s = await dashboard.seedPending();
 
-    await page.goto(pyloros.dashboardUrl);
-    const card = page.locator(`#pending-list .card[data-id="${approval.id}"]`);
-    await expect(card).toBeVisible();
+    await s.card.deny('use the internal mirror instead');
+    await s.card.expectResolvedAs('denied');
 
-    await card.locator('.deny-msg').fill('use the internal mirror instead');
-    await card.locator('.deny').click();
-
-    await expect(card.locator('.tag.denied')).toHaveText('denied');
-
-    const decision = await pyloros.waitForDecision(approval.id);
+    const decision = await pyloros.waitForDecision(s.id);
     expect(decision.status).toBe('denied');
     expect(decision.message).toBe('use the internal mirror instead');
   });
