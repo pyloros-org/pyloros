@@ -9,9 +9,18 @@
 mod common;
 
 use common::{
-    ReportingClient, TestCa, TestProxy, git_rule, git_rule_with_branches, read_audit_entries,
+    ReportingClient, TestCa, TestProxy, TestUpstream, git_rule, git_rule_with_branches, ok_handler,
+    read_audit_entries,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+
+/// Helper to build an LFS batch JSON body (mirrors the one in `git_lfs_test.rs`).
+fn lfs_batch_body(operation: &str) -> String {
+    format!(
+        r#"{{"operation":"{}","transfers":["basic"],"objects":[{{"oid":"abc123","size":42}}]}}"#,
+        operation
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Block point 3: body-inspection-requires-HTTPS (plain HTTP git/LFS bodies)
@@ -86,6 +95,73 @@ async fn test_permissive_forwards_plain_http_body_inspection() {
     );
 
     proxy.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Block point 2: Git-LFS operation check (HTTPS)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_permissive_forwards_lfs_op_check_failure() {
+    let t = test_report!("Permissive mode forwards LFS batch op that fails the operation check");
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("lfs-forwarded"))
+        .report(&t, "LFS batch mock")
+        .start()
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit_path_str = audit_path.to_str().unwrap();
+
+    // fetch rule ⇒ download-only. An upload batch fails the op check; non-permissive
+    // would return 451, permissive forwards it.
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("fetch", "https://localhost/org/repo")],
+        upstream.port(),
+    )
+    .permissive(true)
+    .audit_log(audit_path_str)
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client
+        .inner()
+        .post("https://localhost/org/repo/info/lfs/objects/batch")
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .body(lfs_batch_body("upload"))
+        .send()
+        .await
+        .unwrap();
+    t.assert_eq("status", &resp.status().as_u16(), &200u16);
+    let body = resp.text().await.unwrap();
+    t.assert_eq("upstream was reached", &body.as_str(), &"lfs-forwarded");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let entries = read_audit_entries(audit_path_str);
+    t.assert_eq("entry count", &entries.len(), &1usize);
+    t.assert_eq(
+        "event",
+        &entries[0]["event"].as_str().unwrap(),
+        &"request_permitted",
+    );
+    t.assert_eq(
+        "decision",
+        &entries[0]["decision"].as_str().unwrap(),
+        &"allowed",
+    );
+    t.assert_eq(
+        "reason",
+        &entries[0]["reason"].as_str().unwrap(),
+        &"lfs_operation_not_allowed",
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
 }
 
 // ---------------------------------------------------------------------------

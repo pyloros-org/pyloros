@@ -528,47 +528,65 @@ impl TunnelHandler {
                     })?
                     .to_bytes();
 
-                if !lfs::check_lfs_operation(&body_bytes, allowed_ops) {
-                    if self.logger.log_blocked_requests {
-                        tracing::warn!(
-                            method = %method,
-                            url = %full_url,
-                            allowed_ops = ?allowed_ops,
-                            "BLOCKED (LFS operation not allowed)"
+                // When the operation isn't in the allow-list we normally block. In
+                // permissive mode we behave as if there were no proxy and forward the
+                // batch anyway, emitting a request_permitted audit entry that keeps the
+                // lfs_operation_not_allowed reason so the trail stays greppable.
+                let lfs_permitted_override = if !lfs::check_lfs_operation(&body_bytes, allowed_ops)
+                {
+                    if self.logger.is_permissive_now() {
+                        self.logger.log_permitted_with_reason(
+                            &ctx,
+                            AuditReason::LfsOperationNotAllowed,
+                            None,
                         );
+                        true
+                    } else {
+                        if self.logger.log_blocked_requests {
+                            tracing::warn!(
+                                method = %method,
+                                url = %full_url,
+                                allowed_ops = ?allowed_ops,
+                                "BLOCKED (LFS operation not allowed)"
+                            );
+                        }
+                        self.logger.emit_audit(AuditEntry {
+                            timestamp: crate::audit::now_iso8601(),
+                            event: AuditEvent::RequestBlocked,
+                            method: method.clone(),
+                            url: full_url.clone(),
+                            host: host.to_string(),
+                            scheme: "https".to_string(),
+                            protocol: "https".to_string(),
+                            decision: AuditDecision::Blocked,
+                            reason: AuditReason::LfsOperationNotAllowed,
+                            credential: None,
+                            git: None,
+                            request_body: None,
+                            request_body_encoding: None,
+                            response_body: None,
+                            response_body_encoding: None,
+                            body_truncated: None,
+                            permissive_duration_secs: None,
+                            permissive_source: None,
+                            redirect_target: None,
+                        });
+                        return Ok(blocked_response(&method, &full_url));
                     }
-                    self.logger.emit_audit(AuditEntry {
-                        timestamp: crate::audit::now_iso8601(),
-                        event: AuditEvent::RequestBlocked,
-                        method: method.clone(),
-                        url: full_url.clone(),
-                        host: host.to_string(),
-                        scheme: "https".to_string(),
-                        protocol: "https".to_string(),
-                        decision: AuditDecision::Blocked,
-                        reason: AuditReason::LfsOperationNotAllowed,
-                        credential: None,
-                        git: None,
-                        request_body: None,
-                        request_body_encoding: None,
-                        response_body: None,
-                        response_body_encoding: None,
-                        body_truncated: None,
-                        permissive_duration_secs: None,
-                        permissive_source: None,
-                        redirect_target: None,
-                    });
-                    return Ok(blocked_response(&method, &full_url));
-                }
+                } else {
+                    false
+                };
 
-                // Allowed after LFS check
+                // Allowed after LFS check (or permitted through in permissive mode)
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
-                if !log_body {
+                // Skip the normal allowed/body-log audit when we already emitted the
+                // permitted entry above, to avoid a duplicate audit record.
+                if !log_body && !lfs_permitted_override {
                     self.logger.log_allowed(&allowed_ctx);
                 }
                 return self
@@ -581,7 +599,11 @@ impl TunnelHandler {
                         &full_url,
                         rp,
                         allowed_ops,
-                        if log_body { Some(&allowed_ctx) } else { None },
+                        if log_body && !lfs_permitted_override {
+                            Some(&allowed_ctx)
+                        } else {
+                            None
+                        },
                     )
                     .await;
             }
