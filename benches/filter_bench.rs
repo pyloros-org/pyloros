@@ -1,6 +1,7 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use pyloros::config::Rule;
 use pyloros::filter::{FilterEngine, RequestInfo};
+use std::hint::black_box;
 
 /// Build a realistic set of ~120 rules mixing exact hosts, wildcards, git rules, and websockets.
 fn build_rules() -> Vec<Rule> {
