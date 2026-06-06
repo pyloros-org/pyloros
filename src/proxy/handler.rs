@@ -294,36 +294,52 @@ impl ProxyHandler {
             | FilterResult::AllowedWithLfsCheck { .. } => {
                 // Git rules with branch restrictions or LFS operation checks
                 // require body inspection, which is only supported over HTTPS
-                // CONNECT tunnels. Block plain HTTP to maintain default-deny.
-                if self.logger.log_blocked_requests {
-                    tracing::warn!(
-                        method = %method,
-                        url = %full_url,
-                        "BLOCKED (HTTP: body inspection requires HTTPS)"
+                // CONNECT tunnels. We can't inspect a plain-HTTP body here.
+                if self.logger.is_permissive_now() {
+                    // Permissive mode behaves as if there were no proxy: forward
+                    // the request unconditionally instead of blocking. We retain the
+                    // `body_inspection_requires_https` reason so the audit log shows
+                    // why it would otherwise have been blocked.
+                    self.logger.log_permitted_with_reason(
+                        &ctx,
+                        AuditReason::BodyInspectionRequiresHttps,
+                        None,
                     );
+                    // Fall through to the shared forwarding tail (no redirect policy,
+                    // matching the permissive `Blocked` arm above).
+                    None
+                } else {
+                    // Block plain HTTP to maintain default-deny.
+                    if self.logger.log_blocked_requests {
+                        tracing::warn!(
+                            method = %method,
+                            url = %full_url,
+                            "BLOCKED (HTTP: body inspection requires HTTPS)"
+                        );
+                    }
+                    self.logger.emit_audit(AuditEntry {
+                        timestamp: crate::audit::now_iso8601(),
+                        event: AuditEvent::RequestBlocked,
+                        method: method.clone(),
+                        url: full_url.clone(),
+                        host: host.clone(),
+                        scheme: scheme.to_string(),
+                        protocol: "http".to_string(),
+                        decision: AuditDecision::Blocked,
+                        reason: AuditReason::BodyInspectionRequiresHttps,
+                        credential: None,
+                        git: None,
+                        request_body: None,
+                        request_body_encoding: None,
+                        response_body: None,
+                        response_body_encoding: None,
+                        body_truncated: None,
+                        permissive_duration_secs: None,
+                        permissive_source: None,
+                        redirect_target: None,
+                    });
+                    return Ok(blocked_response(&method, &full_url));
                 }
-                self.logger.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestBlocked,
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.clone(),
-                    scheme: scheme.to_string(),
-                    protocol: "http".to_string(),
-                    decision: AuditDecision::Blocked,
-                    reason: AuditReason::BodyInspectionRequiresHttps,
-                    credential: None,
-                    git: None,
-                    request_body: None,
-                    request_body_encoding: None,
-                    response_body: None,
-                    response_body_encoding: None,
-                    body_truncated: None,
-                    permissive_duration_secs: None,
-                    permissive_source: None,
-                    redirect_target: None,
-                });
-                return Ok(blocked_response(&method, &full_url));
             }
             FilterResult::Allowed { log_body } => {
                 if log_body {

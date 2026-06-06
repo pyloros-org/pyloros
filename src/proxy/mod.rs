@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::approvals::ApprovalManager;
 use crate::audit::{
-    AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason,
+    AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
 };
 use response::blocked_response;
 
@@ -164,6 +164,47 @@ impl RequestLogger {
         } else {
             Some(blocked_response(ctx.method, ctx.url))
         }
+    }
+
+    /// Emit a `RequestPermitted` audit entry (decision `Allowed`) for a block point
+    /// that permissive mode is letting through — e.g. a branch-restricted push, an
+    /// LFS op that fails the operation check, a plain-HTTP body that can't be
+    /// inspected, or an unsupported CONNECT port.
+    ///
+    /// Unlike `log_blocked` (which keys off `is_permissive_now()` and handles the
+    /// `no_matching_rule` case), this is called from the specific block points after
+    /// the caller has already decided permissive mode is active. It keeps the original
+    /// `reason` (e.g. `BranchRestriction`) so the audit log stays greppable and shows
+    /// *why it would have been blocked*, while `event`/`decision` say it was permitted.
+    /// Always emits a tracing line since the point of permissive mode is visibility.
+    pub fn log_permitted_with_reason(
+        &self,
+        ctx: &RequestContext<'_>,
+        reason: AuditReason,
+        git: Option<AuditGitInfo>,
+    ) {
+        tracing::warn!(method = %ctx.method, url = %ctx.url, "PERMITTED{}", ctx.label);
+        self.emit_audit(AuditEntry {
+            timestamp: crate::audit::now_iso8601(),
+            event: AuditEvent::RequestPermitted,
+            method: ctx.method.to_string(),
+            url: ctx.url.to_string(),
+            host: ctx.host.to_string(),
+            scheme: ctx.scheme.to_string(),
+            protocol: ctx.protocol.to_string(),
+            decision: AuditDecision::Allowed,
+            reason,
+            credential: ctx.credential.clone(),
+            git,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
+            redirect_target: None,
+        });
     }
 
     /// Handle the `FilterResult::Allowed` pattern: log and emit audit with `RuleMatched`.

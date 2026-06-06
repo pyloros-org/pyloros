@@ -1,0 +1,127 @@
+//! Tests for permissive mode behaving "as if there were no proxy".
+//!
+//! Beyond letting unmatched requests through (covered in `permissive_mode_test.rs`),
+//! permissive mode must NOT block for any traffic-filtering reason: branch
+//! restrictions, LFS operation checks, the body-inspection-requires-HTTPS block,
+//! and unsupported CONNECT ports all become allow-through. The one exception is
+//! proxy authentication, which still blocks. Each block point is exercised here.
+
+mod common;
+
+use common::{
+    ReportingClient, TestCa, TestProxy, git_rule, git_rule_with_branches, read_audit_entries,
+};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+
+// ---------------------------------------------------------------------------
+// Block point 3: body-inspection-requires-HTTPS (plain HTTP git/LFS bodies)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_permissive_forwards_plain_http_body_inspection() {
+    let t = test_report!(
+        "Permissive mode forwards plain-HTTP git push (would need HTTPS to inspect body)"
+    );
+    let ca = TestCa::generate();
+
+    // Real upstream over plain HTTP — the request must actually be forwarded.
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("forwarded"))
+        .mount(&upstream)
+        .await;
+    let port = upstream.address().port();
+    t.setup("Started plain-HTTP upstream");
+
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit_path_str = audit_path.to_str().unwrap();
+
+    // A push rule with branch restrictions. Over plain HTTP the body can't be
+    // inspected, so non-permissive mode blocks (451). Permissive forwards anyway.
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule_with_branches(
+            "push",
+            &format!("http://localhost:{}/*", port),
+            &["feature/*"],
+        )],
+        port,
+    )
+    .permissive(true)
+    .audit_log(audit_path_str)
+    .report(&t)
+    .start()
+    .await;
+
+    let client = ReportingClient::new_plain(&t, proxy.addr());
+    let resp = client
+        .post_with_body(
+            &format!("http://localhost:{}/repo.git/git-receive-pack", port),
+            b"anything".to_vec(),
+        )
+        .await;
+    t.assert_eq("status", &resp.status().as_u16(), &200u16);
+    let body = resp.text().await.unwrap();
+    t.assert_eq("upstream was reached", &body.as_str(), &"forwarded");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let entries = read_audit_entries(audit_path_str);
+    t.assert_eq("entry count", &entries.len(), &1usize);
+    t.assert_eq(
+        "event",
+        &entries[0]["event"].as_str().unwrap(),
+        &"request_permitted",
+    );
+    t.assert_eq(
+        "decision",
+        &entries[0]["decision"].as_str().unwrap(),
+        &"allowed",
+    );
+    t.assert_eq(
+        "reason",
+        &entries[0]["reason"].as_str().unwrap(),
+        &"body_inspection_requires_https",
+    );
+
+    proxy.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Control: proxy authentication still blocks even in permissive mode
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_permissive_still_enforces_proxy_auth() {
+    let t = test_report!("Permissive mode still returns 407 when proxy auth fails");
+    let ca = TestCa::generate();
+
+    // Plain-HTTP upstream so a missing-auth 407 comes back as a normal response
+    // (reqwest surfaces 407 on a CONNECT as a connection error instead).
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("should not reach"))
+        .mount(&upstream)
+        .await;
+    let port = upstream.address().port();
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![git_rule("fetch", &format!("http://localhost:{}/*", port))],
+        port,
+    )
+    .permissive(true)
+    .auth("user", "pass")
+    .report(&t)
+    .start()
+    .await;
+
+    // Client with NO proxy credentials — auth is access control to the proxy, not
+    // traffic filtering, so it must still be enforced in permissive mode.
+    let client = ReportingClient::new_plain(&t, proxy.addr());
+    let resp = client.get(&format!("http://localhost:{}/test", port)).await;
+    t.assert_eq("status", &resp.status().as_u16(), &407u16);
+
+    proxy.shutdown();
+}
