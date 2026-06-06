@@ -356,6 +356,9 @@ returns `200 approved` immediately, with no pending state and no dashboard notif
 returned to the agent in the long-poll response, giving the agent a chance to refine and
 re-request.
 
+**Testing.** The dashboard UI (all panels and flows above) is covered by Playwright
+browser E2E tests — see "Browser E2E Tests" under Testing.
+
 **Security model:**
 
 - Agent API: the sandbox boundary is the trust boundary. Anything inside the sandbox that can
@@ -663,6 +666,26 @@ Binary tests should enable proxy authentication to mirror realistic deployment
 configurations. Proxy credentials are passed via embedded credentials in the proxy
 URL (e.g. `http://user:pass@127.0.0.1:PORT`), the same way real clients configure
 them.
+
+### Browser E2E Tests
+
+The approvals dashboard's served HTML/JS is exercised by Playwright (Chromium)
+browser tests under `e2e/` (TypeScript). A per-worker fixture spawns the real
+`pyloros` binary with a generated test CA on ephemeral ports and an audit-log file,
+then drives the dashboard in a real browser. Pending approvals are seeded through the
+agent API (`POST https://pyloros.internal/approvals` via the proxy with `--cacert`);
+the dashboard's own endpoints (`/permissive`, `/rules`, `/rules/parse`,
+`/rules/suggest`, decision, revoke) are driven directly. Coverage spans every panel:
+permissive-mode toggle, editable-TOML approvals, deny-with-message, the
+active-timeboxed-rules panel with revoke, the audit-log browser with "create rule
+from a blocked/permitted row", HTML-escaping/XSS guards, the SSE live updates, and
+notification-button state. Per the integration-testing rule, decision/create-rule
+flows verify that the approved rule actually goes live by re-issuing the
+previously-blocked request through the proxy (451 → not-451). Decisions are confirmed
+via the agent long-poll (`GET /approvals/{id}?wait=`).
+
+These run in a dedicated `browser-test` CI job that reuses the `pyloros` binary built
+by the Rust `test` job (downloaded as an artifact) rather than recompiling.
 
 ### Live API Tests
 
