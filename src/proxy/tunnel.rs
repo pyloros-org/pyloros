@@ -435,43 +435,60 @@ impl TunnelHandler {
                     })?
                     .to_bytes();
 
+                // When a push targets a disallowed ref we normally reject it with a
+                // git-protocol error. In permissive mode we behave as if there were no
+                // proxy and forward the push anyway, emitting a request_permitted audit
+                // entry that keeps the branch_restriction reason and the blocked refs.
                 let blocked = pktline::blocked_refs_with_filter(&body_bytes, filter);
-                if !blocked.is_empty() {
-                    if self.logger.log_blocked_requests {
-                        tracing::warn!(
-                            method = %method,
-                            url = %full_url,
-                            blocked_refs = ?blocked,
-                            "BLOCKED (branch restriction)"
+                let branch_permitted_override = if !blocked.is_empty() {
+                    if self.logger.is_permissive_now() {
+                        self.logger.log_permitted_with_reason(
+                            &ctx,
+                            AuditReason::BranchRestriction,
+                            Some(AuditGitInfo {
+                                blocked_refs: blocked.clone(),
+                            }),
                         );
+                        true
+                    } else {
+                        if self.logger.log_blocked_requests {
+                            tracing::warn!(
+                                method = %method,
+                                url = %full_url,
+                                blocked_refs = ?blocked,
+                                "BLOCKED (branch restriction)"
+                            );
+                        }
+                        self.logger.emit_audit(AuditEntry {
+                            timestamp: crate::audit::now_iso8601(),
+                            event: AuditEvent::RequestBlocked,
+                            method: method.clone(),
+                            url: full_url.clone(),
+                            host: host.to_string(),
+                            scheme: "https".to_string(),
+                            protocol: "https".to_string(),
+                            decision: AuditDecision::Blocked,
+                            reason: AuditReason::BranchRestriction,
+                            credential: None,
+                            git: Some(AuditGitInfo {
+                                blocked_refs: blocked.clone(),
+                            }),
+                            request_body: None,
+                            request_body_encoding: None,
+                            response_body: None,
+                            response_body_encoding: None,
+                            body_truncated: None,
+                            permissive_duration_secs: None,
+                            permissive_source: None,
+                            redirect_target: None,
+                        });
+                        return Ok(git_blocked_push_response(&body_bytes, &blocked));
                     }
-                    self.logger.emit_audit(AuditEntry {
-                        timestamp: crate::audit::now_iso8601(),
-                        event: AuditEvent::RequestBlocked,
-                        method: method.clone(),
-                        url: full_url.clone(),
-                        host: host.to_string(),
-                        scheme: "https".to_string(),
-                        protocol: "https".to_string(),
-                        decision: AuditDecision::Blocked,
-                        reason: AuditReason::BranchRestriction,
-                        credential: None,
-                        git: Some(AuditGitInfo {
-                            blocked_refs: blocked.clone(),
-                        }),
-                        request_body: None,
-                        request_body_encoding: None,
-                        response_body: None,
-                        response_body_encoding: None,
-                        body_truncated: None,
-                        permissive_duration_secs: None,
-                        permissive_source: None,
-                        redirect_target: None,
-                    });
-                    return Ok(git_blocked_push_response(&body_bytes, &blocked));
-                }
+                } else {
+                    false
+                };
 
-                // Allowed after branch check
+                // Allowed after branch check (or permitted through in permissive mode)
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
@@ -485,7 +502,9 @@ impl TunnelHandler {
                 );
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
-                if log_body {
+                // When we already emitted the permitted entry, skip the body-log path
+                // and the normal allowed audit so we don't write a duplicate record.
+                if log_body && !branch_permitted_override {
                     return self
                         .forward_buffered_with_body_log(
                             parts,
@@ -500,7 +519,9 @@ impl TunnelHandler {
                         .await;
                 }
 
-                self.logger.log_allowed(&allowed_ctx);
+                if !branch_permitted_override {
+                    self.logger.log_allowed(&allowed_ctx);
+                }
                 return self
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
