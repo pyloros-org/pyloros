@@ -261,14 +261,31 @@ intentionally truncated.
 
 ## Timeboxed permissive mode
 
-Permissive mode is evaluated through `ApprovalManager` so the dashboard can
-toggle it at runtime without a config reload. `proxy.permissive = true` in
-the config file is a permanent override; the dashboard toggle layers on top
-via `ApprovalManager::is_permissive_active()`, which the proxy queries on
-each request decision (via the `TunnelHandler` / `ProxyHandler` factory).
-When the expiry timer fires, the manager calls `request_rebuild()` on the
-same channel approval-rule changes use, so a new `TunnelHandler` is
-broadcast and subsequent requests see the flipped flag.
+The combined permissive decision lives in `PermissiveState { base, approvals }`
+(`src/proxy/mod.rs`), held directly by `ProxyHandler` / `TunnelHandler`.
+`PermissiveState::is_active()` returns `base || approvals.is_permissive_active()`:
+`base` is the permanent `proxy.permissive = true` config flag, and the optional
+`ApprovalManager` layers the runtime dashboard toggle on top so it can be flipped
+without a config reload. When the expiry timer fires, the manager calls
+`request_rebuild()` on the same channel approval-rule changes use, so a new
+`TunnelHandler` is broadcast and subsequent requests see the flipped flag.
+
+Permissive mode is a **control-flow** decision (block vs. forward), not a logging
+one, so it deliberately does *not* live on `RequestLogger` — the logger is a pure
+function of its inputs (`log_blocked` takes the decision as a parameter). It also
+does not live on `ApprovalManager`: that manager is `Option` (present only when
+`[approvals]` is configured), whereas `proxy.permissive` works without it, so
+folding the decision in would invert the dependency.
+
+**Deferred refactor (intentional, not yet done):** the proxy core merges a static
+config layer with a dynamic (approvals) layer by hand in two places — the
+permissive flag (`PermissiveState`) and the rule set (`config.rules ++
+approvals.active_rules()`, rebuilt on grant/expire). In both, `ApprovalManager`
+leaks into the core as an `Option` the handlers thread around. The cleaner shape
+is a single policy source the core queries (`policy.current_rules()`,
+`policy.is_permissive()`) that composes static+dynamic internally, making the
+approvals subsystem just one provider behind that interface. `PermissiveState` is
+a half-step — it still hardcodes the `base || approvals` composition.
 
 Permissive-mode toggles emit dedicated audit entries
 (`AuditEvent::PermissiveEnabled` / `PermissiveDisabled`) with
