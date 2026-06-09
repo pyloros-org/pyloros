@@ -316,8 +316,10 @@ impl ProxyHandler {
             FilterResult::AllowedWithBranchCheck { .. }
             | FilterResult::AllowedWithLfsCheck { .. } => {
                 // Git rules with branch restrictions or LFS operation checks
-                // require body inspection, which is only supported over HTTPS
-                // CONNECT tunnels. We can't inspect a plain-HTTP body here.
+                // require body inspection. We only implement that on the HTTPS
+                // tunnel path — by choice, not necessity (we could buffer and
+                // inspect a plain-HTTP body too). Enforcing mode therefore blocks
+                // plain HTTP (default-deny for unverifiable restrictions).
                 if self.permissive.is_active() {
                     // Permissive mode behaves as if there were no proxy: forward
                     // the request unconditionally instead of blocking. We retain the

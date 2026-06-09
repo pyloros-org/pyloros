@@ -147,9 +147,12 @@ to the proxy and not automatically allowed — users must add separate HTTP rule
 transfer hosts. This is intentional: the proxy shouldn't assume which external hosts are
 acceptable just because git smart HTTP access is allowed.
 
-**Plain HTTP blocking**: Like `AllowedWithBranchCheck`, `AllowedWithLfsCheck` requires
-HTTPS body inspection. On plain HTTP, it is blocked with HTTP 451 (default-deny for
-unverifiable restrictions).
+**Plain HTTP blocking**: Like `AllowedWithBranchCheck`, body inspection for
+`AllowedWithLfsCheck` is only implemented on the HTTPS tunnel path — a deliberate
+choice, not a technical limitation (a plain-HTTP body could be buffered and inspected
+too). On plain HTTP it is blocked with HTTP 451 (default-deny for unverifiable
+restrictions); the `body_inspection_requires_https` audit reason is named for the
+current behavior, not an inherent constraint.
 
 ## Config Live-Reload
 
