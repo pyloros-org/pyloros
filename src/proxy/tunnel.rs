@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::response::{blocked_response, error_response, git_blocked_push_response};
-use super::{RequestContext, RequestLogger};
+use super::{PermissiveState, RequestContext, RequestLogger};
 use crate::approvals::{self, ApprovalManager};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
@@ -47,6 +47,7 @@ pub struct TunnelHandler {
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
     logger: RequestLogger,
+    permissive: PermissiveState,
     max_body_log_size: usize,
     /// Approvals manager — `Some` when the `[approvals]` section is set in
     /// config; `None` means the feature is disabled and the agent API
@@ -70,6 +71,7 @@ impl TunnelHandler {
             upstream_host_override: None,
             upstream_tls_config: None,
             logger: RequestLogger::new(),
+            permissive: PermissiveState::default(),
             max_body_log_size: 1_048_576,
             approvals: None,
         }
@@ -79,9 +81,9 @@ impl TunnelHandler {
     /// `https://pyloros.internal/` are routed to the agent API handler
     /// instead of being treated as a normal upstream host.
     pub fn with_approvals(mut self, manager: Arc<ApprovalManager>) -> Self {
-        // Also wire into the logger so dashboard-controlled permissive
-        // overrides take effect on HTTPS requests too.
-        self.logger = self.logger.with_approvals(Some(Arc::clone(&manager)));
+        // Also feed the permissive state so dashboard-controlled overrides take
+        // effect on HTTPS requests too.
+        self.permissive.set_approvals(Some(Arc::clone(&manager)));
         self.approvals = Some(manager);
         self
     }
@@ -119,7 +121,7 @@ impl TunnelHandler {
 
     /// Enable permissive mode (allow unmatched requests through with logging).
     pub fn with_permissive(mut self, permissive: bool) -> Self {
-        self.logger = self.logger.with_permissive(permissive);
+        self.permissive.set_base(permissive);
         self
     }
 
@@ -365,8 +367,7 @@ impl TunnelHandler {
                     self_arc.logger.log_blocked_requests,
                 )
                 .with_audit_logger(self_arc.logger.audit_logger.clone())
-                .with_permissive(self_arc.logger.permissive_base)
-                .with_approvals(self_arc.logger.approvals.clone())
+                .with_permissive_state(self_arc.permissive.clone())
                 .with_max_body_log_size(self_arc.max_body_log_size);
                 handler.handle_http(req).await
             }
@@ -439,7 +440,7 @@ impl TunnelHandler {
         // (origin rule's patterns, so chains extend recursively).
         let redirect_patterns: Option<Arc<Vec<UrlPattern>>> = match filter_result {
             FilterResult::Blocked => {
-                if let Some(resp) = self.logger.log_blocked(&ctx) {
+                if let Some(resp) = self.logger.log_blocked(&ctx, self.permissive.is_active()) {
                     return Ok(resp);
                 }
                 None
@@ -475,7 +476,7 @@ impl TunnelHandler {
                 // entry that keeps the branch_restriction reason and the blocked refs.
                 let blocked = pktline::blocked_refs_with_filter(&body_bytes, filter);
                 let branch_permitted_override = if !blocked.is_empty() {
-                    if self.logger.is_permissive_now() {
+                    if self.permissive.is_active() {
                         self.logger.log_permitted_with_reason(
                             &ctx,
                             AuditReason::BranchRestriction,
@@ -589,7 +590,7 @@ impl TunnelHandler {
                 // lfs_operation_not_allowed reason so the trail stays greppable.
                 let lfs_permitted_override = if !lfs::check_lfs_operation(&body_bytes, allowed_ops)
                 {
-                    if self.logger.is_permissive_now() {
+                    if self.permissive.is_active() {
                         self.logger.log_permitted_with_reason(
                             &ctx,
                             AuditReason::LfsOperationNotAllowed,

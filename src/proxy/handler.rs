@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 
 use super::response::{auth_required_response, blocked_response, error_response};
 use super::tunnel::TunnelHandler;
-use super::{RequestContext, RequestLogger};
+use super::{PermissiveState, RequestContext, RequestLogger};
 use crate::audit::{AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason};
 use crate::filter::dynamic_whitelist::{DynamicWhitelist, maybe_whitelist_redirect};
 use crate::filter::matcher::UrlPattern;
@@ -25,6 +25,7 @@ pub struct ProxyHandler {
     dynamic_whitelist: Arc<DynamicWhitelist>,
     auth: Option<(String, String)>,
     logger: RequestLogger,
+    permissive: PermissiveState,
     max_body_log_size: usize,
 }
 
@@ -40,6 +41,7 @@ impl ProxyHandler {
             dynamic_whitelist,
             auth: None,
             logger: RequestLogger::new(),
+            permissive: PermissiveState::default(),
             max_body_log_size: 1_048_576,
         }
     }
@@ -59,16 +61,8 @@ impl ProxyHandler {
         self
     }
 
-    pub fn with_permissive(mut self, permissive: bool) -> Self {
-        self.logger = self.logger.with_permissive(permissive);
-        self
-    }
-
-    pub fn with_approvals(
-        mut self,
-        manager: Option<Arc<crate::approvals::ApprovalManager>>,
-    ) -> Self {
-        self.logger = self.logger.with_approvals(manager);
+    pub(crate) fn with_permissive_state(mut self, permissive: PermissiveState) -> Self {
+        self.permissive = permissive;
         self
     }
 
@@ -176,7 +170,7 @@ impl ProxyHandler {
         // are opaque to us, so we cannot apply filter rules.
         if port != 443 && port != 80 {
             let url = format!("{}:{}", host, port);
-            if self.logger.is_permissive_now() {
+            if self.permissive.is_active() {
                 // Permissive mode behaves as if there were no proxy: we can't MITM
                 // this port, so blind-tunnel raw TCP bytes through. We still record a
                 // request_permitted audit entry (with the unsupported_connect_port
@@ -330,7 +324,7 @@ impl ProxyHandler {
             .check_with_dynamic_whitelist(&request_info, &self.dynamic_whitelist)
         {
             FilterResult::Blocked => {
-                if let Some(resp) = self.logger.log_blocked(&ctx) {
+                if let Some(resp) = self.logger.log_blocked(&ctx, self.permissive.is_active()) {
                     return Ok(resp);
                 }
                 // Permissive mode: fall through with no redirect policy.
@@ -341,7 +335,7 @@ impl ProxyHandler {
                 // Git rules with branch restrictions or LFS operation checks
                 // require body inspection, which is only supported over HTTPS
                 // CONNECT tunnels. We can't inspect a plain-HTTP body here.
-                if self.logger.is_permissive_now() {
+                if self.permissive.is_active() {
                     // Permissive mode behaves as if there were no proxy: forward
                     // the request unconditionally instead of blocking. We retain the
                     // `body_inspection_requires_https` reason so the audit log shows
