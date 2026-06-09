@@ -270,13 +270,6 @@ without a config reload. When the expiry timer fires, the manager calls
 `request_rebuild()` on the same channel approval-rule changes use, so a new
 `TunnelHandler` is broadcast and subsequent requests see the flipped flag.
 
-Permissive mode is a **control-flow** decision (block vs. forward), not a logging
-one, so it deliberately does *not* live on `RequestLogger` — the logger is a pure
-function of its inputs (`log_blocked` takes the decision as a parameter). It also
-does not live on `ApprovalManager`: that manager is `Option` (present only when
-`[approvals]` is configured), whereas `proxy.permissive` works without it, so
-folding the decision in would invert the dependency.
-
 **Deferred refactor (intentional, not yet done):** the proxy core merges a static
 config layer with a dynamic (approvals) layer by hand in two places — the
 permissive flag (`PermissiveState`) and the rule set (`config.rules ++
