@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 
 use super::response::{auth_required_response, blocked_response, error_response};
 use super::tunnel::TunnelHandler;
-use super::{RequestContext, RequestLogger};
+use super::{PermissiveState, RequestContext, RequestLogger};
 use crate::audit::{AuditDecision, AuditEntry, AuditEvent, AuditLogger, AuditReason};
 use crate::filter::dynamic_whitelist::{DynamicWhitelist, maybe_whitelist_redirect};
 use crate::filter::matcher::UrlPattern;
@@ -25,6 +25,7 @@ pub struct ProxyHandler {
     dynamic_whitelist: Arc<DynamicWhitelist>,
     auth: Option<(String, String)>,
     logger: RequestLogger,
+    permissive: PermissiveState,
     max_body_log_size: usize,
 }
 
@@ -40,6 +41,7 @@ impl ProxyHandler {
             dynamic_whitelist,
             auth: None,
             logger: RequestLogger::new(),
+            permissive: PermissiveState::default(),
             max_body_log_size: 1_048_576,
         }
     }
@@ -59,16 +61,8 @@ impl ProxyHandler {
         self
     }
 
-    pub fn with_permissive(mut self, permissive: bool) -> Self {
-        self.logger = self.logger.with_permissive(permissive);
-        self
-    }
-
-    pub fn with_approvals(
-        mut self,
-        manager: Option<Arc<crate::approvals::ApprovalManager>>,
-    ) -> Self {
-        self.logger = self.logger.with_approvals(manager);
+    pub(crate) fn with_permissive_state(mut self, permissive: PermissiveState) -> Self {
+        self.permissive = permissive;
         self
     }
 
@@ -173,32 +167,58 @@ impl ProxyHandler {
 
         // CONNECT is supported on port 443 (MITM as HTTPS) and port 80 (serve the
         // tunneled bytes as plain HTTP via the direct-HTTP code path). Other ports
-        // are opaque to us, so we cannot apply filter rules and they are blocked
-        // — see SPEC.md "default-deny for unverifiable restrictions".
+        // are opaque to us, so we cannot apply filter rules.
         if port != 443 && port != 80 {
-            tracing::warn!(host = %host, port = %port, "Blocking CONNECT to unsupported port");
             let url = format!("{}:{}", host, port);
-            self.logger.emit_audit(AuditEntry {
-                timestamp: crate::audit::now_iso8601(),
-                event: AuditEvent::RequestBlocked,
-                method: "CONNECT".to_string(),
-                url: url.clone(),
-                host: host.clone(),
-                scheme: "unknown".to_string(),
-                protocol: "unknown".to_string(),
-                decision: AuditDecision::Blocked,
-                reason: AuditReason::UnsupportedConnectPort,
+            // Shared by both the permissive (blind-tunnel) and enforcing (block)
+            // branches below; `label` is only consumed by the permitted trace line.
+            let ctx = RequestContext {
+                method: "CONNECT",
+                url: &url,
+                host: &host,
+                scheme: "unknown",
+                protocol: "unknown",
                 credential: None,
-                git: None,
-                request_body: None,
-                request_body_encoding: None,
-                response_body: None,
-                response_body_encoding: None,
-                body_truncated: None,
-                permissive_duration_secs: None,
-                permissive_source: None,
-                redirect_target: None,
-            });
+                label: " (blind tunnel)",
+            };
+            if self.permissive.is_active() {
+                // Permissive: can't MITM this port, so blind-tunnel raw bytes (still audited).
+                self.logger.log_permitted_with_reason(
+                    &ctx,
+                    AuditReason::UnsupportedConnectPort,
+                    None,
+                );
+
+                let upgrade = hyper::upgrade::on(req);
+                let tunnel_handler = self.tunnel_handler.clone();
+                tokio::spawn(async move {
+                    let upgraded = match upgrade.await {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::error!(host = %host, error = %e, "Failed to upgrade connection");
+                            return;
+                        }
+                    };
+                    if let Err(e) = tunnel_handler.run_blind_tunnel(upgraded, &host, port).await {
+                        let err_str = e.to_string();
+                        if !err_str.contains("connection closed") && !err_str.contains("early eof")
+                        {
+                            tracing::error!(host = %host, port = %port, error = %e, "Blind tunnel error");
+                        }
+                    }
+                });
+
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())
+                    .unwrap());
+            }
+
+            // Enforcing mode: block — see SPEC.md "default-deny for unverifiable
+            // restrictions".
+            tracing::warn!(host = %host, port = %port, "Blocking CONNECT to unsupported port");
+            self.logger
+                .log_blocked_with_reason(&ctx, AuditReason::UnsupportedConnectPort, None);
             return Ok(blocked_response("CONNECT", &url));
         }
 
@@ -284,7 +304,7 @@ impl ProxyHandler {
             .check_with_dynamic_whitelist(&request_info, &self.dynamic_whitelist)
         {
             FilterResult::Blocked => {
-                if let Some(resp) = self.logger.log_blocked(&ctx) {
+                if let Some(resp) = self.logger.log_blocked(&ctx, self.permissive.is_active()) {
                     return Ok(resp);
                 }
                 // Permissive mode: fall through with no redirect policy.
@@ -292,38 +312,34 @@ impl ProxyHandler {
             }
             FilterResult::AllowedWithBranchCheck { .. }
             | FilterResult::AllowedWithLfsCheck { .. } => {
-                // Git rules with branch restrictions or LFS operation checks
-                // require body inspection, which is only supported over HTTPS
-                // CONNECT tunnels. Block plain HTTP to maintain default-deny.
-                if self.logger.log_blocked_requests {
-                    tracing::warn!(
-                        method = %method,
-                        url = %full_url,
-                        "BLOCKED (HTTP: body inspection requires HTTPS)"
+                // Branch/LFS body inspection is only wired on the HTTPS tunnel path
+                // (by choice, not necessity), so enforcing mode default-denies plain HTTP.
+                if self.permissive.is_active() {
+                    // Permissive: forward instead of block (reason retained for the audit trail).
+                    self.logger.log_permitted_with_reason(
+                        &ctx,
+                        AuditReason::BodyInspectionRequiresHttps,
+                        None,
                     );
+                    // Fall through to the shared forwarding tail (no redirect policy,
+                    // matching the permissive `Blocked` arm above).
+                    None
+                } else {
+                    // Block plain HTTP to maintain default-deny.
+                    if self.logger.log_blocked_requests {
+                        tracing::warn!(
+                            method = %method,
+                            url = %full_url,
+                            "BLOCKED (HTTP: body inspection requires HTTPS)"
+                        );
+                    }
+                    self.logger.log_blocked_with_reason(
+                        &ctx,
+                        AuditReason::BodyInspectionRequiresHttps,
+                        None,
+                    );
+                    return Ok(blocked_response(&method, &full_url));
                 }
-                self.logger.emit_audit(AuditEntry {
-                    timestamp: crate::audit::now_iso8601(),
-                    event: AuditEvent::RequestBlocked,
-                    method: method.clone(),
-                    url: full_url.clone(),
-                    host: host.clone(),
-                    scheme: scheme.to_string(),
-                    protocol: "http".to_string(),
-                    decision: AuditDecision::Blocked,
-                    reason: AuditReason::BodyInspectionRequiresHttps,
-                    credential: None,
-                    git: None,
-                    request_body: None,
-                    request_body_encoding: None,
-                    response_body: None,
-                    response_body_encoding: None,
-                    body_truncated: None,
-                    permissive_duration_secs: None,
-                    permissive_source: None,
-                    redirect_target: None,
-                });
-                return Ok(blocked_response(&method, &full_url));
             }
             FilterResult::Allowed { log_body } => {
                 if log_body {

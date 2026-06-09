@@ -203,29 +203,25 @@ async fn test_permissive_off_blocks_normally() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: Permissive mode still blocks branch restriction failures
+// Test 6: Permissive mode forwards branch restriction failures (no-proxy)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_permissive_still_blocks_branch_restriction() {
-    let t = test_report!("Permissive mode still blocks branch restriction failures");
+async fn test_permissive_forwards_branch_restriction() {
+    let t = test_report!("Permissive mode forwards branch-restricted pushes (as if no proxy)");
     let ca = TestCa::generate();
 
     let dir = tempfile::tempdir().unwrap();
     let audit_path = dir.path().join("audit.jsonl");
     let audit_path_str = audit_path.to_str().unwrap();
 
-    // Use git_cgi_handler for a real git push test, but we can also test at
-    // the protocol level: a git-receive-pack POST with branch restriction
-    // should be blocked even in permissive mode.
-    //
-    // Instead of a full git push, we test via the filter + audit: a push rule
-    // with branch restrictions that doesn't match should still block.
-    // The key insight is that branch restriction failures come from
-    // AllowedWithBranchCheck, not FilterResult::Blocked, so permissive
-    // mode should not affect them.
+    // A push to a disallowed ref comes through AllowedWithBranchCheck (not
+    // FilterResult::Blocked). In permissive mode the proxy must behave as if it
+    // weren't there: forward the push to the upstream instead of returning a
+    // git-protocol rejection, while still recording a request_permitted audit
+    // entry that keeps the branch_restriction reason and the blocked refs.
 
-    let upstream = TestUpstream::builder(&ca, ok_handler("should not reach"))
+    let upstream = TestUpstream::builder(&ca, ok_handler("push-forwarded"))
         .report(&t, "git upstream")
         .start()
         .await;
@@ -247,7 +243,7 @@ async fn test_permissive_still_blocks_branch_restriction() {
     .await;
 
     // Simulate a git-receive-pack POST with a pkt-line pushing to refs/heads/main
-    // (which should be blocked by the branch restriction)
+    // (which would be blocked by the branch restriction in enforcing mode)
     let client = ReportingClient::new(&t, proxy.addr(), &ca);
 
     // Build a minimal pkt-line payload pushing to refs/heads/main
@@ -269,9 +265,14 @@ async fn test_permissive_still_blocks_branch_restriction() {
         )
         .await;
 
-    // Branch restriction should block with 200 (git protocol response), not 451
-    // The response is a git-protocol error, so status is 200
+    // The push is forwarded to the upstream, which returns 200 with its body.
     t.assert_eq("status", &resp.status().as_u16(), &200u16);
+    let resp_body = resp.text().await.unwrap();
+    t.assert_eq(
+        "upstream was reached",
+        &resp_body.as_str(),
+        &"push-forwarded",
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -280,12 +281,22 @@ async fn test_permissive_still_blocks_branch_restriction() {
     t.assert_eq(
         "event",
         &entries[0]["event"].as_str().unwrap(),
-        &"request_blocked",
+        &"request_permitted",
+    );
+    t.assert_eq(
+        "decision",
+        &entries[0]["decision"].as_str().unwrap(),
+        &"allowed",
     );
     t.assert_eq(
         "reason",
         &entries[0]["reason"].as_str().unwrap(),
         &"branch_restriction",
+    );
+    t.assert_eq(
+        "blocked ref recorded",
+        &entries[0]["git"]["blocked_refs"][0].as_str().unwrap(),
+        &"refs/heads/main",
     );
 
     proxy.shutdown();

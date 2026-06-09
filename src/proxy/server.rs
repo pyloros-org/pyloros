@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio_rustls::TlsAcceptor;
 
+use super::PermissiveState;
 use super::handler::ProxyHandler;
 use super::tunnel::TunnelHandler;
 use crate::approvals::{self, ApprovalManager};
@@ -618,8 +619,7 @@ impl ProxyServer {
                 .with_request_logging(log_allowed, log_blocked)
                 .with_auth(auth.clone())
                 .with_audit_logger(audit_logger.clone())
-                .with_permissive(permissive)
-                .with_approvals(approvals.clone())
+                .with_permissive_state(PermissiveState::new(permissive, approvals.clone()))
                 .with_max_body_log_size(max_body_log_size);
                 async move { handler.handle(req).await }
             });
