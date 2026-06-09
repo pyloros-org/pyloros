@@ -184,6 +184,43 @@ impl RequestLogger {
         }
     }
 
+    /// Emit a `RequestBlocked` audit entry (decision `Blocked`) with a specific
+    /// `reason`, for a block point that has decided to reject the request (branch
+    /// restriction, LFS op check, body-inspection-requires-HTTPS, unsupported
+    /// CONNECT port). Mirror of [`Self::log_permitted_with_reason`].
+    ///
+    /// The caller is responsible for any reason-specific `tracing` line — those
+    /// carry extra structured fields (blocked refs, allowed ops) that don't belong
+    /// in a generic helper.
+    pub fn log_blocked_with_reason(
+        &self,
+        ctx: &RequestContext<'_>,
+        reason: AuditReason,
+        git: Option<AuditGitInfo>,
+    ) {
+        self.emit_audit(AuditEntry {
+            timestamp: crate::audit::now_iso8601(),
+            event: AuditEvent::RequestBlocked,
+            method: ctx.method.to_string(),
+            url: ctx.url.to_string(),
+            host: ctx.host.to_string(),
+            scheme: ctx.scheme.to_string(),
+            protocol: ctx.protocol.to_string(),
+            decision: AuditDecision::Blocked,
+            reason,
+            credential: ctx.credential.clone(),
+            git,
+            request_body: None,
+            request_body_encoding: None,
+            response_body: None,
+            response_body_encoding: None,
+            body_truncated: None,
+            permissive_duration_secs: None,
+            permissive_source: None,
+            redirect_target: None,
+        });
+    }
+
     /// Emit a `RequestPermitted` audit entry (decision `Allowed`) for a block point
     /// that permissive mode is letting through — e.g. a branch-restricted push, an
     /// LFS op that fails the operation check, a plain-HTTP body that can't be

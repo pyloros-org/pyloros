@@ -218,27 +218,17 @@ impl ProxyHandler {
             // Enforcing mode: block — see SPEC.md "default-deny for unverifiable
             // restrictions".
             tracing::warn!(host = %host, port = %port, "Blocking CONNECT to unsupported port");
-            self.logger.emit_audit(AuditEntry {
-                timestamp: crate::audit::now_iso8601(),
-                event: AuditEvent::RequestBlocked,
-                method: "CONNECT".to_string(),
-                url: url.clone(),
-                host: host.clone(),
-                scheme: "unknown".to_string(),
-                protocol: "unknown".to_string(),
-                decision: AuditDecision::Blocked,
-                reason: AuditReason::UnsupportedConnectPort,
+            let ctx = RequestContext {
+                method: "CONNECT",
+                url: &url,
+                host: &host,
+                scheme: "unknown",
+                protocol: "unknown",
                 credential: None,
-                git: None,
-                request_body: None,
-                request_body_encoding: None,
-                response_body: None,
-                response_body_encoding: None,
-                body_truncated: None,
-                permissive_duration_secs: None,
-                permissive_source: None,
-                redirect_target: None,
-            });
+                label: "",
+            };
+            self.logger
+                .log_blocked_with_reason(&ctx, AuditReason::UnsupportedConnectPort, None);
             return Ok(blocked_response("CONNECT", &url));
         }
 
@@ -357,27 +347,11 @@ impl ProxyHandler {
                             "BLOCKED (HTTP: body inspection requires HTTPS)"
                         );
                     }
-                    self.logger.emit_audit(AuditEntry {
-                        timestamp: crate::audit::now_iso8601(),
-                        event: AuditEvent::RequestBlocked,
-                        method: method.clone(),
-                        url: full_url.clone(),
-                        host: host.clone(),
-                        scheme: scheme.to_string(),
-                        protocol: "http".to_string(),
-                        decision: AuditDecision::Blocked,
-                        reason: AuditReason::BodyInspectionRequiresHttps,
-                        credential: None,
-                        git: None,
-                        request_body: None,
-                        request_body_encoding: None,
-                        response_body: None,
-                        response_body_encoding: None,
-                        body_truncated: None,
-                        permissive_duration_secs: None,
-                        permissive_source: None,
-                        redirect_target: None,
-                    });
+                    self.logger.log_blocked_with_reason(
+                        &ctx,
+                        AuditReason::BodyInspectionRequiresHttps,
+                        None,
+                    );
                     return Ok(blocked_response(&method, &full_url));
                 }
             }

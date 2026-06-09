@@ -494,29 +494,13 @@ impl TunnelHandler {
                                 "BLOCKED (branch restriction)"
                             );
                         }
-                        self.logger.emit_audit(AuditEntry {
-                            timestamp: crate::audit::now_iso8601(),
-                            event: AuditEvent::RequestBlocked,
-                            method: method.clone(),
-                            url: full_url.clone(),
-                            host: host.to_string(),
-                            scheme: "https".to_string(),
-                            protocol: "https".to_string(),
-                            decision: AuditDecision::Blocked,
-                            reason: AuditReason::BranchRestriction,
-                            credential: None,
-                            git: Some(AuditGitInfo {
+                        self.logger.log_blocked_with_reason(
+                            &ctx,
+                            AuditReason::BranchRestriction,
+                            Some(AuditGitInfo {
                                 blocked_refs: blocked.clone(),
                             }),
-                            request_body: None,
-                            request_body_encoding: None,
-                            response_body: None,
-                            response_body_encoding: None,
-                            body_truncated: None,
-                            permissive_duration_secs: None,
-                            permissive_source: None,
-                            redirect_target: None,
-                        });
+                        );
                         return Ok(git_blocked_push_response(&body_bytes, &blocked));
                     }
                 } else {
@@ -606,27 +590,11 @@ impl TunnelHandler {
                                 "BLOCKED (LFS operation not allowed)"
                             );
                         }
-                        self.logger.emit_audit(AuditEntry {
-                            timestamp: crate::audit::now_iso8601(),
-                            event: AuditEvent::RequestBlocked,
-                            method: method.clone(),
-                            url: full_url.clone(),
-                            host: host.to_string(),
-                            scheme: "https".to_string(),
-                            protocol: "https".to_string(),
-                            decision: AuditDecision::Blocked,
-                            reason: AuditReason::LfsOperationNotAllowed,
-                            credential: None,
-                            git: None,
-                            request_body: None,
-                            request_body_encoding: None,
-                            response_body: None,
-                            response_body_encoding: None,
-                            body_truncated: None,
-                            permissive_duration_secs: None,
-                            permissive_source: None,
-                            redirect_target: None,
-                        });
+                        self.logger.log_blocked_with_reason(
+                            &ctx,
+                            AuditReason::LfsOperationNotAllowed,
+                            None,
+                        );
                         return Ok(blocked_response(&method, &full_url));
                     }
                 } else {
