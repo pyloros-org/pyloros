@@ -182,10 +182,7 @@ impl ProxyHandler {
                 label: " (blind tunnel)",
             };
             if self.permissive.is_active() {
-                // Permissive mode behaves as if there were no proxy: we can't MITM
-                // this port, so blind-tunnel raw TCP bytes through. We still record a
-                // request_permitted audit entry (with the unsupported_connect_port
-                // reason) so the traffic remains visible.
+                // Permissive: can't MITM this port, so blind-tunnel raw bytes (still audited).
                 self.logger.log_permitted_with_reason(
                     &ctx,
                     AuditReason::UnsupportedConnectPort,
@@ -315,16 +312,10 @@ impl ProxyHandler {
             }
             FilterResult::AllowedWithBranchCheck { .. }
             | FilterResult::AllowedWithLfsCheck { .. } => {
-                // Git rules with branch restrictions or LFS operation checks
-                // require body inspection. We only implement that on the HTTPS
-                // tunnel path — by choice, not necessity (we could buffer and
-                // inspect a plain-HTTP body too). Enforcing mode therefore blocks
-                // plain HTTP (default-deny for unverifiable restrictions).
+                // Branch/LFS body inspection is only wired on the HTTPS tunnel path
+                // (by choice, not necessity), so enforcing mode default-denies plain HTTP.
                 if self.permissive.is_active() {
-                    // Permissive mode behaves as if there were no proxy: forward
-                    // the request unconditionally instead of blocking. We retain the
-                    // `body_inspection_requires_https` reason so the audit log shows
-                    // why it would otherwise have been blocked.
+                    // Permissive: forward instead of block (reason retained for the audit trail).
                     self.logger.log_permitted_with_reason(
                         &ctx,
                         AuditReason::BodyInspectionRequiresHttps,

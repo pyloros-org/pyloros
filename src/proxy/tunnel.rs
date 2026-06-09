@@ -231,13 +231,9 @@ impl TunnelHandler {
         Ok(())
     }
 
-    /// Run a blind raw-TCP tunnel on an upgraded CONNECT connection.
-    ///
-    /// Used only in permissive mode for CONNECT requests to ports we can't MITM
-    /// (anything other than 443/80). Since we can't inspect the traffic, we behave
-    /// as if there were no proxy: copy bytes verbatim in both directions between the
-    /// client and the upstream `host:port`. No TLS, no filtering, no credential
-    /// injection. Honors the upstream host/port overrides used elsewhere for testing.
+    /// Blindly copy raw TCP bytes between the client and upstream `host:port` — no
+    /// TLS/filtering/credentials. Permissive-mode fallback for CONNECT ports we
+    /// can't MITM (≠ 443/80). Honors the upstream host/port test overrides.
     pub async fn run_blind_tunnel(
         self: &Arc<Self>,
         upgraded: hyper::upgrade::Upgraded,
@@ -470,10 +466,7 @@ impl TunnelHandler {
                     })?
                     .to_bytes();
 
-                // When a push targets a disallowed ref we normally reject it with a
-                // git-protocol error. In permissive mode we behave as if there were no
-                // proxy and forward the push anyway, emitting a request_permitted audit
-                // entry that keeps the branch_restriction reason and the blocked refs.
+                // Disallowed ref: reject with a git-protocol error, or (permissive) forward anyway.
                 let blocked = pktline::blocked_refs_with_filter(&body_bytes, filter);
                 let branch_permitted_override = if !blocked.is_empty() {
                     if self.permissive.is_active() {
@@ -521,8 +514,7 @@ impl TunnelHandler {
                 );
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
-                // When we already emitted the permitted entry, skip the body-log path
-                // and the normal allowed audit so we don't write a duplicate record.
+                // permitted entry already emitted above; don't double-log via the allowed path.
                 if log_body && !branch_permitted_override {
                     return self
                         .forward_buffered_with_body_log(
@@ -568,10 +560,7 @@ impl TunnelHandler {
                     })?
                     .to_bytes();
 
-                // When the operation isn't in the allow-list we normally block. In
-                // permissive mode we behave as if there were no proxy and forward the
-                // batch anyway, emitting a request_permitted audit entry that keeps the
-                // lfs_operation_not_allowed reason so the trail stays greppable.
+                // Op not in allow-list: block, or (permissive) forward the batch anyway.
                 let lfs_permitted_override = if !lfs::check_lfs_operation(&body_bytes, allowed_ops)
                 {
                     if self.permissive.is_active() {
@@ -608,8 +597,7 @@ impl TunnelHandler {
                 };
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
-                // Skip the normal allowed/body-log audit when we already emitted the
-                // permitted entry above, to avoid a duplicate audit record.
+                // permitted entry already emitted above; don't double-log via the allowed path.
                 if !log_body && !lfs_permitted_override {
                     self.logger.log_allowed(&allowed_ctx);
                 }
