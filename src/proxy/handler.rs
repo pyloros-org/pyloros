@@ -170,20 +170,22 @@ impl ProxyHandler {
         // are opaque to us, so we cannot apply filter rules.
         if port != 443 && port != 80 {
             let url = format!("{}:{}", host, port);
+            // Shared by both the permissive (blind-tunnel) and enforcing (block)
+            // branches below; `label` is only consumed by the permitted trace line.
+            let ctx = RequestContext {
+                method: "CONNECT",
+                url: &url,
+                host: &host,
+                scheme: "unknown",
+                protocol: "unknown",
+                credential: None,
+                label: " (blind tunnel)",
+            };
             if self.permissive.is_active() {
                 // Permissive mode behaves as if there were no proxy: we can't MITM
                 // this port, so blind-tunnel raw TCP bytes through. We still record a
                 // request_permitted audit entry (with the unsupported_connect_port
                 // reason) so the traffic remains visible.
-                let ctx = RequestContext {
-                    method: "CONNECT",
-                    url: &url,
-                    host: &host,
-                    scheme: "unknown",
-                    protocol: "unknown",
-                    credential: None,
-                    label: " (blind tunnel)",
-                };
                 self.logger.log_permitted_with_reason(
                     &ctx,
                     AuditReason::UnsupportedConnectPort,
@@ -218,15 +220,6 @@ impl ProxyHandler {
             // Enforcing mode: block — see SPEC.md "default-deny for unverifiable
             // restrictions".
             tracing::warn!(host = %host, port = %port, "Blocking CONNECT to unsupported port");
-            let ctx = RequestContext {
-                method: "CONNECT",
-                url: &url,
-                host: &host,
-                scheme: "unknown",
-                protocol: "unknown",
-                credential: None,
-                label: "",
-            };
             self.logger
                 .log_blocked_with_reason(&ctx, AuditReason::UnsupportedConnectPort, None);
             return Ok(blocked_response("CONNECT", &url));
