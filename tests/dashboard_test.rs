@@ -355,6 +355,61 @@ async fn test_rules_suggest_git_upload_pack_emits_git_fetch_rule() {
     );
 }
 
+/// /rules/suggest for a smart-HTTP discovery request (`/info/refs?service=...`)
+/// strips both the query string and the `/info/refs` path segment, leaving the
+/// bare repo URL — not `.../info/refs`. Regression test for a bug where the
+/// suffix was only stripped when no query string was present.
+#[tokio::test]
+async fn test_rules_suggest_info_refs_query_strips_to_repo_url() {
+    let t = test_report!("/rules/suggest strips /info/refs?service=... down to the repo URL");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("ok"))
+        .report(&t, "ok")
+        .start()
+        .await;
+    let (proxy, _rules_file, _audit_file) = start_proxy(&t, &ca, upstream.port()).await;
+    let dashboard = format!("http://{}", proxy.dashboard_addr.unwrap());
+    let http = http_client();
+
+    let entry = json!({
+        "timestamp": "2026-05-31T00:00:00Z",
+        "event": "request_blocked",
+        "method": "GET",
+        "url": "https://github.com/lewis6991/gitsigns.nvim/info/refs?service=git-upload-pack",
+        "host": "github.com",
+        "scheme": "https",
+        "protocol": "https",
+        "decision": "blocked",
+        "reason": "no_matching_rule",
+    });
+    let (s, body) = json_post(
+        &http,
+        format!("{}/rules/suggest", dashboard),
+        json!({"audit": entry}),
+    )
+    .await;
+    t.assert_eq("status", &s, &200u16);
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    let toml_text = parsed["toml"].as_str().unwrap().to_string();
+    t.assert_contains("git=fetch present", toml_text.as_str(), "git = \"fetch\"");
+    t.assert_contains(
+        "repo URL stripped to bare repo",
+        toml_text.as_str(),
+        "url = \"https://github.com/lewis6991/gitsigns.nvim\"",
+    );
+    t.assert_not_contains(
+        "no info/refs path in suggestion",
+        toml_text.as_str(),
+        "info/refs",
+    );
+    t.assert_not_contains(
+        "no query string in suggestion",
+        toml_text.as_str(),
+        "service=",
+    );
+}
+
 /// /rules/suggest with reason=branch_restriction includes a commented
 /// `branches = [...]` line populated with the audit entry's blocked refs.
 #[tokio::test]

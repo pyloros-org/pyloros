@@ -168,18 +168,20 @@ fn detect_git_op(url: &str, reason: &AuditReason) -> Option<&'static str> {
 }
 
 fn strip_git_suffix(url: &str) -> &str {
+    // Strip the query string first so suffix matching works for endpoints
+    // like `/info/refs?service=git-upload-pack`.
+    let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
     for suffix in [
         "/git-upload-pack",
         "/git-receive-pack",
         "/info/refs",
         "/info/lfs/objects/batch",
     ] {
-        if let Some(prefix) = url.strip_suffix(suffix) {
+        if let Some(prefix) = path.strip_suffix(suffix) {
             return prefix;
         }
     }
-    // Strip query string if any.
-    url.split_once('?').map(|(p, _)| p).unwrap_or(url)
+    path
 }
 
 fn host_wildcard_for(url: &str) -> String {
