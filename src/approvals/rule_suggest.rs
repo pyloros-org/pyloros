@@ -213,3 +213,125 @@ fn comment_block(toml_block: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Rule;
+    use crate::filter::{FilterEngine, RequestInfo};
+    use pyloros_test_support::test_report;
+
+    /// A blocked request plus the suggestion inputs derived from it. The
+    /// suggester only reads `method`, `url`, and `reason`; the request
+    /// fields below describe the *same* HTTP request, decomposed so we can
+    /// replay it against a FilterEngine built from the suggestion.
+    struct Case {
+        label: &'static str,
+        method: &'static str,
+        url: &'static str,
+        reason: &'static str,
+        // The original request, decomposed for RequestInfo::http.
+        req_path: &'static str,
+        req_query: Option<&'static str>,
+    }
+
+    /// Build an `AuditEntrySnapshot` via the same JSON wire format the
+    /// dashboard posts, so the test stays robust against enum renames.
+    fn snapshot(c: &Case) -> AuditEntrySnapshot {
+        serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "event": "request_blocked",
+            "method": c.method,
+            "url": c.url,
+            "host": "github.com",
+            "scheme": "https",
+            "protocol": "https",
+            "decision": "blocked",
+            "reason": c.reason,
+        }))
+        .expect("audit snapshot json should deserialize")
+    }
+
+    /// Parse the *active* (uncommented) `[[rules]]` blocks from a
+    /// suggestion's TOML text. The broader host-wildcard variant and any
+    /// branch hints are emitted as `#` comments, which the TOML parser
+    /// ignores — so this yields exactly the rule the user would apply.
+    fn parse_active_rules(toml_text: &str) -> Vec<Rule> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            rules: Vec<Rule>,
+        }
+        toml::from_str::<Wrapper>(toml_text)
+            .expect("suggestion TOML should parse")
+            .rules
+    }
+
+    /// Property: whatever rule the suggester proposes for a blocked
+    /// request, applying that rule must actually *allow* the original
+    /// request. Instantiated over the smart-HTTP discovery form (the bug),
+    /// the verb-pack POSTs, and a plain-HTTP request.
+    #[test]
+    fn test_suggested_rule_matches_original_request() {
+        let t = test_report!("Suggested rule allows the request that triggered it");
+
+        let cases = [
+            Case {
+                label: "git fetch discovery (info/refs?service=git-upload-pack)",
+                method: "GET",
+                url: "https://github.com/lewis6991/gitsigns.nvim/info/refs?service=git-upload-pack",
+                reason: "no_matching_rule",
+                req_path: "/lewis6991/gitsigns.nvim/info/refs",
+                req_query: Some("service=git-upload-pack"),
+            },
+            Case {
+                label: "git fetch verb pack (git-upload-pack)",
+                method: "POST",
+                url: "https://github.com/org/repo.git/git-upload-pack",
+                reason: "no_matching_rule",
+                req_path: "/org/repo.git/git-upload-pack",
+                req_query: None,
+            },
+            Case {
+                label: "git push verb pack (git-receive-pack)",
+                method: "POST",
+                url: "https://github.com/org/repo.git/git-receive-pack",
+                reason: "no_matching_rule",
+                req_path: "/org/repo.git/git-receive-pack",
+                req_query: None,
+            },
+            Case {
+                label: "plain HTTP request",
+                method: "GET",
+                url: "https://github.com/org/repo/raw/main/README.md",
+                reason: "no_matching_rule",
+                req_path: "/org/repo/raw/main/README.md",
+                req_query: None,
+            },
+        ];
+
+        for c in &cases {
+            let toml_text = suggest_for_audit_snapshot(&snapshot(c));
+            let rules = parse_active_rules(&toml_text);
+            t.assert_true(
+                &format!("{}: suggestion has an active rule", c.label),
+                !rules.is_empty(),
+            );
+
+            let engine = FilterEngine::new(rules)
+                .unwrap_or_else(|e| panic!("{}: engine build failed: {e}", c.label));
+            let req = RequestInfo::http(
+                c.method,
+                "https",
+                "github.com",
+                None,
+                c.req_path,
+                c.req_query,
+            );
+            t.assert_true(
+                &format!("{}: suggested rule allows the original request", c.label),
+                engine.is_allowed(&req),
+            );
+        }
+    }
+}
