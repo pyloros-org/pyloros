@@ -30,17 +30,18 @@ pub fn format_rule_toml(rule: &Rule) -> String {
 }
 
 /// Parse a `[[rules]]` table-array (or a single bare rule table) into
-/// `Rule` values — the inverse of [`format_rules_toml`]. Commented lines
-/// (e.g. the broader variant `suggest_*` emits) are ignored by the TOML
-/// parser, so feeding a whole suggestion yields just its active rule.
-/// Does not validate; callers needing it call [`Rule::validate`].
+/// `Rule` values. Commented lines (e.g. the broader variant `suggest_*`
+/// emits) are ignored by the TOML parser, so feeding a whole suggestion
+/// yields just its active rule. Does not validate; callers needing it
+/// call [`Rule::validate`].
 pub fn parse_rules_toml(toml_text: &str) -> std::result::Result<Vec<Rule>, toml::de::Error> {
     #[derive(serde::Deserialize)]
     struct RulesWrapper {
         #[serde(default)]
         rules: Vec<Rule>,
     }
-    // Try the table-array form first, then fall back to a bare table.
+    // A bare rule table also parses as a wrapper with zero rules, so the
+    // non-empty guard is what makes the bare-table fallback reachable.
     match toml::from_str::<RulesWrapper>(toml_text) {
         Ok(w) if !w.rules.is_empty() => Ok(w.rules),
         _ => toml::from_str::<Rule>(toml_text).map(|r| vec![r]),
