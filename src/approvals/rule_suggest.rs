@@ -279,9 +279,9 @@ mod tests {
             Case {
                 label: "git fetch discovery (info/refs?service=git-upload-pack)",
                 method: "GET",
-                url: "https://github.com/lewis6991/gitsigns.nvim/info/refs?service=git-upload-pack",
+                url: "https://github.com/octocat/hello-world/info/refs?service=git-upload-pack",
                 reason: "no_matching_rule",
-                req_path: "/lewis6991/gitsigns.nvim/info/refs",
+                req_path: "/octocat/hello-world/info/refs",
                 req_query: Some("service=git-upload-pack"),
             },
             Case {

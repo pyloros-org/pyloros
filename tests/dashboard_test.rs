@@ -376,7 +376,7 @@ async fn test_rules_suggest_info_refs_query_strips_to_repo_url() {
         "timestamp": "2026-05-31T00:00:00Z",
         "event": "request_blocked",
         "method": "GET",
-        "url": "https://github.com/lewis6991/gitsigns.nvim/info/refs?service=git-upload-pack",
+        "url": "https://github.com/octocat/hello-world/info/refs?service=git-upload-pack",
         "host": "github.com",
         "scheme": "https",
         "protocol": "https",
@@ -396,7 +396,7 @@ async fn test_rules_suggest_info_refs_query_strips_to_repo_url() {
     t.assert_contains(
         "repo URL stripped to bare repo",
         toml_text.as_str(),
-        "url = \"https://github.com/lewis6991/gitsigns.nvim\"",
+        "url = \"https://github.com/octocat/hello-world\"",
     );
     t.assert_not_contains(
         "no info/refs path in suggestion",
