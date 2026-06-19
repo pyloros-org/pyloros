@@ -29,6 +29,24 @@ pub fn format_rule_toml(rule: &Rule) -> String {
     format_rules_toml(std::slice::from_ref(rule))
 }
 
+/// Parse a `[[rules]]` table-array (or a single bare rule table) into
+/// `Rule` values — the inverse of [`format_rules_toml`]. Commented lines
+/// (e.g. the broader variant `suggest_*` emits) are ignored by the TOML
+/// parser, so feeding a whole suggestion yields just its active rule.
+/// Does not validate; callers needing it call [`Rule::validate`].
+pub fn parse_rules_toml(toml_text: &str) -> std::result::Result<Vec<Rule>, toml::de::Error> {
+    #[derive(serde::Deserialize)]
+    struct RulesWrapper {
+        #[serde(default)]
+        rules: Vec<Rule>,
+    }
+    // Try the table-array form first, then fall back to a bare table.
+    match toml::from_str::<RulesWrapper>(toml_text) {
+        Ok(w) if !w.rules.is_empty() => Ok(w.rules),
+        _ => toml::from_str::<Rule>(toml_text).map(|r| vec![r]),
+    }
+}
+
 /// Suggest TOML for a "create rule from blocked request" flow given a
 /// recent blocked audit entry. Emits an exact-match `[[rules]]` block
 /// plus a commented broader host-wildcard variant. For git-shaped
@@ -217,7 +235,6 @@ fn comment_block(toml_block: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Rule;
     use crate::filter::{FilterEngine, RequestInfo};
     use pyloros_test_support::test_report;
 
@@ -243,21 +260,6 @@ mod tests {
             "reason": c.reason,
         }))
         .expect("audit snapshot json should deserialize")
-    }
-
-    /// Parse the *active* (uncommented) `[[rules]]` blocks from a
-    /// suggestion's TOML text. The broader host-wildcard variant and any
-    /// branch hints are emitted as `#` comments, which the TOML parser
-    /// ignores — so this yields exactly the rule the user would apply.
-    fn parse_active_rules(toml_text: &str) -> Vec<Rule> {
-        #[derive(serde::Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            rules: Vec<Rule>,
-        }
-        toml::from_str::<Wrapper>(toml_text)
-            .expect("suggestion TOML should parse")
-            .rules
     }
 
     /// Property: a rule the suggester proposes for a blocked request must,
@@ -303,7 +305,7 @@ mod tests {
 
         for c in &cases {
             let toml_text = suggest_for_audit_snapshot(&snapshot(c));
-            let rules = parse_active_rules(&toml_text);
+            let rules = parse_rules_toml(&toml_text).expect("suggestion TOML should parse");
             t.assert_true(
                 &format!("{}: suggestion has an active rule", c.label),
                 !rules.is_empty(),
