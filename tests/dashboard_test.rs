@@ -355,10 +355,8 @@ async fn test_rules_suggest_git_upload_pack_emits_git_fetch_rule() {
     );
 }
 
-/// /rules/suggest for a smart-HTTP discovery request (`/info/refs?service=...`)
-/// strips both the query string and the `/info/refs` path segment, leaving the
-/// bare repo URL — not `.../info/refs`. Regression test for a bug where the
-/// suffix was only stripped when no query string was present.
+/// /rules/suggest strips a `/info/refs?service=...` discovery URL down to the
+/// bare repo URL, not `.../info/refs` (regression: query string broke suffix stripping).
 #[tokio::test]
 async fn test_rules_suggest_info_refs_query_strips_to_repo_url() {
     let t = test_report!("/rules/suggest strips /info/refs?service=... down to the repo URL");

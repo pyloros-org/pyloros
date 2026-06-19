@@ -221,22 +221,15 @@ mod tests {
     use crate::filter::{FilterEngine, RequestInfo};
     use pyloros_test_support::test_report;
 
-    /// A blocked request plus the suggestion inputs derived from it. The
-    /// suggester only reads `method`, `url`, and `reason`; the request
-    /// fields below describe the *same* HTTP request, decomposed so we can
-    /// replay it against a FilterEngine built from the suggestion.
     struct Case {
         label: &'static str,
         method: &'static str,
         url: &'static str,
         reason: &'static str,
-        // The original request, decomposed for RequestInfo::http.
         req_path: &'static str,
         req_query: Option<&'static str>,
     }
 
-    /// Build an `AuditEntrySnapshot` via the same JSON wire format the
-    /// dashboard posts, so the test stays robust against enum renames.
     fn snapshot(c: &Case) -> AuditEntrySnapshot {
         serde_json::from_value(serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z",
@@ -267,10 +260,8 @@ mod tests {
             .rules
     }
 
-    /// Property: whatever rule the suggester proposes for a blocked
-    /// request, applying that rule must actually *allow* the original
-    /// request. Instantiated over the smart-HTTP discovery form (the bug),
-    /// the verb-pack POSTs, and a plain-HTTP request.
+    /// Property: a rule the suggester proposes for a blocked request must,
+    /// when applied, actually allow that request.
     #[test]
     fn test_suggested_rule_matches_original_request() {
         let t = test_report!("Suggested rule allows the request that triggered it");
