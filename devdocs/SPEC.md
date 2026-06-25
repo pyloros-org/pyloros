@@ -383,7 +383,7 @@ subcommands:
 
 ### Permissive Mode
 
-When deploying pyloros for the first time, operators may not know what rules they need. Permissive mode provides a "learning" phase where unmatched requests are allowed through but logged distinctly, so operators can discover traffic patterns and build rules from the audit log. Named after SELinux's permissive mode.
+When deploying pyloros for the first time, operators may not know what rules they need. Permissive mode provides a "learning" phase where traffic flows **as if there were no proxy at all** — nothing is blocked for a traffic-filtering reason — but everything is logged distinctly, so operators can discover traffic patterns and build rules from the audit log. Named after SELinux's permissive mode.
 
 - Enabled via `permissive = true` in `[proxy]` (default: `false`), or temporarily
   via the dashboard's `POST /permissive {duration_secs}` endpoint (default
@@ -391,9 +391,22 @@ When deploying pyloros for the first time, operators may not know what rules the
   override auto-expires and emits `permissive_enabled` and `permissive_disabled`
   audit entries (the latter with `permissive_source` of `dashboard_clear` or
   `expired`) so toggles are traceable
-- Only converts `FilterResult::Blocked` (no matching rule) to allow-through
-- All other block reasons (branch restriction, LFS check, body-inspection-requires-HTTPS, unsupported CONNECT port, auth failure) still block — those represent matched rules with failed constraints
-- Permitted requests emit a distinct audit event `"request_permitted"` with `decision: "allowed"`, `reason: "no_matching_rule"` — easy to grep, distinct from `"request_allowed"` (which means a rule matched)
+- **No request is blocked for any traffic-filtering reason.** This converts to
+  allow-through not just `FilterResult::Blocked` (no matching rule) but every other
+  filtering block point: branch-restriction failures, LFS-operation-check failures,
+  the body-inspection-requires-HTTPS block (plain-HTTP git/LFS bodies are forwarded
+  unconditionally), and unsupported CONNECT ports — which are **blind-tunneled** as
+  raw TCP (no MITM, no inspection) instead of being refused
+- **The one exception that still blocks is proxy authentication** (`auth_failure`).
+  Auth is access control to the proxy front door, not traffic filtering: a client
+  that fails proxy auth still receives `407` so a misconfiguration is surfaced rather
+  than silently opening the proxy during a learning window
+- Permitted requests emit a distinct audit event `"request_permitted"` with
+  `decision: "allowed"`. Pass-throughs at the `FilterResult::Blocked` point use
+  `reason: "no_matching_rule"`; pass-throughs at the other block points retain their
+  specific reason (`branch_restriction`, `lfs_operation_not_allowed`,
+  `body_inspection_requires_https`, `unsupported_connect_port`) so the audit trail
+  stays greppable and shows *why it would have been blocked*
 - Permitted requests ALWAYS emit a tracing log line (regardless of `log_allowed_requests`/`log_blocked_requests`) since the point is visibility
 - Requests matching an explicit rule are logged normally as `"request_allowed"`
 

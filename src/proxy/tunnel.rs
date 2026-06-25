@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::response::{blocked_response, error_response, git_blocked_push_response};
-use super::{RequestContext, RequestLogger};
+use super::{PermissiveState, RequestContext, RequestLogger};
 use crate::approvals::{self, ApprovalManager};
 use crate::audit::{
     AuditCredential, AuditDecision, AuditEntry, AuditEvent, AuditGitInfo, AuditLogger, AuditReason,
@@ -47,6 +47,7 @@ pub struct TunnelHandler {
     upstream_host_override: Option<String>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
     logger: RequestLogger,
+    permissive: PermissiveState,
     max_body_log_size: usize,
     /// Approvals manager — `Some` when the `[approvals]` section is set in
     /// config; `None` means the feature is disabled and the agent API
@@ -70,6 +71,7 @@ impl TunnelHandler {
             upstream_host_override: None,
             upstream_tls_config: None,
             logger: RequestLogger::new(),
+            permissive: PermissiveState::default(),
             max_body_log_size: 1_048_576,
             approvals: None,
         }
@@ -79,9 +81,9 @@ impl TunnelHandler {
     /// `https://pyloros.internal/` are routed to the agent API handler
     /// instead of being treated as a normal upstream host.
     pub fn with_approvals(mut self, manager: Arc<ApprovalManager>) -> Self {
-        // Also wire into the logger so dashboard-controlled permissive
-        // overrides take effect on HTTPS requests too.
-        self.logger = self.logger.with_approvals(Some(Arc::clone(&manager)));
+        // Also feed the permissive state so dashboard-controlled overrides take
+        // effect on HTTPS requests too.
+        self.permissive.set_approvals(Some(Arc::clone(&manager)));
         self.approvals = Some(manager);
         self
     }
@@ -119,7 +121,7 @@ impl TunnelHandler {
 
     /// Enable permissive mode (allow unmatched requests through with logging).
     pub fn with_permissive(mut self, permissive: bool) -> Self {
-        self.logger = self.logger.with_permissive(permissive);
+        self.permissive.set_base(permissive);
         self
     }
 
@@ -229,6 +231,36 @@ impl TunnelHandler {
         Ok(())
     }
 
+    /// Blindly copy raw TCP bytes between the client and upstream `host:port` — no
+    /// TLS/filtering/credentials. Permissive-mode fallback for CONNECT ports we
+    /// can't MITM (≠ 443/80). Honors the upstream host/port test overrides.
+    pub async fn run_blind_tunnel(
+        self: &Arc<Self>,
+        upgraded: hyper::upgrade::Upgraded,
+        host: &str,
+        port: u16,
+    ) -> Result<()> {
+        let connect_port = self.upstream_port_override.unwrap_or(port);
+        let connect_host = self
+            .upstream_host_override
+            .as_deref()
+            .unwrap_or(host)
+            .to_string();
+        let addr = format!("{}:{}", connect_host, connect_port);
+        let mut upstream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| Error::proxy(format!("Failed to connect to {}: {}", addr, e)))?;
+
+        let mut client_io = TokioIo::new(upgraded);
+        if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await {
+            let err_str = e.to_string();
+            if !err_str.contains("connection closed") && !err_str.contains("early eof") {
+                tracing::debug!(host = %host, port = %port, error = %e, "Blind tunnel ended");
+            }
+        }
+        Ok(())
+    }
+
     /// Serve HTTP requests over an established TLS connection.
     ///
     /// Shared by CONNECT tunnel (after MITM handshake) and direct HTTPS listener
@@ -331,8 +363,7 @@ impl TunnelHandler {
                     self_arc.logger.log_blocked_requests,
                 )
                 .with_audit_logger(self_arc.logger.audit_logger.clone())
-                .with_permissive(self_arc.logger.permissive_base)
-                .with_approvals(self_arc.logger.approvals.clone())
+                .with_permissive_state(self_arc.permissive.clone())
                 .with_max_body_log_size(self_arc.max_body_log_size);
                 handler.handle_http(req).await
             }
@@ -405,7 +436,7 @@ impl TunnelHandler {
         // (origin rule's patterns, so chains extend recursively).
         let redirect_patterns: Option<Arc<Vec<UrlPattern>>> = match filter_result {
             FilterResult::Blocked => {
-                if let Some(resp) = self.logger.log_blocked(&ctx) {
+                if let Some(resp) = self.logger.log_blocked(&ctx, self.permissive.is_active()) {
                     return Ok(resp);
                 }
                 None
@@ -435,43 +466,41 @@ impl TunnelHandler {
                     })?
                     .to_bytes();
 
+                // Disallowed ref: reject with a git-protocol error, or (permissive) forward anyway.
                 let blocked = pktline::blocked_refs_with_filter(&body_bytes, filter);
-                if !blocked.is_empty() {
-                    if self.logger.log_blocked_requests {
-                        tracing::warn!(
-                            method = %method,
-                            url = %full_url,
-                            blocked_refs = ?blocked,
-                            "BLOCKED (branch restriction)"
+                let branch_permitted_override = if !blocked.is_empty() {
+                    if self.permissive.is_active() {
+                        self.logger.log_permitted_with_reason(
+                            &ctx,
+                            AuditReason::BranchRestriction,
+                            Some(AuditGitInfo {
+                                blocked_refs: blocked.clone(),
+                            }),
                         );
+                        true
+                    } else {
+                        if self.logger.log_blocked_requests {
+                            tracing::warn!(
+                                method = %method,
+                                url = %full_url,
+                                blocked_refs = ?blocked,
+                                "BLOCKED (branch restriction)"
+                            );
+                        }
+                        self.logger.log_blocked_with_reason(
+                            &ctx,
+                            AuditReason::BranchRestriction,
+                            Some(AuditGitInfo {
+                                blocked_refs: blocked.clone(),
+                            }),
+                        );
+                        return Ok(git_blocked_push_response(&body_bytes, &blocked));
                     }
-                    self.logger.emit_audit(AuditEntry {
-                        timestamp: crate::audit::now_iso8601(),
-                        event: AuditEvent::RequestBlocked,
-                        method: method.clone(),
-                        url: full_url.clone(),
-                        host: host.to_string(),
-                        scheme: "https".to_string(),
-                        protocol: "https".to_string(),
-                        decision: AuditDecision::Blocked,
-                        reason: AuditReason::BranchRestriction,
-                        credential: None,
-                        git: Some(AuditGitInfo {
-                            blocked_refs: blocked.clone(),
-                        }),
-                        request_body: None,
-                        request_body_encoding: None,
-                        response_body: None,
-                        response_body_encoding: None,
-                        body_truncated: None,
-                        permissive_duration_secs: None,
-                        permissive_source: None,
-                        redirect_target: None,
-                    });
-                    return Ok(git_blocked_push_response(&body_bytes, &blocked));
-                }
+                } else {
+                    false
+                };
 
-                // Allowed after branch check
+                // Allowed after branch check (or permitted through in permissive mode)
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
@@ -485,7 +514,8 @@ impl TunnelHandler {
                 );
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
-                if log_body {
+                // permitted entry already emitted above; don't double-log via the allowed path.
+                if log_body && !branch_permitted_override {
                     return self
                         .forward_buffered_with_body_log(
                             parts,
@@ -500,7 +530,9 @@ impl TunnelHandler {
                         .await;
                 }
 
-                self.logger.log_allowed(&allowed_ctx);
+                if !branch_permitted_override {
+                    self.logger.log_allowed(&allowed_ctx);
+                }
                 return self
                     .forward_buffered(parts, body_bytes, host, port, &method, &full_url, rp)
                     .await;
@@ -528,47 +560,45 @@ impl TunnelHandler {
                     })?
                     .to_bytes();
 
-                if !lfs::check_lfs_operation(&body_bytes, allowed_ops) {
-                    if self.logger.log_blocked_requests {
-                        tracing::warn!(
-                            method = %method,
-                            url = %full_url,
-                            allowed_ops = ?allowed_ops,
-                            "BLOCKED (LFS operation not allowed)"
+                // Op not in allow-list: block, or (permissive) forward the batch anyway.
+                let lfs_permitted_override = if !lfs::check_lfs_operation(&body_bytes, allowed_ops)
+                {
+                    if self.permissive.is_active() {
+                        self.logger.log_permitted_with_reason(
+                            &ctx,
+                            AuditReason::LfsOperationNotAllowed,
+                            None,
                         );
+                        true
+                    } else {
+                        if self.logger.log_blocked_requests {
+                            tracing::warn!(
+                                method = %method,
+                                url = %full_url,
+                                allowed_ops = ?allowed_ops,
+                                "BLOCKED (LFS operation not allowed)"
+                            );
+                        }
+                        self.logger.log_blocked_with_reason(
+                            &ctx,
+                            AuditReason::LfsOperationNotAllowed,
+                            None,
+                        );
+                        return Ok(blocked_response(&method, &full_url));
                     }
-                    self.logger.emit_audit(AuditEntry {
-                        timestamp: crate::audit::now_iso8601(),
-                        event: AuditEvent::RequestBlocked,
-                        method: method.clone(),
-                        url: full_url.clone(),
-                        host: host.to_string(),
-                        scheme: "https".to_string(),
-                        protocol: "https".to_string(),
-                        decision: AuditDecision::Blocked,
-                        reason: AuditReason::LfsOperationNotAllowed,
-                        credential: None,
-                        git: None,
-                        request_body: None,
-                        request_body_encoding: None,
-                        response_body: None,
-                        response_body_encoding: None,
-                        body_truncated: None,
-                        permissive_duration_secs: None,
-                        permissive_source: None,
-                        redirect_target: None,
-                    });
-                    return Ok(blocked_response(&method, &full_url));
-                }
+                } else {
+                    false
+                };
 
-                // Allowed after LFS check
+                // Allowed after LFS check (or permitted through in permissive mode)
                 let allowed_ctx = RequestContext {
                     credential: self.audit_credential(&request_info),
                     ..ctx
                 };
 
                 let rp = self.filter_engine.redirect_policy_for(&request_info);
-                if !log_body {
+                // permitted entry already emitted above; don't double-log via the allowed path.
+                if !log_body && !lfs_permitted_override {
                     self.logger.log_allowed(&allowed_ctx);
                 }
                 return self
@@ -581,7 +611,11 @@ impl TunnelHandler {
                         &full_url,
                         rp,
                         allowed_ops,
-                        if log_body { Some(&allowed_ctx) } else { None },
+                        if log_body && !lfs_permitted_override {
+                            Some(&allowed_ctx)
+                        } else {
+                            None
+                        },
                     )
                     .await;
             }
