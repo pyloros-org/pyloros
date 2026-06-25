@@ -203,12 +203,6 @@ struct RulesParseBody {
     toml: String,
 }
 
-#[derive(Deserialize)]
-struct RulesWrapper {
-    #[serde(default)]
-    rules: Vec<Rule>,
-}
-
 #[derive(Serialize)]
 struct RulesParseResponse {
     rules: Vec<Rule>,
@@ -217,15 +211,8 @@ struct RulesParseResponse {
 async fn serve_rules_parse(
     Json(body): Json<RulesParseBody>,
 ) -> Result<Json<RulesParseResponse>, AppError> {
-    // Accept either a single `[[rules]]` table-array form or a bare rule
-    // table. Try the wrapper form first, then a bare table as fallback.
-    let rules = match toml::from_str::<RulesWrapper>(&body.toml) {
-        Ok(w) if !w.rules.is_empty() => w.rules,
-        _ => match toml::from_str::<Rule>(&body.toml) {
-            Ok(r) => vec![r],
-            Err(e) => return Err(AppError::bad_request(format!("TOML parse error: {}", e))),
-        },
-    };
+    let rules = rule_suggest::parse_rules_toml(&body.toml)
+        .map_err(|e| AppError::bad_request(format!("TOML parse error: {}", e)))?;
     for r in &rules {
         r.validate()
             .map_err(|e| AppError::bad_request(format!("invalid rule: {}", e)))?;
