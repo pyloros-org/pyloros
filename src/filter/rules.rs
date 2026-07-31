@@ -381,9 +381,10 @@ impl CompiledRule {
             return false;
         }
 
-        // Check method
+        // Check method. A rule allowing GET also allows HEAD.
         if let Some(ref method_matcher) = self.method
             && !method_matcher.matches(request.method)
+            && !(request.method.eq_ignore_ascii_case("HEAD") && method_matcher.matches("GET"))
         {
             return false;
         }
@@ -614,6 +615,27 @@ mod tests {
         t.assert_true("wrong method blocked", !engine.is_allowed(&wrong_method));
         t.assert_true("wrong path blocked", !engine.is_allowed(&wrong_path));
         t.assert_true("wrong host blocked", !engine.is_allowed(&wrong_host));
+    }
+
+    #[test]
+    fn test_get_rule_allows_head() {
+        let t = test_report!("GET rule also allows HEAD, but not the reverse");
+        let engine =
+            FilterEngine::new(vec![make_rule("GET", "https://api.example.com/file")]).unwrap();
+        let head = RequestInfo::http("HEAD", "https", "api.example.com", None, "/file", None);
+        t.assert_true("HEAD allowed by GET rule", engine.is_allowed(&head));
+
+        let head_only =
+            FilterEngine::new(vec![make_rule("HEAD", "https://api.example.com/file")]).unwrap();
+        let get = RequestInfo::http("GET", "https", "api.example.com", None, "/file", None);
+        t.assert_true("GET not allowed by HEAD rule", !head_only.is_allowed(&get));
+
+        let post_only =
+            FilterEngine::new(vec![make_rule("POST", "https://api.example.com/file")]).unwrap();
+        t.assert_true(
+            "HEAD not allowed by POST rule",
+            !post_only.is_allowed(&head),
+        );
     }
 
     #[test]

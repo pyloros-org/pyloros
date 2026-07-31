@@ -26,6 +26,7 @@ The intended deployment is one proxy per VM/container running an AI agent. All o
 - Rules specify: method, URL pattern, optional `websocket = true` flag
 - `*` wildcard matches any character sequence (including across segments) in host, path, and query
 - Method `*` matches any HTTP method
+- A rule allowing `GET` also allows `HEAD` for the same URL pattern (HEAD is a GET without the response body, so it exposes nothing GET doesn't). A rule allowing only `HEAD` does not allow `GET`.
 - Example: `https://*.github.com/api/*` matches `https://foo.github.com/api/v1/repos`
 
 ### Redirect Following
