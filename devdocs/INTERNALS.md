@@ -147,9 +147,12 @@ to the proxy and not automatically allowed — users must add separate HTTP rule
 transfer hosts. This is intentional: the proxy shouldn't assume which external hosts are
 acceptable just because git smart HTTP access is allowed.
 
-**Plain HTTP blocking**: Like `AllowedWithBranchCheck`, `AllowedWithLfsCheck` requires
-HTTPS body inspection. On plain HTTP, it is blocked with HTTP 451 (default-deny for
-unverifiable restrictions).
+**Plain HTTP blocking**: Like `AllowedWithBranchCheck`, body inspection for
+`AllowedWithLfsCheck` is only implemented on the HTTPS tunnel path — a deliberate
+choice, not a technical limitation (a plain-HTTP body could be buffered and inspected
+too). On plain HTTP it is blocked with HTTP 451 (default-deny for unverifiable
+restrictions); the `body_inspection_requires_https` audit reason is named for the
+current behavior, not an inherent constraint.
 
 ## Config Live-Reload
 
@@ -261,14 +264,24 @@ intentionally truncated.
 
 ## Timeboxed permissive mode
 
-Permissive mode is evaluated through `ApprovalManager` so the dashboard can
-toggle it at runtime without a config reload. `proxy.permissive = true` in
-the config file is a permanent override; the dashboard toggle layers on top
-via `ApprovalManager::is_permissive_active()`, which the proxy queries on
-each request decision (via the `TunnelHandler` / `ProxyHandler` factory).
-When the expiry timer fires, the manager calls `request_rebuild()` on the
-same channel approval-rule changes use, so a new `TunnelHandler` is
-broadcast and subsequent requests see the flipped flag.
+The combined permissive decision lives in `PermissiveState { base, approvals }`
+(`src/proxy/mod.rs`), held directly by `ProxyHandler` / `TunnelHandler`.
+`PermissiveState::is_active()` returns `base || approvals.is_permissive_active()`:
+`base` is the permanent `proxy.permissive = true` config flag, and the optional
+`ApprovalManager` layers the runtime dashboard toggle on top so it can be flipped
+without a config reload. When the expiry timer fires, the manager calls
+`request_rebuild()` on the same channel approval-rule changes use, so a new
+`TunnelHandler` is broadcast and subsequent requests see the flipped flag.
+
+**Deferred refactor (intentional, not yet done):** the proxy core merges a static
+config layer with a dynamic (approvals) layer by hand in two places — the
+permissive flag (`PermissiveState`) and the rule set (`config.rules ++
+approvals.active_rules()`, rebuilt on grant/expire). In both, `ApprovalManager`
+leaks into the core as an `Option` the handlers thread around. The cleaner shape
+is a single policy source the core queries (`policy.current_rules()`,
+`policy.is_permissive()`) that composes static+dynamic internally, making the
+approvals subsystem just one provider behind that interface. `PermissiveState` is
+a half-step — it still hardcodes the `base || approvals` composition.
 
 Permissive-mode toggles emit dedicated audit entries
 (`AuditEvent::PermissiveEnabled` / `PermissiveDisabled`) with

@@ -167,8 +167,8 @@ mod tests {
     #[test]
     fn test_generate_cert() {
         let t = test_report!("MITM generator produces cert+key");
-        let gen = create_test_generator();
-        let (cert, key) = gen.get_cert_for_host("example.com").unwrap();
+        let generator = create_test_generator();
+        let (cert, key) = generator.get_cert_for_host("example.com").unwrap();
 
         t.assert_true("cert not empty", !cert.is_empty());
         t.assert_true("key not empty", !key.secret_der().is_empty());
@@ -177,24 +177,28 @@ mod tests {
     #[test]
     fn test_cache_hit() {
         let t = test_report!("MITM generator caches on second call");
-        let gen = create_test_generator();
+        let generator = create_test_generator();
 
-        let _ = gen.get_cert_for_host("example.com").unwrap();
-        t.assert_eq("after first call", &gen.cache_size(), &1usize);
+        let _ = generator.get_cert_for_host("example.com").unwrap();
+        t.assert_eq("after first call", &generator.cache_size(), &1usize);
 
-        let _ = gen.get_cert_for_host("example.com").unwrap();
-        t.assert_eq("after second call (cached)", &gen.cache_size(), &1usize);
+        let _ = generator.get_cert_for_host("example.com").unwrap();
+        t.assert_eq(
+            "after second call (cached)",
+            &generator.cache_size(),
+            &1usize,
+        );
     }
 
     #[test]
     fn test_different_hosts() {
         let t = test_report!("MITM generator stores per-host");
-        let gen = create_test_generator();
+        let generator = create_test_generator();
 
-        let _ = gen.get_cert_for_host("one.com").unwrap();
-        let _ = gen.get_cert_for_host("two.com").unwrap();
+        let _ = generator.get_cert_for_host("one.com").unwrap();
+        let _ = generator.get_cert_for_host("two.com").unwrap();
 
-        t.assert_eq("cache size", &gen.cache_size(), &2usize);
+        t.assert_eq("cache size", &generator.cache_size(), &2usize);
     }
 
     #[test]
@@ -202,8 +206,8 @@ mod tests {
         let t = test_report!("Server config has h2+h1 ALPN");
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let gen = create_test_generator();
-        let config = gen.server_config_for_host("example.com").unwrap();
+        let generator = create_test_generator();
+        let config = generator.server_config_for_host("example.com").unwrap();
 
         t.assert_eq(
             "ALPN protocols",

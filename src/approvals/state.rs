@@ -381,16 +381,15 @@ impl ApprovalManager {
             }
         };
 
-        if let Some(snapshot) = permanent_snapshot {
-            if let Err(e) =
+        if let Some(snapshot) = permanent_snapshot
+            && let Err(e) =
                 super::storage::save_permanent_rules(&self.config.permanent_rules_file, &snapshot)
-            {
-                tracing::error!(
-                    error = %e,
-                    path = %self.config.permanent_rules_file,
-                    "Failed to persist approvals permanent-rules file"
-                );
-            }
+        {
+            tracing::error!(
+                error = %e,
+                path = %self.config.permanent_rules_file,
+                "Failed to persist approvals permanent-rules file"
+            );
         }
 
         if let Some(duration) = ttl.duration() {
@@ -581,9 +580,9 @@ impl ApprovalManager {
             .active
             .iter()
             .map(|a| {
-                let remaining_secs =
-                    a.expires_at
-                        .map(|t| if t > now { (t - now).as_secs() } else { 0 });
+                let remaining_secs = a
+                    .expires_at
+                    .map(|t| if t > now { (t - now).as_secs() } else { 0 });
                 ActiveApprovalSnapshot {
                     approval_id: a.approval_id.clone(),
                     rule: a.rule.clone(),

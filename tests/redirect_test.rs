@@ -9,15 +9,15 @@
 mod common;
 
 use bytes::Bytes;
-use common::{rule, rule_with_redirects, ReportingClient, TestCa, TestProxy, TestUpstream};
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, rule, rule_with_redirects};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::{
-    matchers::{method, path as wm_path},
     Mock, MockServer, ResponseTemplate,
+    matchers::{method, path as wm_path},
 };
 
 /// Build a client that does NOT auto-follow redirects, so tests can observe

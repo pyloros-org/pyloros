@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ok_handler, rule, LogCapture, ReportingClient, TestCa, TestUpstream};
+use common::{LogCapture, ReportingClient, TestCa, TestUpstream, ok_handler, rule};
 use pyloros::{Config, ProxyServer};
 
 // ---------------------------------------------------------------------------

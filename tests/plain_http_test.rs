@@ -1,8 +1,8 @@
 mod common;
 
-use common::{rule, ReportingClient, TestCa, TestProxy};
+use common::{ReportingClient, TestCa, TestProxy, rule};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 // ---------------------------------------------------------------------------
 // Plain HTTP forwarding tests

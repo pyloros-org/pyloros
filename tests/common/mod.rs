@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -29,7 +29,7 @@ pub use pyloros_test_support::TestReport;
 /// Must be called from the test function body (not a helper).
 #[macro_export]
 macro_rules! test_report {
-    ($title:expr) => {{
+    ($title:expr_2021) => {{
         fn f() {}
         fn type_name_of<T>(_: T) -> &'static str {
             std::any::type_name::<T>()
@@ -1070,10 +1070,10 @@ pub fn parse_cgi_response(output: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>
     for line in header_str.lines() {
         if let Some(rest) = line.strip_prefix("Status:") {
             let rest = rest.trim();
-            if let Some(code_str) = rest.split_whitespace().next() {
-                if let Ok(code) = code_str.parse::<u16>() {
-                    status = code;
-                }
+            if let Some(code_str) = rest.split_whitespace().next()
+                && let Ok(code) = code_str.parse::<u16>()
+            {
+                status = code;
             }
         } else if let Some((key, value)) = line.split_once(':') {
             headers.push((key.trim().to_string(), value.trim().to_string()));
