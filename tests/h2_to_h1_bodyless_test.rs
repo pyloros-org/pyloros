@@ -1,7 +1,7 @@
 mod common;
 
 use bytes::Bytes;
-use common::{rule, ReportingClient, TestCa, TestProxy, TestUpstream, UpstreamHandler};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, UpstreamHandler, rule};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};

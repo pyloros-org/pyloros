@@ -29,6 +29,25 @@ pub fn format_rule_toml(rule: &Rule) -> String {
     format_rules_toml(std::slice::from_ref(rule))
 }
 
+/// Parse a `[[rules]]` table-array (or a single bare rule table) into
+/// `Rule` values. Commented lines (e.g. the broader variant `suggest_*`
+/// emits) are ignored by the TOML parser, so feeding a whole suggestion
+/// yields just its active rule. Does not validate; callers needing it
+/// call [`Rule::validate`].
+pub fn parse_rules_toml(toml_text: &str) -> std::result::Result<Vec<Rule>, toml::de::Error> {
+    #[derive(serde::Deserialize)]
+    struct RulesWrapper {
+        #[serde(default)]
+        rules: Vec<Rule>,
+    }
+    // A bare rule table also parses as a wrapper with zero rules, so the
+    // non-empty guard is what makes the bare-table fallback reachable.
+    match toml::from_str::<RulesWrapper>(toml_text) {
+        Ok(w) if !w.rules.is_empty() => Ok(w.rules),
+        _ => toml::from_str::<Rule>(toml_text).map(|r| vec![r]),
+    }
+}
+
 /// Suggest TOML for a "create rule from blocked request" flow given a
 /// recent blocked audit entry. Emits an exact-match `[[rules]]` block
 /// plus a commented broader host-wildcard variant. For git-shaped
@@ -168,18 +187,20 @@ fn detect_git_op(url: &str, reason: &AuditReason) -> Option<&'static str> {
 }
 
 fn strip_git_suffix(url: &str) -> &str {
+    // Strip the query string first so suffix matching works for endpoints
+    // like `/info/refs?service=git-upload-pack`.
+    let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
     for suffix in [
         "/git-upload-pack",
         "/git-receive-pack",
         "/info/refs",
         "/info/lfs/objects/batch",
     ] {
-        if let Some(prefix) = url.strip_suffix(suffix) {
+        if let Some(prefix) = path.strip_suffix(suffix) {
             return prefix;
         }
     }
-    // Strip query string if any.
-    url.split_once('?').map(|(p, _)| p).unwrap_or(url)
+    path
 }
 
 fn host_wildcard_for(url: &str) -> String {
@@ -210,4 +231,101 @@ fn comment_block(toml_block: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::{FilterEngine, RequestInfo};
+    use pyloros_test_support::test_report;
+
+    struct Case {
+        label: &'static str,
+        method: &'static str,
+        url: &'static str,
+        reason: &'static str,
+        req_path: &'static str,
+        req_query: Option<&'static str>,
+    }
+
+    fn snapshot(c: &Case) -> AuditEntrySnapshot {
+        serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "event": "request_blocked",
+            "method": c.method,
+            "url": c.url,
+            "host": "github.com",
+            "scheme": "https",
+            "protocol": "https",
+            "decision": "blocked",
+            "reason": c.reason,
+        }))
+        .expect("audit snapshot json should deserialize")
+    }
+
+    /// Property: a rule the suggester proposes for a blocked request must,
+    /// when applied, actually allow that request.
+    #[test]
+    fn test_suggested_rule_matches_original_request() {
+        let t = test_report!("Suggested rule allows the request that triggered it");
+
+        let cases = [
+            Case {
+                label: "git fetch discovery (info/refs?service=git-upload-pack)",
+                method: "GET",
+                url: "https://github.com/octocat/hello-world/info/refs?service=git-upload-pack",
+                reason: "no_matching_rule",
+                req_path: "/octocat/hello-world/info/refs",
+                req_query: Some("service=git-upload-pack"),
+            },
+            Case {
+                label: "git fetch verb pack (git-upload-pack)",
+                method: "POST",
+                url: "https://github.com/org/repo.git/git-upload-pack",
+                reason: "no_matching_rule",
+                req_path: "/org/repo.git/git-upload-pack",
+                req_query: None,
+            },
+            Case {
+                label: "git push verb pack (git-receive-pack)",
+                method: "POST",
+                url: "https://github.com/org/repo.git/git-receive-pack",
+                reason: "no_matching_rule",
+                req_path: "/org/repo.git/git-receive-pack",
+                req_query: None,
+            },
+            Case {
+                label: "plain HTTP request",
+                method: "GET",
+                url: "https://github.com/org/repo/raw/main/README.md",
+                reason: "no_matching_rule",
+                req_path: "/org/repo/raw/main/README.md",
+                req_query: None,
+            },
+        ];
+
+        for c in &cases {
+            let toml_text = suggest_for_audit_snapshot(&snapshot(c));
+            let rules = parse_rules_toml(&toml_text).expect("suggestion TOML should parse");
+            t.assert_true(
+                &format!("{}: suggestion has an active rule", c.label),
+                !rules.is_empty(),
+            );
+
+            let engine = FilterEngine::new(rules)
+                .unwrap_or_else(|e| panic!("{}: engine build failed: {e}", c.label));
+            let req = RequestInfo::http(
+                c.method,
+                "https",
+                "github.com",
+                None,
+                c.req_path,
+                c.req_query,
+            );
+            t.assert_true(
+                &format!("{}: suggested rule allows the original request", c.label),
+                engine.is_allowed(&req),
+            );
+        }
+    }
 }

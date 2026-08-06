@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ok_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, ok_handler, rule};
 
 /// When SSLKEYLOGFILE is set before the proxy starts, the MITM server side
 /// writes TLS secrets in NSS Key Log Format so captures can be decrypted.

@@ -4,8 +4,8 @@ exclude = ["tools/test-report"]
 
 [package]
 name = "pyloros"
-version = "0.7.0"
-edition = "2021"
+version = "0.9.0"
+edition = "2024"
 description = "A filtering HTTPS proxy for agent network access control"
 license = "MIT"
 
@@ -51,7 +51,7 @@ wiremock = "0.6"
 pyloros-test-support = { path = "crates/test-support" }
 libc = "0.2"
 wait-timeout = "0.2"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "filter_bench"

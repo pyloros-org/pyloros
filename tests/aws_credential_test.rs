@@ -7,7 +7,7 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    echo_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream, UpstreamHandler,
+    ReportingClient, TestCa, TestProxy, TestUpstream, UpstreamHandler, echo_handler, rule,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;

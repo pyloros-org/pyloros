@@ -1,8 +1,8 @@
 mod common;
 
 use common::{
-    echo_handler, ok_handler, rule, ReportingClient, TestCa, TestProxy, TestUpstream,
-    UpstreamHandler,
+    ReportingClient, TestCa, TestProxy, TestUpstream, UpstreamHandler, echo_handler, ok_handler,
+    rule,
 };
 
 // ---------------------------------------------------------------------------

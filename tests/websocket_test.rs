@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ok_handler, ws_echo_handler, ws_rule, TestCa, TestProxy, TestReport, TestUpstream};
+use common::{TestCa, TestProxy, TestReport, TestUpstream, ok_handler, ws_echo_handler, ws_rule};
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

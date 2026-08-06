@@ -314,10 +314,10 @@ fn ref_matches_any_pattern(refname: &str, patterns: &[PatternMatcher]) -> bool {
             let full_ref = format!("refs/heads/{}", branch_name);
             let full_pattern = format!("refs/heads/{}", pat);
             // We need to create a temporary PatternMatcher for the full pattern
-            if let Ok(full_matcher) = PatternMatcher::new(&full_pattern) {
-                if full_matcher.matches(&full_ref) {
-                    return true;
-                }
+            if let Ok(full_matcher) = PatternMatcher::new(&full_pattern)
+                && full_matcher.matches(&full_ref)
+            {
+                return true;
             }
         }
     }

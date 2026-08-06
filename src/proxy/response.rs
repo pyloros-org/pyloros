@@ -1,7 +1,7 @@
 //! Shared HTTP response helpers for blocked/error responses
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{Response, StatusCode};
 
 /// Create an HTTP 451 response for blocked requests.

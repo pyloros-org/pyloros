@@ -2,9 +2,9 @@
 
 mod common;
 
-use common::{echo_handler, rule, test_client, ReportingClient, TestCa, TestProxy, TestUpstream};
+use common::{ReportingClient, TestCa, TestProxy, TestUpstream, echo_handler, rule, test_client};
 use pyloros::config::{Credential, LocalHeaderConfig};
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 fn cred(url: &str, header: &str, value: &str) -> Credential {
     Credential::Header {
@@ -108,82 +108,53 @@ async fn test_credential_authorization_bearer() {
 
 /// When `value = "Bearer ${TOKEN}"`, the proxy parses out the literal "Bearer "
 /// prefix during verification: the sandbox is expected to send
-/// `Authorization: Bearer <local-token>`, NOT a bare local-token.
-#[tokio::test]
-async fn test_bearer_template_verifies_against_prefixed_header() {
+/// `Authorization: Bearer <local-token>`, NOT a bare local-token. A bare token
+/// without the prefix must be rejected.
+///
+/// Exercised at the engine level with an injected lookup rather than mutating
+/// the process environment — set_var is unsafe under Rust 2024 and races with
+/// the parallel test threads. The e2e 403 path is covered by the mismatch tests.
+#[test]
+fn test_bearer_template_prefix_handling() {
     let t = test_report!("Bearer ${TOKEN} template strips prefix on verify");
-    std::env::set_var("CREDTEST_REAL_TOKEN", "real-bearer-token");
-    let ca = TestCa::generate();
-    let upstream = TestUpstream::builder(&ca, echo_handler())
-        .report(&t, "echo")
-        .start()
-        .await;
-    let proxy = TestProxy::builder(&ca, vec![rule("*", "https://localhost/*")], upstream.port())
-        .credentials(vec![Credential::Header {
+    let lookup = |name: &str| (name == "CREDTEST_REAL_TOKEN").then(|| "real-bearer-token".into());
+    let (engine, _) = pyloros::CredentialEngine::new_with_lookup(
+        vec![Credential::Header {
             url: "https://localhost/*".to_string(),
             header: "authorization".to_string(),
             value: "Bearer ${CREDTEST_REAL_TOKEN}".to_string(),
             local: LocalHeaderConfig::Value("local-token".to_string()),
-        }])
-        .report(&t)
-        .start()
-        .await;
-    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+        }],
+        &Default::default(),
+        lookup,
+    )
+    .unwrap();
+
+    let ri = pyloros::RequestInfo::http("GET", "https", "localhost", None, "/test", None);
 
     // Sandbox sends "Bearer local-token" (the standard format with its own
     // env-var substituted). Proxy strips "Bearer ", checks middle == "local-token",
     // then forwards "Bearer real-bearer-token".
-    let resp = client
-        .get_with_header(
-            "https://localhost/test",
-            "authorization",
-            "Bearer local-token",
-        )
-        .await;
-    t.assert_eq("status", &resp.status().as_u16(), &200u16);
-    let body = resp.text().await.unwrap();
-    t.assert_contains(
-        "real bearer token forwarded",
-        &body,
-        "authorization: Bearer real-bearer-token",
+    let mut headers = hyper::header::HeaderMap::new();
+    headers.insert("authorization", "Bearer local-token".parse().unwrap());
+    t.assert_true(
+        "prefixed local token verifies",
+        engine.verify_local(&ri, &headers).is_ok(),
+    );
+    engine.inject(&ri, &mut headers);
+    t.assert_eq(
+        "real bearer token injected",
+        &headers.get("authorization").unwrap().to_str().unwrap(),
+        &"Bearer real-bearer-token",
     );
 
-    proxy.shutdown();
-    upstream.shutdown();
-}
-
-/// A bare token without the "Bearer " prefix must NOT verify, because the
-/// real value template includes the prefix and the sandbox is expected to
-/// match that shape.
-#[tokio::test]
-async fn test_bearer_template_rejects_bare_token() {
-    let t = test_report!("Bearer ${TOKEN} rejects bare-token header");
-    std::env::set_var("CREDTEST_REAL_TOKEN_2", "real-token-2");
-    let ca = TestCa::generate();
-    let upstream = TestUpstream::builder(&ca, echo_handler())
-        .report(&t, "echo")
-        .start()
-        .await;
-    let proxy = TestProxy::builder(&ca, vec![rule("*", "https://localhost/*")], upstream.port())
-        .credentials(vec![Credential::Header {
-            url: "https://localhost/*".to_string(),
-            header: "authorization".to_string(),
-            value: "Bearer ${CREDTEST_REAL_TOKEN_2}".to_string(),
-            local: LocalHeaderConfig::Value("local-token".to_string()),
-        }])
-        .report(&t)
-        .start()
-        .await;
-    let client = ReportingClient::new(&t, proxy.addr(), &ca);
-
     // No "Bearer " prefix → must reject.
-    let resp = client
-        .get_with_header("https://localhost/test", "authorization", "local-token")
-        .await;
-    t.assert_eq("status", &resp.status().as_u16(), &403u16);
-
-    proxy.shutdown();
-    upstream.shutdown();
+    let mut bare = hyper::header::HeaderMap::new();
+    bare.insert("authorization", "local-token".parse().unwrap());
+    t.assert_true(
+        "bare token rejected",
+        engine.verify_local(&ri, &bare).is_err(),
+    );
 }
 
 /// `local_generated = true` with a literal `value` (no ${VAR}) is rejected
@@ -368,37 +339,35 @@ async fn test_no_injection_over_plain_http() {
     proxy.shutdown();
 }
 
-#[tokio::test]
-async fn test_credential_with_env_var() {
+#[test]
+fn test_credential_with_env_var() {
     let t = test_report!("Config with env var resolution");
-    std::env::set_var("TEST_CRED_E2E_SECRET", "env-resolved-value");
-
-    let ca = TestCa::generate();
-    let upstream = TestUpstream::builder(&ca, echo_handler())
-        .report(&t, "echo")
-        .start()
-        .await;
-    let proxy = TestProxy::builder(&ca, vec![rule("*", "https://localhost/*")], upstream.port())
-        .credentials(vec![cred(
+    // The other tests in this file already prove the full proxy injects credential
+    // headers e2e; what's unique here is that a `${VAR}` placeholder gets resolved.
+    // We exercise that via the engine's injectable lookup rather than mutating the
+    // process environment — set_var/remove_var are unsafe under Rust 2024 and race
+    // with the parallel test threads (libtest + tokio/DNS/TLS getenv calls).
+    let lookup = |name: &str| (name == "TEST_CRED_E2E_SECRET").then(|| "env-resolved-value".into());
+    let (engine, _) = pyloros::CredentialEngine::new_with_lookup(
+        vec![cred(
             "https://localhost/*",
             "x-api-key",
             "${TEST_CRED_E2E_SECRET}",
-        )])
-        .report(&t)
-        .start()
-        .await;
-    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+        )],
+        &Default::default(),
+        lookup,
+    )
+    .unwrap();
 
-    // Send the local credential value
-    let resp = client
-        .get_with_header("https://localhost/test", "x-api-key", "test-local")
-        .await;
-    let body = resp.text().await.unwrap();
-    t.assert_contains("env var resolved", &body, "x-api-key: env-resolved-value");
+    let ri = pyloros::RequestInfo::http("GET", "https", "localhost", None, "/test", None);
+    let mut headers = hyper::header::HeaderMap::new();
+    engine.inject(&ri, &mut headers);
 
-    proxy.shutdown();
-    upstream.shutdown();
-    std::env::remove_var("TEST_CRED_E2E_SECRET");
+    t.assert_eq(
+        "env var resolved into header",
+        &headers.get("x-api-key").unwrap().to_str().unwrap(),
+        &"env-resolved-value",
+    );
 }
 
 #[tokio::test]

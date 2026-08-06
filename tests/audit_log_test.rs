@@ -1,8 +1,8 @@
 mod common;
 
 use common::{
-    ok_handler, read_audit_entries, rule, test_client, ReportingClient, TestCa, TestProxy,
-    TestUpstream,
+    ReportingClient, TestCa, TestProxy, TestUpstream, ok_handler, read_audit_entries, rule,
+    test_client,
 };
 
 #[tokio::test]

@@ -42,11 +42,11 @@ fn spawn_proxy(config_path: &Path) -> (std::process::Child, u16) {
                 let clean = strip_ansi(&line);
                 if let Some(idx) = clean.find("address=") {
                     let addr_str = clean[idx + "address=".len()..].trim();
-                    if let Some(colon) = addr_str.rfind(':') {
-                        if let Ok(port) = addr_str[colon + 1..].parse::<u16>() {
-                            let _ = tx.send(port);
-                            sent = true;
-                        }
+                    if let Some(colon) = addr_str.rfind(':')
+                        && let Ok(port) = addr_str[colon + 1..].parse::<u16>()
+                    {
+                        let _ = tx.send(port);
+                        sent = true;
                     }
                 }
             }

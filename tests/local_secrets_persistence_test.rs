@@ -83,11 +83,9 @@ async fn test_restart_preserves_generated_sigv4_local_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let secrets_path = dir.path().join("secrets.env");
 
-    // Set real-credential env vars; the local env-var names default to
-    // these via inference from the ${VAR} placeholders.
-    std::env::set_var("RESTART_AWS_AKID", "AKIAREAL_FOR_TEST");
-    std::env::set_var("RESTART_AWS_SAK", "REAL_SECRET_FOR_TEST");
-
+    // Literal real credentials with explicit local env-var names: keeps the test
+    // off `std::env::set_var`, which is unsafe under Rust 2024 and races with the
+    // parallel test threads.
     let config_toml = build_config(
         &ca,
         &secrets_path,
@@ -95,9 +93,11 @@ async fn test_restart_preserves_generated_sigv4_local_credentials() {
 [[credentials]]
 type = "aws-sigv4"
 url = "https://*.amazonaws.com/*"
-access_key_id = "${RESTART_AWS_AKID}"
-secret_access_key = "${RESTART_AWS_SAK}"
+access_key_id = "AKIAREAL_FOR_TEST"
+secret_access_key = "REAL_SECRET_FOR_TEST"
 local_generated = true
+local_access_key_id_env_name = "RESTART_AWS_AKID"
+local_secret_access_key_env_name = "RESTART_AWS_SAK"
 "#,
     );
 

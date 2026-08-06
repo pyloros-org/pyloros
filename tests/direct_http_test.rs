@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use pyloros::config::Rule;
 use pyloros::{Config, ProxyServer};
-use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 /// Start a proxy with both the regular proxy listener and a direct-HTTP listener
 /// bound on 127.0.0.1. Returns the direct-HTTP address and a shutdown handle.

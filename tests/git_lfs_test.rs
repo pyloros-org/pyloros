@@ -7,9 +7,9 @@
 mod common;
 
 use common::{
-    create_test_repo_with_lfs, git_http_backend_path, git_lfs_available, git_rule,
-    git_rule_with_branches, lfs_git_handler, ok_handler, rule, ReportingClient, RequestLog, TestCa,
-    TestProxy, TestUpstream,
+    ReportingClient, RequestLog, TestCa, TestProxy, TestUpstream, create_test_repo_with_lfs,
+    git_http_backend_path, git_lfs_available, git_rule, git_rule_with_branches, lfs_git_handler,
+    ok_handler, rule,
 };
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;

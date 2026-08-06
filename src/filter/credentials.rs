@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use super::matcher::UrlPattern;
 use crate::config::{
+    Credential, CredentialTemplate, LocalHeaderConfig, LocalSigV4Config,
     generate_fake_access_key_id, generate_fake_secret_access_key, generate_random_header_value,
-    parse_credential_template, resolve_credential_value, Credential, CredentialTemplate,
-    LocalHeaderConfig, LocalSigV4Config,
+    parse_credential_template, resolve_credential_value_with,
 };
 use crate::error::{Error, Result};
 use crate::filter::RequestInfo;
@@ -106,6 +106,18 @@ impl CredentialEngine {
         credentials: Vec<Credential>,
         existing: &HashMap<String, String>,
     ) -> Result<(Self, Vec<GeneratedSecret>)> {
+        Self::new_with_lookup(credentials, existing, |name| std::env::var(name).ok())
+    }
+
+    /// Like [`CredentialEngine::new`], but with an injectable variable lookup so
+    /// tests can resolve `${ENV_VAR}` placeholders without mutating the process
+    /// environment (which is `unsafe` under Rust 2024 and races with parallel test
+    /// threads — see `config::resolve_credential_value_with`).
+    pub fn new_with_lookup(
+        credentials: Vec<Credential>,
+        existing: &HashMap<String, String>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(Self, Vec<GeneratedSecret>)> {
         let mut resolved = Vec::with_capacity(credentials.len());
         let mut generated_secrets = Vec::new();
         for cred in &credentials {
@@ -117,7 +129,7 @@ impl CredentialEngine {
                     local,
                 } => {
                     let template = parse_credential_template(value)?;
-                    let resolved_value = template.resolve()?;
+                    let resolved_value = template.resolve_with(&lookup)?;
                     let url_pattern = UrlPattern::new(url)?;
 
                     let (prefix, suffix) = match &template {
@@ -129,7 +141,7 @@ impl CredentialEngine {
 
                     let resolved_local = match local {
                         LocalHeaderConfig::Value(v) => {
-                            let local_value = resolve_credential_value(v)?;
+                            let local_value = resolve_credential_value_with(v, &lookup)?;
                             ResolvedLocalHeader {
                                 prefix,
                                 value: local_value,
@@ -180,11 +192,11 @@ impl CredentialEngine {
                 } => {
                     let akid_template = parse_credential_template(access_key_id)?;
                     let sak_template = parse_credential_template(secret_access_key)?;
-                    let resolved_akid = akid_template.resolve()?;
-                    let resolved_sak = sak_template.resolve()?;
+                    let resolved_akid = akid_template.resolve_with(&lookup)?;
+                    let resolved_sak = sak_template.resolve_with(&lookup)?;
                     let session_token = session_token
                         .as_deref()
-                        .map(resolve_credential_value)
+                        .map(|t| resolve_credential_value_with(t, &lookup))
                         .transpose()?;
                     let url_pattern = UrlPattern::new(url)?;
 
@@ -193,8 +205,8 @@ impl CredentialEngine {
                             access_key_id: local_akid,
                             secret_access_key: local_sak,
                         } => {
-                            let akid = resolve_credential_value(local_akid)?;
-                            let sak = resolve_credential_value(local_sak)?;
+                            let akid = resolve_credential_value_with(local_akid, &lookup)?;
+                            let sak = resolve_credential_value_with(local_sak, &lookup)?;
                             ResolvedLocalSigV4 {
                                 access_key_id: akid,
                                 secret_access_key: sak,
@@ -272,14 +284,14 @@ impl CredentialEngine {
     /// and must use `inject_with_body()` instead.
     pub fn inject(&self, request_info: &RequestInfo, headers: &mut HeaderMap) {
         for cred in &self.credentials {
-            if let ResolvedCredential::Header { header, value, .. } = cred {
-                if cred.matches(request_info) {
-                    tracing::debug!(header = %header, "Injecting credential");
-                    if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes()) {
-                        if let Ok(val) = hyper::header::HeaderValue::from_str(value) {
-                            headers.insert(name, val);
-                        }
-                    }
+            if let ResolvedCredential::Header { header, value, .. } = cred
+                && cred.matches(request_info)
+            {
+                tracing::debug!(header = %header, "Injecting credential");
+                if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes())
+                    && let Ok(val) = hyper::header::HeaderValue::from_str(value)
+                {
+                    headers.insert(name, val);
                 }
             }
         }
@@ -310,10 +322,10 @@ impl CredentialEngine {
             match cred {
                 ResolvedCredential::Header { header, value, .. } => {
                     tracing::debug!(header = %header, "Injecting credential");
-                    if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes()) {
-                        if let Ok(val) = hyper::header::HeaderValue::from_str(value) {
-                            headers.insert(name, val);
-                        }
+                    if let Ok(name) = hyper::header::HeaderName::from_bytes(header.as_bytes())
+                        && let Ok(val) = hyper::header::HeaderValue::from_str(value)
+                    {
+                        headers.insert(name, val);
                     }
                 }
                 ResolvedCredential::AwsSigV4 {
@@ -382,10 +394,9 @@ impl CredentialEngine {
                     for (name, value) in new_headers {
                         if let Ok(header_name) =
                             hyper::header::HeaderName::from_bytes(name.as_bytes())
+                            && let Ok(header_value) = hyper::header::HeaderValue::from_str(&value)
                         {
-                            if let Ok(header_value) = hyper::header::HeaderValue::from_str(&value) {
-                                headers.insert(header_name, header_value);
-                            }
+                            headers.insert(header_name, header_value);
                         }
                     }
                 }
