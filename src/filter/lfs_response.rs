@@ -192,7 +192,8 @@ fn derive_expires_at(
             return None;
         }
         secs as u64
-    } else if let Some(s) = expires_at {
+    } else {
+        let s = expires_at?;
         let parsed =
             time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
         let now_utc = time::OffsetDateTime::now_utc();
@@ -202,8 +203,6 @@ fn derive_expires_at(
             return None;
         }
         secs as u64
-    } else {
-        return None;
     };
     let clamped = Duration::from_secs(raw_secs)
         .max(MIN_ACTION_TTL)

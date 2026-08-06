@@ -251,7 +251,7 @@
           errEl.style.display = 'none';
           const parsed = await postJson('/rules/parse', { toml: tomlEl.value });
           if (!parsed.ok) {
-            errEl.style.display = '';
+            errEl.style.display = 'block';
             errEl.textContent = await parsed.text();
             return;
           }
@@ -260,7 +260,7 @@
             action: 'approve', ttl: ttlSel.value, rules_applied: rules,
           });
           if (!resp.ok) {
-            errEl.style.display = '';
+            errEl.style.display = 'block';
             errEl.textContent = await resp.text();
           }
         });
@@ -409,14 +409,14 @@
           errEl.style.display = 'none';
           const parsed = await postJson('/rules/parse', { toml: tomlEl.value });
           if (!parsed.ok) {
-            errEl.style.display = '';
+            errEl.style.display = 'block';
             errEl.textContent = await parsed.text();
             return;
           }
           const { rules } = await parsed.json();
           const resp = await postJson('/rules', { rules, ttl: ttlSel.value });
           if (!resp.ok) {
-            errEl.style.display = '';
+            errEl.style.display = 'block';
             errEl.textContent = await resp.text();
           } else {
             card.remove();
@@ -488,9 +488,15 @@
           } else if (msg.event === 'resolved') {
             const a = state.pending.get(msg.id);
             if (a) {
-              a.status = msg.status;
-              if (msg.rules_applied) a.rules_applied = msg.rules_applied;
-              if (msg.message) a.message = msg.message;
+              // `msg.status` is a nested ApprovalStatus object
+              // ({status, rules_applied?, ttl?, message?}), whereas the
+              // snapshot/pending shapes flatten it. Normalize to the flat
+              // form the rest of the code expects (a.status is the string
+              // discriminant used for the approved/denied tag).
+              const st = msg.status || {};
+              a.status = st.status;
+              if (st.rules_applied) a.rules_applied = st.rules_applied;
+              if (st.message) a.message = st.message;
               renderPending();
               setTimeout(() => { state.pending.delete(msg.id); renderPending(); }, 3000);
             }
