@@ -122,11 +122,14 @@ Guidelines:
   valid pattern (other fields require a scheme). Use it only when the target
   host is unpredictable, and expect the human to push back.
 - `allow_redirects` belongs on the rule for the **origin** URL, not on a
-  separate rule for the redirect target. Don't request a second rule for a
-  signed URL — it's single-use and expires.
-- The whitelist entry is short-lived. Retry promptly after approval, and
-  don't reuse a redirect target across a long pause; re-request the origin
-  URL instead.
+  separate rule for the redirect target.
+- **After approval, retry the origin URL — not the redirect target.** The
+  whitelist entry is created only when the proxy *observes* the 3xx response;
+  approving a rule does not retroactively allow the target you were blocked
+  on. Re-issuing the origin request produces the redirect again, which is
+  what opens the short-lived window for the follow-up. Requesting the signed
+  target URL directly won't work anyway — it's typically single-use and
+  expires.
 
 ## Guidelines
 
