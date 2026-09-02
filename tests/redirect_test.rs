@@ -30,6 +30,60 @@ fn plain_client_no_follow(
     ReportingClient::new_plain_no_follow(t, proxy_addr)
 }
 
+/// A broad rule without `allow_redirects` sitting in front of a narrower rule
+/// that has them must not shadow it. This is the engine order an approval
+/// produces: base config rules first, approval-added rules appended.
+#[tokio::test]
+async fn test_broad_rule_does_not_shadow_later_redirect_rule() {
+    let t = test_report!("Earlier rule without allow_redirects doesn't suppress a later one");
+
+    let ca = TestCa::generate();
+
+    let cdn = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path("/cdn/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("payload"))
+        .mount(&cdn)
+        .await;
+    let cdn_port = cdn.address().port();
+
+    let origin = MockServer::start().await;
+    let location = format!("http://localhost:{}/cdn/file", cdn_port);
+    Mock::given(method("GET"))
+        .and(wm_path("/origin"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
+        .mount(&origin)
+        .await;
+    let origin_port = origin.address().port();
+
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![
+            rule("GET", &format!("http://localhost:{}/*", origin_port)),
+            rule_with_redirects(
+                "GET",
+                &format!("http://localhost:{}/origin", origin_port),
+                &[&format!("http://localhost:{}/cdn/*", cdn_port)],
+            ),
+        ],
+        origin_port,
+    )
+    .report(&t)
+    .start()
+    .await;
+
+    let client = plain_client_no_follow(&t, proxy.addr());
+    let origin_url = format!("http://localhost:{}/origin", origin_port);
+    let resp = client.get(&origin_url).await;
+    t.assert_eq("origin response is 302", &resp.status().as_u16(), &302u16);
+
+    let resp2 = client.get(&location).await;
+    t.assert_eq("CDN follow-up allowed", &resp2.status().as_u16(), &200u16);
+    t.assert_eq("payload", &resp2.text().await.unwrap().as_str(), &"payload");
+
+    proxy.shutdown();
+}
+
 /// Baseline: a rule without `allow_redirects` does NOT whitelist the redirect
 /// target; the follow-up request is blocked.
 #[tokio::test]
