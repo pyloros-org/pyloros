@@ -26,6 +26,7 @@ The intended deployment is one proxy per VM/container running an AI agent. All o
 - Rules specify: method, URL pattern, optional `websocket = true` flag
 - `*` wildcard matches any character sequence (including across segments) in host, path, and query
 - Method `*` matches any HTTP method
+- A rule allowing `GET` also allows `HEAD` for the same URL pattern (HEAD is a GET without the response body, so it exposes nothing GET doesn't). A rule allowing only `HEAD` does not allow `GET`.
 - Example: `https://*.github.com/api/*` matches `https://foo.github.com/api/v1/repos`
 
 ### Redirect Following
@@ -202,6 +203,9 @@ Lock endpoints are plain pass-through rules (no body inspection needed):
 - User-provided or auto-generated CA certificate/key
 - Per-host certificate generation with in-memory LRU cache (1000 entries, 12h TTL)
 - CLI command to generate CA cert/key pair
+- Generated certificates carry Subject Key Identifier and Authority Key Identifier extensions, so
+  they pass strict RFC 5280 validation (OpenSSL `X509_V_FLAG_X509_STRICT`, which Python 3.12+
+  enables by default via `ssl.VERIFY_X509_STRICT`)
 
 ### Direct HTTPS Mode
 

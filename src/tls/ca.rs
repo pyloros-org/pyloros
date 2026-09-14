@@ -43,6 +43,10 @@ impl GeneratedCa {
             KeyUsagePurpose::DigitalSignature,
         ];
 
+        // Python 3.12+ enables ssl.VERIFY_X509_STRICT by default, which rejects chains whose
+        // certificates lack an Authority Key Identifier.
+        params.use_authority_key_identifier_extension = true;
+
         // Valid for 10 years
         params.not_before = time::OffsetDateTime::now_utc();
         params.not_after = params.not_before + time::Duration::days(3650);
@@ -172,6 +176,9 @@ impl CertificateAuthority {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
+
+        // Required by strict RFC 5280 validation (ssl.VERIFY_X509_STRICT)
+        params.use_authority_key_identifier_extension = true;
 
         // Valid for 1 day (short-lived MITM certs)
         params.not_before = time::OffsetDateTime::now_utc();
