@@ -203,6 +203,9 @@ Lock endpoints are plain pass-through rules (no body inspection needed):
 - User-provided or auto-generated CA certificate/key
 - Per-host certificate generation with in-memory LRU cache (1000 entries, 12h TTL)
 - CLI command to generate CA cert/key pair
+- Generated certificates carry Subject Key Identifier and Authority Key Identifier extensions, so
+  they pass strict RFC 5280 validation (OpenSSL `X509_V_FLAG_X509_STRICT`, which Python 3.12+
+  enables by default via `ssl.VERIFY_X509_STRICT`)
 
 ### Direct HTTPS Mode
 
