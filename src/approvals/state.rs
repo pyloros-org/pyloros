@@ -360,6 +360,16 @@ impl ApprovalManager {
         let permanent_snapshot = {
             let mut state = self.state.lock().unwrap();
             for rule in rules {
+                // Identical rule already active with the same lifetime: adding
+                // another copy changes nothing but grows the active set and the
+                // permanent-rules file.
+                if state
+                    .active
+                    .iter()
+                    .any(|a| a.lifetime == ttl && a.rule == rule)
+                {
+                    continue;
+                }
                 state.active.push(ActiveApproval {
                     rule,
                     lifetime: ttl,
