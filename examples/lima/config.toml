@@ -1,0 +1,15 @@
+[proxy]
+bind_address = "0.0.0.0:8080"
+
+[logging]
+level = "info"
+log_requests = true
+
+# Allowed: httpbin (used by smoke test) + GitHub API
+[[rules]]
+method = "GET"
+url = "https://httpbin.org/robots.txt"
+
+[[rules]]
+method = "*"
+url = "https://api.github.com/*"
