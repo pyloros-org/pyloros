@@ -3,6 +3,8 @@
 
 [proxy]
 bind_address = "0.0.0.0:8080"
+# Path for generated local credential secrets (shared with sandbox via volume)
+generated_secrets_file = "/run/pyloros/secrets.env"
 
 [logging]
 level = "info"
@@ -24,3 +26,14 @@ url = "https://github.com/octocat/Hello-World"
 [[rules]]
 method = "*"
 url = "https://api.github.com/*"
+
+# Credential injection with generated local credentials.
+# The proxy generates random local credential values at startup and writes them
+# to /run/pyloros/secrets.env. The sandbox loads that file on boot.
+# To use: set GITHUB_TOKEN env var on the proxy container.
+#
+# [[credentials]]
+# url = "https://api.github.com/*"
+# header = "authorization"
+# value = "Bearer ${GITHUB_TOKEN}"
+# local_generated = true
