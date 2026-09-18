@@ -20,7 +20,7 @@
       .controls select, .controls input, .controls textarea { font: inherit; padding: .3rem; border: 1px solid #ccc; border-radius: 3px; }
       .deny-msg { flex: 1; min-width: 220px; height: 2.2em; resize: vertical; }
       .rule-toml { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: .85em; padding: .5rem; border: 1px solid #ddd; border-radius: 4px; min-height: 9em; resize: vertical; }
-      .parse-error { color: #c13030; font-size: .85em; margin-top: .25rem; white-space: pre-wrap; font-family: ui-monospace, monospace; display: none; }
+      .parse-error { color: #c13030; font-size: .85em; margin-top: .25rem; white-space: pre-wrap; font-family: ui-monospace, monospace; }
       .approve { background: #1b8f3a; color: #fff; border-color: #1b8f3a; }
       .deny { background: #c13030; color: #fff; border-color: #c13030; }
       .revoke { background: #fff; color: #c13030; border-color: #c13030; }
@@ -53,76 +53,12 @@
     </style>
   </head>
   <body>
-    <h1>pyloros approvals</h1>
-    <div class="bar">
-      <button id="notify-btn">Enable notifications</button>
-      <span class="status" id="stream-status">connecting…</span>
-    </div>
+    <div id="app"></div>
 
-    <!-- Permissive-mode bar -->
-    <div class="perm-bar" id="perm-bar">
-      <span class="perm-status" id="perm-status">permissive mode: off</span>
-      <label class="inline">duration:
-        <select id="perm-duration">
-          <option value="300">5 min</option>
-          <option value="900" selected>15 min</option>
-          <option value="3600">1 hour</option>
-        </select>
-      </label>
-      <button id="perm-enable">Enable</button>
-      <button id="perm-disable" style="display:none">Disable</button>
-    </div>
-
-    <h2>Pending approvals</h2>
-    <div id="pending-list"></div>
-
-    <h2>Active timeboxed rules</h2>
-    <div id="active-list"></div>
-
-    <h2>Audit log
-      <label class="inline" style="font-weight: normal; margin-left: .5rem;">
-        <input type="checkbox" id="audit-include-allowed" />
-        also show allowed (rule-matched) requests
-      </label>
-    </h2>
-    <div id="audit-list"></div>
-    <div class="filebrk">Older entries available in the audit log file on disk.</div>
-
-    <script>
-      const els = {
-        pending: document.getElementById('pending-list'),
-        active: document.getElementById('active-list'),
-        audit: document.getElementById('audit-list'),
-        permBar: document.getElementById('perm-bar'),
-        permStatus: document.getElementById('perm-status'),
-        permEnable: document.getElementById('perm-enable'),
-        permDisable: document.getElementById('perm-disable'),
-        permDuration: document.getElementById('perm-duration'),
-        streamStatus: document.getElementById('stream-status'),
-        notifyBtn: document.getElementById('notify-btn'),
-        auditIncludeAllowed: document.getElementById('audit-include-allowed'),
-      };
-
-      const state = {
-        pending: new Map(),       // id -> ApprovalRequest
-        active: [],               // ActiveApprovalSnapshot[]
-        permissive: { active: false, remaining_secs: null },
-        permissiveDeadline: null, // millis when override expires (for live countdown)
-        recent_blocked: [],
-        recent_all: [],
-        // Read the checkbox's current state: browsers preserve form
-        // state across reloads, so on F5 the box may already be checked.
-        showAllowed: document.getElementById('audit-include-allowed').checked,
-        pendingToml: new Map(),   // id -> string (lazy-fetched server-formatted TOML)
-      };
+    <script type="module">
+      import { html, render, useState, useEffect, useRef } from './preact.js';
 
       // ---------- helpers ----------
-      function escapeHtml(s) {
-        return (s || '').replace(/[&<>"']/g, c => ({
-          '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-        }[c]));
-      }
-
       function fmtRemaining(secs) {
         if (secs == null) return '';
         if (secs < 60) return `${secs}s`;
@@ -132,272 +68,217 @@
         return `${h}h ${m % 60}m`;
       }
 
-      async function postJson(path, body) {
-        const resp = await fetch(path, {
+      function postJson(path, body) {
+        return fetch(path, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        return resp;
       }
 
       async function fetchSuggestForRules(rules) {
         const resp = await postJson('/rules/suggest', { rules });
         if (!resp.ok) return rules.map(r => '# ' + JSON.stringify(r)).join('\n');
-        const j = await resp.json();
-        return j.toml;
+        return (await resp.json()).toml;
       }
 
       async function fetchSuggestForAudit(entry) {
         const resp = await postJson('/rules/suggest', { audit: entry });
         if (!resp.ok) return '# (server suggestion failed)\n';
-        const j = await resp.json();
-        return j.toml;
+        return (await resp.json()).toml;
+      }
+
+      /** Parse TOML server-side, then run `submit(rules)`. Returns an error string or null. */
+      async function parseThen(toml, submit) {
+        const parsed = await postJson('/rules/parse', { toml });
+        if (!parsed.ok) return await parsed.text();
+        const { rules } = await parsed.json();
+        const resp = await submit(rules);
+        return resp.ok ? null : await resp.text();
       }
 
       // ---------- permissive bar ----------
-      function renderPermissive() {
-        const p = state.permissive;
-        if (p.active) {
-          els.permBar.classList.add('active');
-          let remaining = p.remaining_secs ?? 0;
-          if (state.permissiveDeadline) {
-            remaining = Math.max(0, Math.round((state.permissiveDeadline - Date.now()) / 1000));
-          }
-          els.permStatus.textContent = `permissive mode: ON — expires in ${fmtRemaining(remaining)}`;
-          els.permEnable.style.display = 'none';
-          els.permDisable.style.display = '';
-        } else {
-          els.permBar.classList.remove('active');
-          els.permStatus.textContent = 'permissive mode: off';
-          els.permEnable.style.display = '';
-          els.permDisable.style.display = 'none';
-          state.permissiveDeadline = null;
-        }
-      }
-      setInterval(renderPermissive, 1000);
+      function PermissiveBar({ permissive, deadline }) {
+        const [, setTick] = useState(0);
+        useEffect(() => {
+          const t = setInterval(() => setTick(n => n + 1), 1000);
+          return () => clearInterval(t);
+        }, []);
+        const durRef = useRef(null);
 
-      els.permEnable.addEventListener('click', async () => {
-        const dur = parseInt(els.permDuration.value, 10);
-        const resp = await postJson('/permissive', { duration_secs: dur });
-        if (!resp.ok) alert(`Enable failed: ${resp.status} ${await resp.text()}`);
-      });
-      els.permDisable.addEventListener('click', async () => {
-        const resp = await postJson('/permissive', { duration_secs: 0 });
-        if (!resp.ok) alert(`Disable failed: ${resp.status} ${await resp.text()}`);
-      });
+        const enable = async () => {
+          const resp = await postJson('/permissive', { duration_secs: parseInt(durRef.current.value, 10) });
+          if (!resp.ok) alert(`Enable failed: ${resp.status} ${await resp.text()}`);
+        };
+        const disable = async () => {
+          const resp = await postJson('/permissive', { duration_secs: 0 });
+          if (!resp.ok) alert(`Disable failed: ${resp.status} ${await resp.text()}`);
+        };
 
-      // ---------- pending approvals ----------
-      async function renderPending() {
-        if (state.pending.size === 0) {
-          els.pending.innerHTML = '<div class="empty">No pending approvals.</div>';
-          return;
-        }
-        els.pending.innerHTML = '';
-        for (const [id, a] of state.pending) {
-          els.pending.appendChild(await renderPendingCard(id, a));
-        }
-      }
+        const active = !!permissive.active;
+        const remaining = deadline
+          ? Math.max(0, Math.round((deadline - Date.now()) / 1000))
+          : (permissive.remaining_secs ?? 0);
 
-      async function renderPendingCard(id, a) {
-        const card = document.createElement('div');
-        const resolved = a.status && a.status !== 'pending';
-        card.className = 'card' + (resolved ? ' resolved' : '');
-        card.dataset.id = id;
-
-        // Lazy-fetch server-formatted TOML; cache by id.
-        let toml = state.pendingToml.get(id);
-        if (toml === undefined) {
-          toml = await fetchSuggestForRules(a.rules || []);
-          state.pendingToml.set(id, toml);
-        }
-
-        const reason = a.reason ? `<div class="reason">${escapeHtml(a.reason)}</div>` : '';
-        const triggered = a.triggered_by
-          ? `<div class="triggered">triggered by <code>${escapeHtml(a.triggered_by.method)} ${escapeHtml(a.triggered_by.url)}</code></div>`
-          : '';
-        const ttlDefault = a.suggested_ttl || 'permanent';
-        let tag = '';
-        if (a.status === 'approved') tag = '<span class="tag approved">approved</span>';
-        if (a.status === 'denied') tag = '<span class="tag denied">denied</span>';
-
-        card.innerHTML = `
-          <h3>${escapeHtml(id)}${tag}</h3>
-          ${reason}
-          ${triggered}
-          <div class="editor-row">
-            <textarea class="rule-toml">${escapeHtml(toml)}</textarea>
-          </div>
-          <div class="parse-error"></div>
-          <div class="controls">
-            <label class="inline">Lifetime:
-              <select>
-                <option value="one_hour" ${ttlDefault==='one_hour'?'selected':''}>1 hour</option>
-                <option value="one_day" ${ttlDefault==='one_day'?'selected':''}>1 day</option>
-                <option value="permanent" ${ttlDefault==='permanent'?'selected':''}>permanent</option>
+        return html`
+          <div class=${'perm-bar' + (active ? ' active' : '')} id="perm-bar">
+            <span class="perm-status" id="perm-status">
+              ${active ? `permissive mode: ON — expires in ${fmtRemaining(remaining)}` : 'permissive mode: off'}
+            </span>
+            <label class="inline">duration:
+              <select id="perm-duration" ref=${durRef}>
+                <option value="300">5 min</option>
+                <option value="900" selected>15 min</option>
+                <option value="3600">1 hour</option>
               </select>
             </label>
-            <textarea class="deny-msg" placeholder="Deny message (optional)"></textarea>
-            <button class="approve">Approve</button>
-            <button class="deny">Deny</button>
+            ${active
+              ? html`<button id="perm-disable" onClick=${disable}>Disable</button>`
+              : html`<button id="perm-enable" onClick=${enable}>Enable</button>`}
           </div>
         `;
+      }
 
-        const ttlSel = card.querySelector('.controls select');
-        const tomlEl = card.querySelector('.rule-toml');
-        const errEl = card.querySelector('.parse-error');
-        const msgEl = card.querySelector('.deny-msg');
-        card.querySelector('.approve').addEventListener('click', async () => {
-          errEl.style.display = 'none';
-          const parsed = await postJson('/rules/parse', { toml: tomlEl.value });
-          if (!parsed.ok) {
-            errEl.style.display = 'block';
-            errEl.textContent = await parsed.text();
-            return;
-          }
-          const { rules } = await parsed.json();
-          const resp = await postJson(`/approvals/${encodeURIComponent(id)}/decision`, {
-            action: 'approve', ttl: ttlSel.value, rules_applied: rules,
-          });
-          if (!resp.ok) {
-            errEl.style.display = 'block';
-            errEl.textContent = await resp.text();
-          }
-        });
-        card.querySelector('.deny').addEventListener('click', async () => {
-          const m = msgEl.value.trim();
-          const resp = await postJson(`/approvals/${encodeURIComponent(id)}/decision`, {
+      // ---------- pending approvals ----------
+      function PendingCard({ a }) {
+        // Server-formatted TOML, fetched once per approval; edits live here too.
+        const [toml, setToml] = useState('');
+        const [error, setError] = useState(null);
+        const [ttl, setTtl] = useState(a.suggested_ttl || 'permanent');
+        const msgRef = useRef(null);
+
+        useEffect(() => { fetchSuggestForRules(a.rules || []).then(setToml); }, [a.id]);
+
+        const approve = async () => {
+          setError(await parseThen(toml, rules =>
+            postJson(`/approvals/${encodeURIComponent(a.id)}/decision`, {
+              action: 'approve', ttl, rules_applied: rules,
+            })));
+        };
+        const deny = async () => {
+          const m = msgRef.current.value.trim();
+          const resp = await postJson(`/approvals/${encodeURIComponent(a.id)}/decision`, {
             action: 'deny', message: m || null,
           });
           if (!resp.ok) alert(`Deny failed: ${resp.status} ${await resp.text()}`);
-        });
-        // Cache invalidation: if user edits, forget the cached server fetch.
-        tomlEl.addEventListener('input', () => state.pendingToml.set(id, tomlEl.value));
-        return card;
+        };
+
+        const resolved = a.status && a.status !== 'pending';
+        return html`
+          <div class=${'card' + (resolved ? ' resolved' : '')} data-id=${a.id}>
+            <h3>
+              ${a.id}
+              ${a.status === 'approved' && html`<span class="tag approved">approved</span>`}
+              ${a.status === 'denied' && html`<span class="tag denied">denied</span>`}
+            </h3>
+            ${a.reason && html`<div class="reason">${a.reason}</div>`}
+            ${a.triggered_by && html`
+              <div class="triggered">triggered by <code>${a.triggered_by.method} ${a.triggered_by.url}</code></div>`}
+            <div class="editor-row">
+              <textarea class="rule-toml" value=${toml} onInput=${e => setToml(e.target.value)}></textarea>
+            </div>
+            ${error && html`<div class="parse-error">${error}</div>`}
+            <div class="controls">
+              <label class="inline">Lifetime:
+                <${LifetimeSelect} value=${ttl} onChange=${setTtl} />
+              </label>
+              <textarea class="deny-msg" ref=${msgRef} placeholder="Deny message (optional)"></textarea>
+              <button class="approve" onClick=${approve}>Approve</button>
+              <button class="deny" onClick=${deny}>Deny</button>
+            </div>
+          </div>
+        `;
+      }
+
+      function LifetimeSelect({ value, onChange }) {
+        return html`
+          <select value=${value} onChange=${e => onChange(e.target.value)}>
+            <option value="one_hour">1 hour</option>
+            <option value="one_day">1 day</option>
+            <option value="permanent">permanent</option>
+          </select>
+        `;
       }
 
       // ---------- active timeboxed rules ----------
-      function renderActive() {
-        const items = state.active.filter(r => r.remaining_secs !== undefined && r.remaining_secs !== null);
-        if (items.length === 0) {
-          els.active.innerHTML = '<div class="empty">No timeboxed rules active.</div>';
-          return;
-        }
-        els.active.innerHTML = '';
-        for (const it of items) {
-          const card = document.createElement('div');
-          card.className = 'card';
-          card.innerHTML = `
-            <h3>${escapeHtml(it.approval_id)} <span class="tag lifetime">${escapeHtml(it.lifetime)} — ${fmtRemaining(it.remaining_secs)} left</span></h3>
-            <textarea class="rule-toml" readonly>${escapeHtml(it.toml)}</textarea>
-            <div class="controls">
-              <button class="revoke">Revoke</button>
-            </div>
-          `;
-          card.querySelector('.revoke').addEventListener('click', async () => {
-            const resp = await fetch(`/approvals/${encodeURIComponent(it.approval_id)}/rules`, { method: 'DELETE' });
-            if (!resp.ok) alert(`Revoke failed: ${resp.status} ${await resp.text()}`);
-          });
-          els.active.appendChild(card);
-        }
+      function ActiveCard({ rule }) {
+        const revoke = async () => {
+          const resp = await fetch(`/approvals/${encodeURIComponent(rule.approval_id)}/rules`, { method: 'DELETE' });
+          if (!resp.ok) alert(`Revoke failed: ${resp.status} ${await resp.text()}`);
+        };
+        return html`
+          <div class="card">
+            <h3>
+              ${rule.approval_id}
+              <span class="tag lifetime">${rule.lifetime} — ${fmtRemaining(rule.remaining_secs)} left</span>
+            </h3>
+            <textarea class="rule-toml" readonly value=${rule.toml}></textarea>
+            <div class="controls"><button class="revoke" onClick=${revoke}>Revoke</button></div>
+          </div>
+        `;
       }
 
       // ---------- audit list ----------
-      function renderAudit() {
-        const src = state.showAllowed ? state.recent_all : state.recent_blocked;
-        const items = src.slice(0, 100);
-        if (items.length === 0) {
-          els.audit.innerHTML = '<div class="empty">No audit entries.</div>';
-          return;
-        }
-        els.audit.innerHTML = '<div class="audit-list"></div>';
-        const list = els.audit.firstElementChild;
-        for (const e of items) list.appendChild(auditRow(e));
-      }
-
       // Events where "Create rule" makes sense: a real request that
       // either was blocked, was let through only because permissive
       // mode was on (so the user likely wants a permanent rule), or
       // failed auth.
       const RULE_EVENTS = new Set(['request_blocked', 'request_permitted', 'auth_failed']);
 
-      function auditRow(e) {
-        const row = document.createElement('div');
+      function AuditRow({ entry: e, onCreateRule }) {
         const cls = e.event === 'request_blocked' ? 'blocked'
                   : e.event === 'request_permitted' ? 'permitted'
                   : e.event === 'request_allowed' ? 'allowed' : '';
-        row.className = `audit-row ${cls}`;
         const ts = (e.timestamp || '').replace('T', ' ').replace('Z', '');
-        const ev = e.event === 'permissive_enabled'
-          ? `<span class="method">PERMISSIVE ON</span><span class="url">duration=${e.permissive_duration_secs}s source=${escapeHtml(e.permissive_source || '')}</span>`
+        const body = e.event === 'permissive_enabled'
+          ? html`<span class="method">PERMISSIVE ON</span>
+                 <span class="url">duration=${e.permissive_duration_secs}s source=${e.permissive_source || ''}</span>`
           : e.event === 'permissive_disabled'
-          ? `<span class="method">PERMISSIVE OFF</span><span class="url">source=${escapeHtml(e.permissive_source || '')}</span>`
-          : `<span class="method">${escapeHtml(e.method)}</span><span class="url">${escapeHtml(e.url)}</span>`;
-        const reason = e.reason ? `<span class="reason">${escapeHtml(e.reason)}</span>` : '';
-        row.innerHTML = `<span class="ts">${escapeHtml(ts)}</span>${ev}${reason}`;
-        if (RULE_EVENTS.has(e.event)) {
-          const btn = document.createElement('button');
-          btn.className = 'small createrule';
-          btn.textContent = 'Create rule';
-          btn.addEventListener('click', () => openCreateRule(e));
-          row.appendChild(btn);
-        }
-        return row;
-      }
-
-      els.auditIncludeAllowed.addEventListener('change', () => {
-        state.showAllowed = els.auditIncludeAllowed.checked;
-        renderAudit();
-      });
-
-      // ---------- create-rule modal (inline insertion above the audit list) ----------
-      async function openCreateRule(entry) {
-        const toml = await fetchSuggestForAudit(entry);
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.innerHTML = `
-          <h3>Create rule from blocked request</h3>
-          <div class="triggered"><code>${escapeHtml(entry.method)} ${escapeHtml(entry.url)}</code></div>
-          <textarea class="rule-toml">${escapeHtml(toml)}</textarea>
-          <div class="parse-error"></div>
-          <div class="controls">
-            <label class="inline">Lifetime:
-              <select>
-                <option value="one_hour">1 hour</option>
-                <option value="one_day">1 day</option>
-                <option value="permanent" selected>permanent</option>
-              </select>
-            </label>
-            <button class="approve">Add rule</button>
-            <button class="cancel">Cancel</button>
+          ? html`<span class="method">PERMISSIVE OFF</span><span class="url">source=${e.permissive_source || ''}</span>`
+          : html`<span class="method">${e.method}</span><span class="url">${e.url}</span>`;
+        return html`
+          <div class=${`audit-row ${cls}`}>
+            <span class="ts">${ts}</span>
+            ${body}
+            ${e.reason && html`<span class="reason">${e.reason}</span>`}
+            ${RULE_EVENTS.has(e.event) && html`
+              <button class="small createrule" onClick=${() => onCreateRule(e)}>Create rule</button>`}
           </div>
         `;
-        const tomlEl = card.querySelector('.rule-toml');
-        const errEl = card.querySelector('.parse-error');
-        const ttlSel = card.querySelector('select');
-        card.querySelector('.approve').addEventListener('click', async () => {
-          errEl.style.display = 'none';
-          const parsed = await postJson('/rules/parse', { toml: tomlEl.value });
-          if (!parsed.ok) {
-            errEl.style.display = 'block';
-            errEl.textContent = await parsed.text();
-            return;
-          }
-          const { rules } = await parsed.json();
-          const resp = await postJson('/rules', { rules, ttl: ttlSel.value });
-          if (!resp.ok) {
-            errEl.style.display = 'block';
-            errEl.textContent = await resp.text();
-          } else {
-            card.remove();
-          }
-        });
-        card.querySelector('.cancel').addEventListener('click', () => card.remove());
-        els.audit.parentElement.insertBefore(card, els.audit);
+      }
+
+      // ---------- create-rule editor (inserted above the audit list) ----------
+      function CreateRuleCard({ entry, onClose }) {
+        const [toml, setToml] = useState('');
+        const [error, setError] = useState(null);
+        const [ttl, setTtl] = useState('permanent');
+
+        useEffect(() => { fetchSuggestForAudit(entry).then(setToml); }, []);
+
+        const add = async () => {
+          const err = await parseThen(toml, rules => postJson('/rules', { rules, ttl }));
+          if (err === null) onClose(); else setError(err);
+        };
+
+        return html`
+          <div class="card">
+            <h3>Create rule from blocked request</h3>
+            <div class="triggered"><code>${entry.method} ${entry.url}</code></div>
+            <textarea class="rule-toml" value=${toml} onInput=${e => setToml(e.target.value)}></textarea>
+            ${error && html`<div class="parse-error">${error}</div>`}
+            <div class="controls">
+              <label class="inline">Lifetime:
+                <${LifetimeSelect} value=${ttl} onChange=${setTtl} />
+              </label>
+              <button class="approve" onClick=${add}>Add rule</button>
+              <button class="cancel" onClick=${onClose}>Cancel</button>
+            </div>
+          </div>
+        `;
       }
 
       // ---------- notifications ----------
-      function maybeNotify(a) {
+      function notify(a) {
         if (!('Notification' in window) || Notification.permission !== 'granted') return;
         const body = (a.rules || []).map(r => JSON.stringify(r)).join('\n')
           + (a.reason ? `\n— ${a.reason}` : '');
@@ -409,102 +290,174 @@
         } catch (e) { console.warn('Notification failed', e); }
       }
 
-      els.notifyBtn.addEventListener('click', async () => {
-        if (!('Notification' in window)) {
-          els.notifyBtn.textContent = 'Notifications unsupported';
-          els.notifyBtn.disabled = true;
-          return;
-        }
-        const res = await Notification.requestPermission();
-        els.notifyBtn.textContent = res === 'granted' ? 'Notifications on' : `Notifications: ${res}`;
-        els.notifyBtn.disabled = true;
-      });
-      if ('Notification' in window && Notification.permission === 'granted') {
-        els.notifyBtn.textContent = 'Notifications on';
-        els.notifyBtn.disabled = true;
+      function NotifyButton() {
+        const granted = 'Notification' in window && Notification.permission === 'granted';
+        const [label, setLabel] = useState(granted ? 'Notifications on' : 'Enable notifications');
+        const [disabled, setDisabled] = useState(granted);
+
+        const click = async () => {
+          if (!('Notification' in window)) {
+            setLabel('Notifications unsupported');
+            setDisabled(true);
+            return;
+          }
+          const res = await Notification.requestPermission();
+          setLabel(res === 'granted' ? 'Notifications on' : `Notifications: ${res}`);
+          setDisabled(true);
+        };
+        return html`<button id="notify-btn" disabled=${disabled} onClick=${click}>${label}</button>`;
       }
 
-      // ---------- SSE ----------
-      function applySnapshot(msg) {
-        state.pending.clear();
-        state.pendingToml.clear();
-        for (const a of (msg.pending || [])) state.pending.set(a.id, a);
-        state.active = msg.active || [];
-        state.permissive = msg.permissive || { active: false };
-        if (state.permissive.active && state.permissive.remaining_secs != null) {
-          state.permissiveDeadline = Date.now() + state.permissive.remaining_secs * 1000;
-        }
-        state.recent_blocked = msg.recent_blocked || [];
-        state.recent_all = msg.recent_all || [];
-        renderPermissive();
-        renderPending();
-        renderActive();
-        renderAudit();
-      }
+      // ---------- app ----------
+      const EMPTY = {
+        pending: [],              // ApprovalRequest[]
+        active: [],               // ActiveApprovalSnapshot[]
+        permissive: { active: false, remaining_secs: null },
+        permissiveDeadline: null, // millis when the override expires (live countdown)
+        recent_blocked: [],
+        recent_all: [],
+        stream: 'connecting…',
+        drafts: [],               // open create-rule editors: {key, entry}[]
+      };
 
-      function connect() {
-        const es = new EventSource('/events');
-        es.onopen = () => { els.streamStatus.textContent = 'connected'; };
-        es.onerror = () => { els.streamStatus.textContent = 'disconnected — retrying'; };
-        es.onmessage = (ev) => {
-          const msg = JSON.parse(ev.data);
+      function App() {
+        const [st, setSt] = useState(EMPTY);
+        const [showAllowed, setShowAllowed] = useState(false);
+        const allowedRef = useRef(null);
+        const patch = p => setSt(s => ({ ...s, ...(typeof p === 'function' ? p(s) : p) }));
+
+        // Browsers preserve form state across reloads, so on F5 the box may
+        // already be checked before any of our code runs.
+        useEffect(() => { setShowAllowed(allowedRef.current.checked); }, []);
+
+        useEffect(() => {
+          const es = new EventSource('/events');
+          es.onopen = () => patch({ stream: 'connected' });
+          es.onerror = () => patch({ stream: 'disconnected — retrying' });
+          es.onmessage = ev => handle(JSON.parse(ev.data));
+          return () => es.close();
+        }, []);
+
+        function handle(msg) {
           if (msg.event === 'snapshot') {
-            applySnapshot(msg);
+            const p = msg.permissive || { active: false };
+            patch({
+              pending: msg.pending || [],
+              active: msg.active || [],
+              permissive: p,
+              permissiveDeadline: p.active && p.remaining_secs != null
+                ? Date.now() + p.remaining_secs * 1000 : null,
+              recent_blocked: msg.recent_blocked || [],
+              recent_all: msg.recent_all || [],
+            });
           } else if (msg.event === 'pending') {
-            state.pending.set(msg.approval.id, msg.approval);
-            state.pendingToml.delete(msg.approval.id);
-            renderPending();
-            maybeNotify(msg.approval);
+            patch(s => ({ pending: upsertById(s.pending, msg.approval) }));
+            notify(msg.approval);
           } else if (msg.event === 'resolved') {
-            const a = state.pending.get(msg.id);
-            if (a) {
-              // `msg.status` is a nested ApprovalStatus object
-              // ({status, rules_applied?, ttl?, message?}), whereas the
-              // snapshot/pending shapes flatten it. Normalize to the flat
-              // form the rest of the code expects (a.status is the string
-              // discriminant used for the approved/denied tag).
-              const st = msg.status || {};
-              a.status = st.status;
-              if (st.rules_applied) a.rules_applied = st.rules_applied;
-              if (st.message) a.message = st.message;
-              renderPending();
-              setTimeout(() => { state.pending.delete(msg.id); renderPending(); }, 3000);
-            }
+            // `msg.status` is a nested ApprovalStatus object
+            // ({status, rules_applied?, ttl?, message?}), whereas the
+            // snapshot/pending shapes flatten it. Normalize to the flat
+            // form the rest of the code expects (a.status is the string
+            // discriminant used for the approved/denied tag).
+            const st2 = msg.status || {};
+            patch(s => ({
+              pending: s.pending.map(a => a.id === msg.id
+                ? { ...a, status: st2.status, rules_applied: st2.rules_applied, message: st2.message }
+                : a),
+            }));
+            setTimeout(() => patch(s => ({ pending: s.pending.filter(a => a.id !== msg.id) })), 3000);
           } else if (msg.event === 'permissive_changed') {
-            state.permissive = msg.status;
-            if (msg.status.active && msg.status.remaining_secs != null) {
-              state.permissiveDeadline = Date.now() + msg.status.remaining_secs * 1000;
-            } else {
-              state.permissiveDeadline = null;
-            }
-            renderPermissive();
+            patch({
+              permissive: msg.status,
+              permissiveDeadline: msg.status.active && msg.status.remaining_secs != null
+                ? Date.now() + msg.status.remaining_secs * 1000 : null,
+            });
           } else if (msg.event === 'active_rules_changed') {
-            state.active = msg.rules || [];
-            renderActive();
+            patch({ active: msg.rules || [] });
           } else if (msg.event === 'audit') {
             const e = msg.entry;
-            // The server re-fires the SSE audit callback when an
-            // existing entry is mutated (e.g. redirect_target attached
-            // after the response arrives). Replace in place if we
-            // already have an entry with the same timestamp+url+event;
-            // otherwise prepend.
-            const sameKey = x => x.timestamp === e.timestamp && x.url === e.url && x.event === e.event;
-            const upsert = (arr) => {
-              const i = arr.findIndex(sameKey);
-              if (i >= 0) arr[i] = e; else arr.unshift(e);
-              if (arr.length > 500) arr.pop();
-            };
-            upsert(state.recent_all);
-            if (e.event === 'request_blocked' || e.event === 'auth_failed'
-                || e.event === 'request_permitted'
-                || e.event === 'permissive_enabled' || e.event === 'permissive_disabled') {
-              upsert(state.recent_blocked);
-            }
-            renderAudit();
+            const blocked = ['request_blocked', 'auth_failed', 'request_permitted',
+                             'permissive_enabled', 'permissive_disabled'].includes(e.event);
+            patch(s => ({
+              recent_all: upsertAudit(s.recent_all, e),
+              recent_blocked: blocked ? upsertAudit(s.recent_blocked, e) : s.recent_blocked,
+            }));
           }
-        };
+        }
+
+        const openDraft = entry => patch(s => ({ drafts: [...s.drafts, { key: Date.now() + Math.random(), entry }] }));
+        const closeDraft = key => patch(s => ({ drafts: s.drafts.filter(d => d.key !== key) }));
+
+        const activeRules = st.active.filter(r => r.remaining_secs != null);
+        const auditItems = (showAllowed ? st.recent_all : st.recent_blocked).slice(0, 100);
+
+        return html`
+          <h1>pyloros approvals</h1>
+          <div class="bar">
+            <${NotifyButton} />
+            <span class="status" id="stream-status">${st.stream}</span>
+          </div>
+
+          <${PermissiveBar} permissive=${st.permissive} deadline=${st.permissiveDeadline} />
+
+          <h2>Pending approvals</h2>
+          <div id="pending-list">
+            ${st.pending.length === 0
+              ? html`<div class="empty">No pending approvals.</div>`
+              : st.pending.map(a => html`<${PendingCard} key=${a.id} a=${a} />`)}
+          </div>
+
+          <h2>Active timeboxed rules</h2>
+          <div id="active-list">
+            ${activeRules.length === 0
+              ? html`<div class="empty">No timeboxed rules active.</div>`
+              : activeRules.map(r => html`<${ActiveCard} key=${r.approval_id} rule=${r} />`)}
+          </div>
+
+          <h2>Audit log
+            <label class="inline" style="font-weight: normal; margin-left: .5rem;">
+              <input type="checkbox" id="audit-include-allowed" ref=${allowedRef}
+                     onChange=${e => setShowAllowed(e.target.checked)} />
+              also show allowed (rule-matched) requests
+            </label>
+          </h2>
+          ${st.drafts.map(d => html`
+            <${CreateRuleCard} key=${d.key} entry=${d.entry} onClose=${() => closeDraft(d.key)} />`)}
+          <div id="audit-list">
+            ${auditItems.length === 0
+              ? html`<div class="empty">No audit entries.</div>`
+              : html`<div class="audit-list">
+                  ${auditItems.map((e, i) => html`
+                    <${AuditRow} key=${`${e.timestamp}|${e.url}|${e.event}|${i}`} entry=${e} onCreateRule=${openDraft} />`)}
+                </div>`}
+          </div>
+          <div class="filebrk">Older entries available in the audit log file on disk.</div>
+        `;
       }
-      connect();
+
+      function upsertById(list, a) {
+        const i = list.findIndex(x => x.id === a.id);
+        if (i < 0) return [...list, a];
+        const out = list.slice();
+        out[i] = a;
+        return out;
+      }
+
+      // The server re-fires the SSE audit callback when an existing entry is
+      // mutated (e.g. redirect_target attached after the response arrives).
+      // Replace in place if we already have an entry with the same
+      // timestamp+url+event; otherwise prepend.
+      function upsertAudit(list, e) {
+        const i = list.findIndex(x => x.timestamp === e.timestamp && x.url === e.url && x.event === e.event);
+        if (i >= 0) {
+          const out = list.slice();
+          out[i] = e;
+          return out;
+        }
+        return [e, ...list].slice(0, 500);
+      }
+
+      render(html`<${App} />`, document.getElementById('app'));
     </script>
   </body>
 </html>
