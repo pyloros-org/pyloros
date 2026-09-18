@@ -1,7 +1,8 @@
 //! Human-facing dashboard served on the dedicated `dashboard_bind` listener.
 //!
 //! Endpoints:
-//! - `GET /`                              — HTML page (inline JS for SSE + Notification API)
+//! - `GET /`                              — HTML page (Preact app: SSE + Notification API)
+//! - `GET /preact.js`                     — vendored preact+htm module the page imports
 //! - `GET /events`                        — Server-Sent Events stream; first frame is the
 //!   snapshot used by the dashboard UI to initialize state
 //! - `POST /approvals/{id}/decision`      — record a decision for the given approval id
@@ -40,6 +41,7 @@ use crate::audit::AuditEntrySnapshot;
 use crate::config::Rule;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+const PREACT_JS: &str = include_str!("vendor/htm-preact-standalone.module.js");
 
 /// Serve a single dashboard HTTP connection.
 pub async fn serve_connection<S>(manager: Arc<ApprovalManager>, stream: S)
@@ -48,6 +50,7 @@ where
 {
     let app: Router = Router::new()
         .route("/", get(serve_html))
+        .route("/preact.js", get(serve_preact_js))
         .route("/events", get(serve_events))
         .route("/permissive", post(serve_permissive))
         .route("/rules", post(serve_add_rules))
@@ -73,6 +76,13 @@ where
 
 async fn serve_html() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+async fn serve_preact_js() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/javascript")],
+        PREACT_JS,
+    )
 }
 
 /// Snapshot sent as the first SSE frame on `/events`. Dashboards

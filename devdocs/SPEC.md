@@ -300,6 +300,9 @@ Without this section, the agent API returns 404 and no dashboard listener is bou
 - **Dashboard at `dashboard_bind`.** Its own dedicated listener, plain HTTP. Endpoints:
   - `GET /` — HTML page with several panels (see "Dashboard panels" below);
     fires browser notifications via the Notification API when new approvals arrive.
+    The UI is a Preact app using `htm` tagged templates (no JSX, no build step);
+    preact+hooks+htm is vendored in-tree and served at `GET /preact.js`, so the
+    dashboard works offline and the whole UI stays embedded in the binary.
   - `GET /events` — Server-Sent Events stream. The first frame is a full
     snapshot of pending approvals, active timeboxed rules, permissive-mode
     status, and the recent-audit ring buffer; subsequent frames are
