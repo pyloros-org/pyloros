@@ -278,25 +278,7 @@
 
       // ---------- active timeboxed rules ----------
       function renderActive() {
-        const rows = state.active.filter(r => r.remaining_secs !== undefined && r.remaining_secs !== null);
-        // Also synthesize a permissive-mode row when active.
-        const items = [];
-        if (state.permissive.active) {
-          items.push({
-            kind: 'permissive',
-            label: 'permissive mode (timeboxed override)',
-            remaining_secs: state.permissive.remaining_secs,
-          });
-        }
-        for (const r of rows) {
-          items.push({
-            kind: 'rule',
-            approval_id: r.approval_id,
-            lifetime: r.lifetime,
-            remaining_secs: r.remaining_secs,
-            toml: r.toml,
-          });
-        }
+        const items = state.active.filter(r => r.remaining_secs !== undefined && r.remaining_secs !== null);
         if (items.length === 0) {
           els.active.innerHTML = '<div class="empty">No timeboxed rules active.</div>';
           return;
@@ -305,29 +287,17 @@
         for (const it of items) {
           const card = document.createElement('div');
           card.className = 'card';
-          if (it.kind === 'permissive') {
-            card.innerHTML = `
-              <h3>${escapeHtml(it.label)} <span class="tag lifetime">${fmtRemaining(it.remaining_secs)} left</span></h3>
-              <div class="controls">
-                <button class="revoke">Disable now</button>
-              </div>
-            `;
-            card.querySelector('.revoke').addEventListener('click', async () => {
-              await postJson('/permissive', { duration_secs: 0 });
-            });
-          } else {
-            card.innerHTML = `
-              <h3>${escapeHtml(it.approval_id)} <span class="tag lifetime">${escapeHtml(it.lifetime)} — ${fmtRemaining(it.remaining_secs)} left</span></h3>
-              <textarea class="rule-toml" readonly>${escapeHtml(it.toml)}</textarea>
-              <div class="controls">
-                <button class="revoke">Revoke</button>
-              </div>
-            `;
-            card.querySelector('.revoke').addEventListener('click', async () => {
-              const resp = await fetch(`/approvals/${encodeURIComponent(it.approval_id)}/rules`, { method: 'DELETE' });
-              if (!resp.ok) alert(`Revoke failed: ${resp.status} ${await resp.text()}`);
-            });
-          }
+          card.innerHTML = `
+            <h3>${escapeHtml(it.approval_id)} <span class="tag lifetime">${escapeHtml(it.lifetime)} — ${fmtRemaining(it.remaining_secs)} left</span></h3>
+            <textarea class="rule-toml" readonly>${escapeHtml(it.toml)}</textarea>
+            <div class="controls">
+              <button class="revoke">Revoke</button>
+            </div>
+          `;
+          card.querySelector('.revoke').addEventListener('click', async () => {
+            const resp = await fetch(`/approvals/${encodeURIComponent(it.approval_id)}/rules`, { method: 'DELETE' });
+            if (!resp.ok) alert(`Revoke failed: ${resp.status} ${await resp.text()}`);
+          });
           els.active.appendChild(card);
         }
       }
@@ -508,7 +478,6 @@
               state.permissiveDeadline = null;
             }
             renderPermissive();
-            renderActive();
           } else if (msg.event === 'active_rules_changed') {
             state.active = msg.rules || [];
             renderActive();

@@ -80,11 +80,6 @@ export class DashboardPage {
   get notifyButton() {
     return this.page.locator('#notify-btn');
   }
-  permissiveRow() {
-    return this.page.locator('#active-list .card', {
-      hasText: 'permissive mode (timeboxed override)',
-    });
-  }
   async enablePermissive(durationSecs: '300' | '900' | '3600') {
     await this.page.locator('#perm-duration').selectOption(durationSecs);
     await this.page.locator('#perm-enable').click();
