@@ -334,8 +334,7 @@ Without this section, the agent API returns 404 and no dashboard listener is bou
    editable TOML. On approve, the textarea contents go through `/rules/parse`
    and the resulting rules become `rules_applied`.
 3. **Active timeboxed rules.** Lists `OneHour` / `OneDay` approval groups with
-   their remaining time and a Revoke button. The active permissive-mode
-   override appears here as a synthetic row when active.
+   their remaining time and a Revoke button.
 4. **Recent blocked requests.** Newest-first from the audit ring buffer, each
    with a "Create rule" button that opens the TOML editor pre-filled via
    `/rules/suggest`.

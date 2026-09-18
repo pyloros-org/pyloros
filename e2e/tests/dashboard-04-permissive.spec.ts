@@ -8,12 +8,12 @@ test.describe('permissive mode', () => {
     await dashboard.enablePermissive('300');
     await expect(dashboard.permBar).toHaveClass(/active/);
     await expect(dashboard.permStatus).toContainText('permissive mode: ON');
-    await expect(dashboard.permissiveRow()).toBeVisible();
+    // Permissive mode is shown only by the top bar, not the active-rules panel.
+    await expect(dashboard.emptyOf('active-list')).toBeVisible();
     await expect(pyloros).toRouteThrough(probe);
 
     await dashboard.disablePermissive();
     await expect(dashboard.permStatus).toHaveText('permissive mode: off');
-    await expect(dashboard.permissiveRow()).toHaveCount(0);
     await expect(pyloros).toBlock(probe);
   });
 
