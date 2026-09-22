@@ -306,7 +306,7 @@ impl<'de> Deserialize<'de> for LoggingConfig {
 }
 
 /// A single allowlist rule
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Rule {
     /// HTTP method to match (or "*" for any). Required for HTTP rules, absent for git rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]

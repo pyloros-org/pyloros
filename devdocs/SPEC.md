@@ -48,7 +48,7 @@ allow_redirects = ["*"]
 
 Semantics:
 - `allow_redirects` is a list of URL patterns (same wildcard syntax as `url`). The bare string `"*"` is a shorthand for "match any URL" (accepted here but not in other pattern fields, which require a scheme). Omitted or empty = redirects are not followed (follow-up request will be blocked as usual).
-- When a rule-matched request produces a response with a 3xx status and a `Location` header, the Location URL is resolved against the request URL (absolute or relative) and checked against the rule's `allow_redirects` patterns. On match, the exact resolved URL is added to a time-limited global whitelist. Any subsequent request matching that URL exactly is allowed regardless of other rules.
+- When a rule-matched request produces a response with a 3xx status and a `Location` header, the Location URL is resolved against the request URL (absolute or relative) and checked against the `allow_redirects` patterns of **every** rule matching the request, unioned. (A broad rule without `allow_redirects` therefore does not shadow a narrower rule that has them.) On match, the exact resolved URL is added to a time-limited global whitelist. Any subsequent request matching that URL exactly is allowed regardless of other rules.
 - Chains are followed recursively. If a whitelisted-by-redirect request itself returns a 3xx, the new Location is checked against the **original** rule's patterns (which travel with the whitelist entry).
 - The whitelist TTL is controlled by `redirect_whitelist_ttl_secs` under `[proxy]` (default **60**). The whitelist is global — keying per client is not feasible when `direct_https_bind` is used.
 - Applies to both plain HTTP and MITM'd HTTPS (all HTTPS in pyloros is MITM'd).
