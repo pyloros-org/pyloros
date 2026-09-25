@@ -5,7 +5,6 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{KeyLog, KeyLogFile, ServerConfig};
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::ca::CertificateAuthority;
 use super::cache::CertificateCache;
@@ -37,14 +36,10 @@ impl MitmCertificateGenerator {
     }
 
     /// Create with custom cache settings
-    pub fn with_cache(
-        ca: CertificateAuthority,
-        cache_capacity: usize,
-        cache_ttl: Duration,
-    ) -> Self {
+    pub fn with_cache(ca: CertificateAuthority, cache_capacity: usize) -> Self {
         Self {
             ca: Arc::new(ca),
-            cache: CertificateCache::new(cache_capacity, cache_ttl),
+            cache: CertificateCache::new(cache_capacity),
             key_log: Arc::new(KeyLogFile::new()),
         }
     }
@@ -62,11 +57,15 @@ impl MitmCertificateGenerator {
 
         // Generate new certificate
         tracing::debug!(hostname = %hostname, "Generating new certificate");
-        let (cert, key) = self.ca.generate_cert_for_host(hostname)?;
+        let (cert, key, not_after) = self.ca.generate_cert_for_host(hostname)?;
 
         // Cache it
-        self.cache
-            .put(hostname.to_string(), cert.clone(), key.clone_key());
+        self.cache.put(
+            hostname.to_string(),
+            cert.clone(),
+            key.clone_key(),
+            not_after,
+        );
 
         Ok((cert, key))
     }

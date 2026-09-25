@@ -4,19 +4,29 @@ use lru::LruCache;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
+
+/// Certificates are evicted this long before they actually expire, so a certificate is never
+/// handed to a handshake with only moments of validity left.
+const RENEWAL_MARGIN: Duration = Duration::from_secs(60 * 60);
 
 /// A cached certificate entry
 struct CacheEntry {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
-    created_at: Instant,
+    /// The certificate's own `not_after`, as reported by the CA that issued it.
+    not_after: SystemTime,
 }
 
 /// LRU cache for generated certificates
+///
+/// Entries expire on wall-clock time against the certificate's own `not_after`, not on an
+/// independent TTL. A TTL measured with `Instant` would not advance while the host is suspended
+/// (`CLOCK_MONOTONIC` excludes suspend time) while certificate validity, being wall-clock, would
+/// elapse — so after a long suspend the cache would keep serving certificates that clients
+/// already reject as expired. See devdocs/lessons/cert-cache-wall-clock-expiry.md.
 pub struct CertificateCache {
     cache: Mutex<LruCache<String, CacheEntry>>,
-    ttl: Duration,
 }
 
 impl CertificateCache {
@@ -24,12 +34,10 @@ impl CertificateCache {
     ///
     /// # Arguments
     /// * `capacity` - Maximum number of certificates to cache
-    /// * `ttl` - Time-to-live for cached certificates
-    pub fn new(capacity: usize, ttl: Duration) -> Self {
+    pub fn new(capacity: usize) -> Self {
         let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
         Self {
             cache: Mutex::new(LruCache::new(capacity)),
-            ttl,
         }
     }
 
@@ -38,10 +46,10 @@ impl CertificateCache {
         let mut cache = self.cache.lock().unwrap();
 
         if let Some(entry) = cache.get(hostname) {
-            if entry.created_at.elapsed() < self.ttl {
+            if SystemTime::now() + RENEWAL_MARGIN < entry.not_after {
                 return Some((entry.cert.clone(), entry.key.clone_key()));
             } else {
-                // Expired, remove it
+                // Expired (or close enough to it), remove it
                 cache.pop(hostname);
             }
         }
@@ -55,6 +63,7 @@ impl CertificateCache {
         hostname: String,
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
+        not_after: SystemTime,
     ) {
         let mut cache = self.cache.lock().unwrap();
         cache.put(
@@ -62,7 +71,7 @@ impl CertificateCache {
             CacheEntry {
                 cert,
                 key,
-                created_at: Instant::now(),
+                not_after,
             },
         );
     }
@@ -85,8 +94,7 @@ impl CertificateCache {
 
 impl Default for CertificateCache {
     fn default() -> Self {
-        // Default: 1000 certs, 12 hour TTL
-        Self::new(1000, Duration::from_secs(12 * 60 * 60))
+        Self::new(1000)
     }
 }
 
@@ -96,7 +104,9 @@ mod tests {
     use crate::tls::ca::{CertificateAuthority, GeneratedCa};
     use pyloros_test_support::test_report;
 
-    fn generate_test_cert(hostname: &str) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    fn generate_test_cert(
+        hostname: &str,
+    ) -> (CertificateDer<'static>, PrivateKeyDer<'static>, SystemTime) {
         let generated = GeneratedCa::generate().unwrap();
         let ca = CertificateAuthority::from_pem(&generated.cert_pem, &generated.key_pem).unwrap();
         ca.generate_cert_for_host(hostname).unwrap()
@@ -107,8 +117,8 @@ mod tests {
         let t = test_report!("Cache put and get returns same cert");
         let cache = CertificateCache::default();
 
-        let (cert, key) = generate_test_cert("example.com");
-        cache.put("example.com".to_string(), cert.clone(), key);
+        let (cert, key, not_after) = generate_test_cert("example.com");
+        cache.put("example.com".to_string(), cert.clone(), key, not_after);
 
         let result = cache.get("example.com");
         t.assert_true("cache hit", result.is_some());
@@ -126,29 +136,57 @@ mod tests {
 
     #[test]
     fn test_cache_expiration() {
-        let t = test_report!("Cache entries expire after TTL");
-        let cache = CertificateCache::new(100, Duration::from_millis(1));
+        let t = test_report!("Cache evicts entries by the certificate's wall-clock not_after");
+        let cache = CertificateCache::new(100);
+        let (cert, key, _) = generate_test_cert("example.com");
 
-        let (cert, key) = generate_test_cert("example.com");
-        cache.put("example.com".to_string(), cert, key);
+        // Already past not_after: the case a long host suspend produces, where a monotonic TTL
+        // would still consider the entry fresh.
+        cache.put(
+            "expired.com".to_string(),
+            cert.clone(),
+            key.clone_key(),
+            SystemTime::now() - Duration::from_secs(60),
+        );
+        t.assert_true("expired entry is None", cache.get("expired.com").is_none());
 
-        std::thread::sleep(Duration::from_millis(10));
+        // Still valid, but inside the renewal margin.
+        cache.put(
+            "soon.com".to_string(),
+            cert.clone(),
+            key.clone_key(),
+            SystemTime::now() + RENEWAL_MARGIN / 2,
+        );
+        t.assert_true(
+            "entry inside renewal margin is None",
+            cache.get("soon.com").is_none(),
+        );
 
-        t.assert_true("expired entry is None", cache.get("example.com").is_none());
+        // Comfortably valid.
+        cache.put(
+            "fresh.com".to_string(),
+            cert,
+            key,
+            SystemTime::now() + RENEWAL_MARGIN * 2,
+        );
+        t.assert_true(
+            "entry beyond renewal margin is served",
+            cache.get("fresh.com").is_some(),
+        );
     }
 
     #[test]
     fn test_cache_capacity() {
         let t = test_report!("Cache LRU eviction at capacity");
-        let cache = CertificateCache::new(2, Duration::from_secs(3600));
+        let cache = CertificateCache::new(2);
 
-        let (cert1, key1) = generate_test_cert("one.com");
-        let (cert2, key2) = generate_test_cert("two.com");
-        let (cert3, key3) = generate_test_cert("three.com");
+        let (cert1, key1, na1) = generate_test_cert("one.com");
+        let (cert2, key2, na2) = generate_test_cert("two.com");
+        let (cert3, key3, na3) = generate_test_cert("three.com");
 
-        cache.put("one.com".to_string(), cert1, key1);
-        cache.put("two.com".to_string(), cert2, key2);
-        cache.put("three.com".to_string(), cert3, key3);
+        cache.put("one.com".to_string(), cert1, key1, na1);
+        cache.put("two.com".to_string(), cert2, key2, na2);
+        cache.put("three.com".to_string(), cert3, key3, na3);
 
         t.assert_true("one.com evicted", cache.get("one.com").is_none());
         t.assert_true("two.com present", cache.get("two.com").is_some());
@@ -162,8 +200,8 @@ mod tests {
         t.assert_eq("initial len", &cache.len(), &0usize);
         t.assert_true("initially empty", cache.is_empty());
 
-        let (cert, key) = generate_test_cert("example.com");
-        cache.put("example.com".to_string(), cert, key);
+        let (cert, key, not_after) = generate_test_cert("example.com");
+        cache.put("example.com".to_string(), cert, key, not_after);
 
         t.assert_eq("len after put", &cache.len(), &1usize);
         t.assert_true("not empty", !cache.is_empty());
@@ -174,8 +212,8 @@ mod tests {
         let t = test_report!("Cache clear empties cache");
         let cache = CertificateCache::default();
 
-        let (cert, key) = generate_test_cert("example.com");
-        cache.put("example.com".to_string(), cert, key);
+        let (cert, key, not_after) = generate_test_cert("example.com");
+        cache.put("example.com".to_string(), cert, key, not_after);
 
         cache.clear();
         t.assert_true("empty after clear", cache.is_empty());

@@ -6,7 +6,6 @@ mod common;
 use common::TestReport;
 use pyloros::tls::{CertificateAuthority, GeneratedCa, MitmCertificateGenerator};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Reported wrappers
@@ -37,7 +36,8 @@ fn generate_cert_reported(
     host: &str,
 ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     t.action(format!("Generate cert for {}", host));
-    ca.generate_cert_for_host(host).unwrap()
+    let (cert, key, _) = ca.generate_cert_for_host(host).unwrap();
+    (cert, key)
 }
 
 fn create_mitm_reported(t: &TestReport, ca: CertificateAuthority) -> MitmCertificateGenerator {
@@ -178,7 +178,7 @@ fn test_mitm_generator_cache_capacity() {
     let ca = load_ca_from_pem_reported(&t, &generated);
 
     t.action("Create MITM generator with capacity=2");
-    let generator = MitmCertificateGenerator::with_cache(ca, 2, Duration::from_secs(3600));
+    let generator = MitmCertificateGenerator::with_cache(ca, 2);
 
     get_cert_reported(&t, &generator, "one.com");
     get_cert_reported(&t, &generator, "two.com");

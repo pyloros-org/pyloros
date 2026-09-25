@@ -238,7 +238,7 @@ impl TestCa {
 
     /// Build a rustls ServerConfig for a given hostname signed by this CA (with h2 + h1 ALPN).
     pub fn server_tls_config(&self, hostname: &str) -> Arc<ServerConfig> {
-        let (cert, key) = self.ca.generate_cert_for_host(hostname).unwrap();
+        let (cert, key, _) = self.ca.generate_cert_for_host(hostname).unwrap();
         let cert_chain = vec![cert, self.cert_der.clone()];
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
@@ -250,7 +250,7 @@ impl TestCa {
 
     /// Build a rustls ServerConfig that only advertises HTTP/1.1 ALPN.
     pub fn server_tls_config_h1_only(&self, hostname: &str) -> Arc<ServerConfig> {
-        let (cert, key) = self.ca.generate_cert_for_host(hostname).unwrap();
+        let (cert, key, _) = self.ca.generate_cert_for_host(hostname).unwrap();
         let cert_chain = vec![cert, self.cert_der.clone()];
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
