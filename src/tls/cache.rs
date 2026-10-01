@@ -20,11 +20,8 @@ struct CacheEntry {
 
 /// LRU cache for generated certificates
 ///
-/// Entries expire on wall-clock time against the certificate's own `not_after`, not on an
-/// independent TTL. A TTL measured with `Instant` would not advance while the host is suspended
-/// (`CLOCK_MONOTONIC` excludes suspend time) while certificate validity, being wall-clock, would
-/// elapse — so after a long suspend the cache would keep serving certificates that clients
-/// already reject as expired. See devdocs/lessons/cert-cache-wall-clock-expiry.md.
+/// Entries expire against the certificate's own `not_after`, on wall-clock time rather than an
+/// `Instant`-based TTL (see devdocs/lessons/cert-cache-wall-clock-expiry.md).
 pub struct CertificateCache {
     cache: Mutex<LruCache<String, CacheEntry>>,
 }
@@ -140,8 +137,7 @@ mod tests {
         let cache = CertificateCache::new(100);
         let (cert, key, _) = generate_test_cert("example.com");
 
-        // Already past not_after: the case a long host suspend produces, where a monotonic TTL
-        // would still consider the entry fresh.
+        // Already past not_after.
         cache.put(
             "expired.com".to_string(),
             cert.clone(),

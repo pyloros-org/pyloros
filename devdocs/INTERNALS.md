@@ -211,19 +211,15 @@ be created after reload because reqwest pools CONNECT tunnels.
 Per-host certificates are valid for 30 days, CA certificates for 10 years, and both are backdated
 1 hour.
 
-The cert cache has no TTL of its own. It stores the `not_after` that `generate_cert_for_host`
-returns and evicts an entry once `now + 1h > not_after`, checked against `SystemTime`. The
-alternative — an independent TTL measured with `Instant` — is wrong on any host that suspends,
-because `Instant` is `CLOCK_MONOTONIC` and does not advance across a suspend while certificate
-validity does. Docker Desktop on macOS hits this every time the Mac sleeps. Full write-up in
-devdocs/lessons/cert-cache-wall-clock-expiry.md.
+The cert cache has no TTL of its own: it stores the `not_after` that `generate_cert_for_host`
+returns and evicts an entry once `now + 1h > not_after`, checked against `SystemTime`. An
+independent TTL measured with `Instant` is wrong on hosts that suspend, since `Instant` does not
+advance across a suspend while certificate validity does — see
+devdocs/lessons/cert-cache-wall-clock-expiry.md. Keeping the deadline in one place also stops the
+cache and the certificate drifting apart.
 
 The backdate exists because `not_before = now` leaves no tolerance for a client whose clock trails
-the proxy's, including a VM that has resumed but not yet resynced, and a `generate-ca` run before
-the clock is correct.
-
-Keeping the deadline in one place matters: if the cache computed its own expiry instead of using
-the certificate's, the two could drift apart and the check would stop meaning anything.
+the proxy's.
 
 ## Upstream TLS Root CAs
 

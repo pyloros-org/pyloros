@@ -13,9 +13,7 @@ use std::time::SystemTime;
 
 use crate::error::{Error, Result};
 
-/// Certificates are backdated by this much so that a client whose clock lags the proxy's still
-/// accepts them. One hour covers NTP drift and the window after a VM resume (e.g. Docker Desktop
-/// on macOS) before the guest clock resyncs.
+/// Backdate certificates by this much, so a client whose clock lags the proxy's still accepts them.
 const CLOCK_SKEW_BACKDATE: time::Duration = time::Duration::hours(1);
 
 /// Validity period of a generated CA certificate.
@@ -162,9 +160,8 @@ impl CertificateAuthority {
 
     /// Generate a certificate for a specific hostname.
     ///
-    /// Returns the certificate, its private key, and the certificate's `not_after`. The caller
-    /// caches against that value rather than deriving its own expiry, so the cache can never
-    /// disagree with the certificate about when it stops being usable.
+    /// Returns the certificate, its private key, and the certificate's `not_after`, which the
+    /// caller caches against rather than deriving its own expiry.
     pub fn generate_cert_for_host(
         &self,
         hostname: &str,

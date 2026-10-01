@@ -1,7 +1,5 @@
-//! Certificate validity windows must tolerate clock skew between the proxy and its clients.
-//!
-//! Both CA and per-host certificates are backdated, so a client whose clock lags the proxy's —
-//! for instance a VM that has just resumed and not yet resynced — still accepts them.
+//! Certificate validity windows: both CA and per-host certificates are backdated, so a client
+//! whose clock lags the proxy's still accepts them.
 
 mod common;
 
@@ -79,7 +77,7 @@ fn test_host_cert_is_backdated_and_long_lived() {
     let now = now_secs();
 
     t.assert_true(
-        "notBefore is at least 1h in the past (client clock skew tolerance)",
+        "notBefore is at least 1h in the past",
         not_before_secs <= now - HOUR + SLOP,
     );
     t.assert_true(
@@ -123,18 +121,15 @@ fn test_ca_cert_is_backdated() {
 }
 
 #[test]
-fn test_host_cert_outlives_a_weekend_suspend() {
+fn test_host_cert_outlives_a_long_host_suspend() {
     let t = test_report!("Host cert validity exceeds a long host suspend");
 
     let ca = TestCa::generate();
     let (_, _, not_after) = ca.ca.generate_cert_for_host("example.com").unwrap();
 
-    // A Mac asleep from Friday evening to Monday morning is ~60h. A certificate issued before
-    // the suspend must still be valid on resume, since the cache is keyed on wall-clock time
-    // and will happily serve it.
-    let weekend = Duration::from_secs(60 * HOUR as u64);
+    // The cache will serve a cert across a host suspend, so validity has to outlast one.
     t.assert_true(
         "cert issued now is still valid 60h later",
-        not_after > SystemTime::now() + weekend,
+        not_after > SystemTime::now() + Duration::from_secs(60 * HOUR as u64),
     );
 }
