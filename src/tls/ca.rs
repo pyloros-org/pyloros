@@ -22,6 +22,23 @@ const CA_VALIDITY: time::Duration = time::Duration::days(3650);
 /// Validity period of a generated per-host certificate.
 const HOST_CERT_VALIDITY: time::Duration = time::Duration::days(30);
 
+/// A certificate issued for a single host, with the expiry callers cache against
+pub struct HostCert {
+    pub cert: CertificateDer<'static>,
+    pub key: PrivateKeyDer<'static>,
+    pub not_after: SystemTime,
+}
+
+impl Clone for HostCert {
+    fn clone(&self) -> Self {
+        Self {
+            cert: self.cert.clone(),
+            key: self.key.clone_key(),
+            not_after: self.not_after,
+        }
+    }
+}
+
 /// A generated CA certificate and key pair
 pub struct GeneratedCa {
     /// PEM-encoded certificate
@@ -158,14 +175,8 @@ impl CertificateAuthority {
         Self::from_pem(&cert_pem, &key_pem)
     }
 
-    /// Generate a certificate for a specific hostname.
-    ///
-    /// Returns the certificate, its private key, and the certificate's `not_after`, which the
-    /// caller caches against rather than deriving its own expiry.
-    pub fn generate_cert_for_host(
-        &self,
-        hostname: &str,
-    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>, SystemTime)> {
+    /// Generate a certificate for a specific hostname
+    pub fn generate_cert_for_host(&self, hostname: &str) -> Result<HostCert> {
         let mut params = CertificateParams::default();
 
         // Set common name
@@ -211,7 +222,11 @@ impl CertificateAuthority {
         let cert_der = CertificateDer::from(cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key_pair.serialize_der()));
 
-        Ok((cert_der, key_der, not_after))
+        Ok(HostCert {
+            cert: cert_der,
+            key: key_der,
+            not_after,
+        })
     }
 
     /// Get the CA certificate in DER format
@@ -247,9 +262,9 @@ mod tests {
         let generated = GeneratedCa::generate().unwrap();
         let ca = CertificateAuthority::from_pem(&generated.cert_pem, &generated.key_pem).unwrap();
 
-        let (cert_der, key_der, _) = ca.generate_cert_for_host("example.com").unwrap();
-        t.assert_true("cert not empty", !cert_der.is_empty());
-        t.assert_true("key not empty", !key_der.secret_der().is_empty());
+        let issued = ca.generate_cert_for_host("example.com").unwrap();
+        t.assert_true("cert not empty", !issued.cert.is_empty());
+        t.assert_true("key not empty", !issued.key.secret_der().is_empty());
     }
 
     #[test]
@@ -258,8 +273,8 @@ mod tests {
         let generated = GeneratedCa::generate().unwrap();
         let ca = CertificateAuthority::from_pem(&generated.cert_pem, &generated.key_pem).unwrap();
 
-        let (cert_der, _, _) = ca.generate_cert_for_host("api.example.com").unwrap();
-        t.assert_true("cert not empty", !cert_der.is_empty());
+        let issued = ca.generate_cert_for_host("api.example.com").unwrap();
+        t.assert_true("cert not empty", !issued.cert.is_empty());
     }
 
     #[test]
@@ -275,7 +290,7 @@ mod tests {
 
         t.action("Load CA from saved files");
         let ca = CertificateAuthority::from_files(&cert_path, &key_path).unwrap();
-        let (cert_der, _, _) = ca.generate_cert_for_host("test.com").unwrap();
-        t.assert_true("cert from loaded CA not empty", !cert_der.is_empty());
+        let issued = ca.generate_cert_for_host("test.com").unwrap();
+        t.assert_true("cert from loaded CA not empty", !issued.cert.is_empty());
     }
 }

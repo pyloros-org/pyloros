@@ -24,7 +24,8 @@ fn test_strict_x509_validation_accepts_generated_chain() {
     let t = test_report!("Python strict X.509 validation accepts a pyloros-issued cert");
 
     let ca = TestCa::generate();
-    let (cert_der, key_der, _) = ca.ca.generate_cert_for_host("localhost").unwrap();
+    let issued = ca.ca.generate_cert_for_host("localhost").unwrap();
+    let (cert_der, key_der) = (issued.cert, issued.key);
     let key_bytes = match &key_der {
         PrivateKeyDer::Pkcs8(k) => k.secret_pkcs8_der().to_vec(),
         other => other.secret_der().to_vec(),

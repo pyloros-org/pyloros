@@ -36,8 +36,8 @@ fn generate_cert_reported(
     host: &str,
 ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     t.action(format!("Generate cert for {}", host));
-    let (cert, key, _) = ca.generate_cert_for_host(host).unwrap();
-    (cert, key)
+    let issued = ca.generate_cert_for_host(host).unwrap();
+    (issued.cert, issued.key)
 }
 
 fn create_mitm_reported(t: &TestReport, ca: CertificateAuthority) -> MitmCertificateGenerator {

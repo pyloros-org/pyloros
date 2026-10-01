@@ -63,9 +63,9 @@ fn test_host_cert_is_backdated_and_long_lived() {
     let t = test_report!("Per-host certs are backdated 1h and valid for 30 days");
 
     let ca = TestCa::generate();
-    let (cert_der, _, not_after) = ca.ca.generate_cert_for_host("example.com").unwrap();
+    let issued = ca.ca.generate_cert_for_host("example.com").unwrap();
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&cert_der);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&issued.cert);
     let body: String = b64
         .as_bytes()
         .chunks(64)
@@ -91,7 +91,8 @@ fn test_host_cert_is_backdated_and_long_lived() {
 
     // The not_after handed back for caching must be the certificate's own, not a second
     // independently computed deadline: the cache's expiry check is only meaningful if they agree.
-    let reported = not_after
+    let reported = issued
+        .not_after
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
@@ -125,11 +126,11 @@ fn test_host_cert_outlives_a_long_host_suspend() {
     let t = test_report!("Host cert validity exceeds a long host suspend");
 
     let ca = TestCa::generate();
-    let (_, _, not_after) = ca.ca.generate_cert_for_host("example.com").unwrap();
+    let issued = ca.ca.generate_cert_for_host("example.com").unwrap();
 
     // The cache will serve a cert across a host suspend, so validity has to outlast one.
     t.assert_true(
         "cert issued now is still valid 60h later",
-        not_after > SystemTime::now() + Duration::from_secs(60 * HOUR as u64),
+        issued.not_after > SystemTime::now() + Duration::from_secs(60 * HOUR as u64),
     );
 }

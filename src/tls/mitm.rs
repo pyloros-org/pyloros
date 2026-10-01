@@ -1,12 +1,12 @@
 //! MITM certificate generation with caching
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::CertificateDer;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{KeyLog, KeyLogFile, ServerConfig};
 use std::sync::Arc;
 
-use super::ca::CertificateAuthority;
+use super::ca::{CertificateAuthority, HostCert};
 use super::cache::CertificateCache;
 use crate::error::Result;
 
@@ -45,10 +45,7 @@ impl MitmCertificateGenerator {
     }
 
     /// Get or generate a certificate for a hostname
-    pub fn get_cert_for_host(
-        &self,
-        hostname: &str,
-    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    pub fn get_cert_for_host(&self, hostname: &str) -> Result<HostCert> {
         // Check cache first
         if let Some(cached) = self.cache.get(hostname) {
             tracing::debug!(hostname = %hostname, "Using cached certificate");
@@ -57,30 +54,23 @@ impl MitmCertificateGenerator {
 
         // Generate new certificate
         tracing::debug!(hostname = %hostname, "Generating new certificate");
-        let (cert, key, not_after) = self.ca.generate_cert_for_host(hostname)?;
+        let issued = self.ca.generate_cert_for_host(hostname)?;
+        self.cache.put(hostname.to_string(), issued.clone());
 
-        // Cache it
-        self.cache.put(
-            hostname.to_string(),
-            cert.clone(),
-            key.clone_key(),
-            not_after,
-        );
-
-        Ok((cert, key))
+        Ok(issued)
     }
 
     /// Create a rustls ServerConfig for a specific hostname
     pub fn server_config_for_host(&self, hostname: &str) -> Result<ServerConfig> {
-        let (cert, key) = self.get_cert_for_host(hostname)?;
+        let issued = self.get_cert_for_host(hostname)?;
         let ca_cert = self.ca.cert_der().clone();
 
         // Build certificate chain: [host cert, CA cert]
-        let cert_chain = vec![cert, ca_cert];
+        let cert_chain = vec![issued.cert, ca_cert];
 
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
+            .with_single_cert(cert_chain, issued.key)
             .map_err(|e| {
                 crate::error::Error::tls(format!("Failed to build server config: {}", e))
             })?;
@@ -128,8 +118,8 @@ impl ResolvesServerCert for SniCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let hostname = client_hello.server_name()?;
 
-        let (cert, key) = match self.generator.get_cert_for_host(hostname) {
-            Ok(pair) => pair,
+        let issued = match self.generator.get_cert_for_host(hostname) {
+            Ok(issued) => issued,
             Err(e) => {
                 tracing::error!(hostname = %hostname, error = %e, "Failed to generate cert for SNI");
                 return None;
@@ -137,9 +127,9 @@ impl ResolvesServerCert for SniCertResolver {
         };
 
         let ca_cert = self.generator.ca_cert_der().clone();
-        let cert_chain = vec![cert, ca_cert];
+        let cert_chain = vec![issued.cert, ca_cert];
 
-        let signing_key = match rustls::crypto::aws_lc_rs::sign::any_supported_type(&key) {
+        let signing_key = match rustls::crypto::aws_lc_rs::sign::any_supported_type(&issued.key) {
             Ok(k) => k,
             Err(e) => {
                 tracing::error!(hostname = %hostname, error = %e, "Failed to create signing key");
@@ -167,10 +157,10 @@ mod tests {
     fn test_generate_cert() {
         let t = test_report!("MITM generator produces cert+key");
         let generator = create_test_generator();
-        let (cert, key) = generator.get_cert_for_host("example.com").unwrap();
+        let issued = generator.get_cert_for_host("example.com").unwrap();
 
-        t.assert_true("cert not empty", !cert.is_empty());
-        t.assert_true("key not empty", !key.secret_der().is_empty());
+        t.assert_true("cert not empty", !issued.cert.is_empty());
+        t.assert_true("key not empty", !issued.key.secret_der().is_empty());
     }
 
     #[test]
