@@ -202,16 +202,10 @@ Lock endpoints are plain pass-through rules (no body inspection needed):
 ### Certificate Management
 - User-provided or auto-generated CA certificate/key
 - Per-host certificate generation with in-memory LRU cache (1000 entries)
-- Certificate validity:
-  - CA certificates are valid for 10 years, per-host certificates for 30 days.
-  - Both are backdated 1 hour (`not_before = now - 1h`) to tolerate clock skew between the proxy
-    and its clients, and to tolerate a client clock that has not yet resynced after a VM resume.
-- Cached certificates expire on wall-clock time, evicted once `now > not_after - 1h`, so a
-  certificate is never handed to a handshake with less than an hour of validity left. The cache
-  has no independent TTL: a cached certificate's lifetime is the certificate's own validity.
-  This matters on hosts that suspend (e.g. Docker Desktop on macOS when the Mac sleeps), where a
-  monotonic-clock TTL would not advance across the suspend while certificate validity, measured in
-  wall-clock time, would elapse.
+- Certificate validity: 10 years for CA certificates, 30 days for per-host ones, both backdated
+  1 hour to tolerate client clock skew
+- Cached certificates expire on wall-clock time against their own `not_after`, evicted 1 hour
+  before it; the cache has no independent TTL
 - CLI command to generate CA cert/key pair
 - Generated certificates carry Subject Key Identifier and Authority Key Identifier extensions, so
   they pass strict RFC 5280 validation (OpenSSL `X509_V_FLAG_X509_STRICT`, which Python 3.12+
