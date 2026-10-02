@@ -52,6 +52,7 @@ wiremock = "0.6"
 pyloros-test-support = { path = "crates/test-support" }
 libc = "0.2"
 wait-timeout = "0.2"
+x509-parser = "0.18"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

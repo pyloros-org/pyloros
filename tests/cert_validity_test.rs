@@ -3,47 +3,19 @@
 
 mod common;
 
-use base64::Engine;
 use common::TestCa;
-use pyloros::GeneratedCa;
-use std::process::Command;
+use pyloros::{CertificateAuthority, GeneratedCa};
+use rustls::pki_types::CertificateDer;
 use std::time::{Duration, SystemTime};
 
-/// Read a certificate's notBefore/notAfter as seconds since the Unix epoch, via `openssl`.
-fn validity_window(cert_pem: &str) -> (i64, i64) {
-    let out = Command::new("openssl")
-        .args(["x509", "-noout", "-dates", "-dateopt", "iso_8601"])
-        .arg("-in")
-        .arg("/dev/stdin")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.take().unwrap().write_all(cert_pem.as_bytes())?;
-            child.wait_with_output()
-        })
-        .expect("openssl x509 -dates");
-    assert!(out.status.success(), "openssl failed: {:?}", out);
-    let text = String::from_utf8(out.stdout).unwrap();
-
-    let field = |name: &str| -> i64 {
-        let line = text
-            .lines()
-            .find(|l| l.starts_with(name))
-            .unwrap_or_else(|| panic!("no {name} in {text}"));
-        let value = line.split_once('=').unwrap().1.trim();
-        let out = Command::new("date")
-            .args(["-u", "-d", value, "+%s"])
-            .output()
-            .expect("date");
-        String::from_utf8(out.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
-    };
-    (field("notBefore"), field("notAfter"))
+/// A certificate's notBefore/notAfter, as seconds since the Unix epoch.
+fn validity_window(cert_der: &CertificateDer<'_>) -> (i64, i64) {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der).expect("parse cert");
+    let validity = cert.validity();
+    (
+        validity.not_before.timestamp(),
+        validity.not_after.timestamp(),
+    )
 }
 
 fn now_secs() -> i64 {
@@ -65,15 +37,7 @@ fn test_host_cert_is_backdated_and_long_lived() {
     let ca = TestCa::generate();
     let issued = ca.ca.generate_cert_for_host("example.com").unwrap();
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&issued.cert);
-    let body: String = b64
-        .as_bytes()
-        .chunks(64)
-        .map(|c| format!("{}\n", std::str::from_utf8(c).unwrap()))
-        .collect();
-    let pem = format!("-----BEGIN CERTIFICATE-----\n{body}-----END CERTIFICATE-----\n");
-
-    let (not_before_secs, not_after_secs) = validity_window(&pem);
+    let (not_before_secs, not_after_secs) = validity_window(&issued.cert);
     let now = now_secs();
 
     t.assert_true(
@@ -108,7 +72,8 @@ fn test_ca_cert_is_backdated() {
     let t = test_report!("CA certs are backdated 1h and valid for 10 years");
 
     let generated = GeneratedCa::generate().unwrap();
-    let (not_before_secs, not_after_secs) = validity_window(&generated.cert_pem);
+    let ca = CertificateAuthority::from_pem(&generated.cert_pem, &generated.key_pem).unwrap();
+    let (not_before_secs, not_after_secs) = validity_window(ca.cert_der());
     let now = now_secs();
 
     t.assert_true(
