@@ -289,3 +289,20 @@ Permissive-mode toggles emit dedicated audit entries
 `dashboard_clear`, `expired`) fields. Method/URL/host fields are set to `"-"`
 placeholders since these entries are not per-request — keeping the schema
 consistent rather than introducing per-variant required-vs-optional rules.
+
+## Dashboard UI: Preact + htm, vendored
+
+The dashboard page is a Preact app written with `htm` tagged templates rather than
+the raw `innerHTML` string concatenation it started as. The motivation is escaping:
+string building needed an `escapeHtml()` call at every interpolation point, and one
+missed call is an XSS hole. Values interpolated into `htm` templates are inserted as
+data, so escaping is structural.
+
+`htm`'s `preact/standalone` build (preact + hooks + htm, ~13 KB) is vendored at
+`src/approvals/vendor/htm-preact-standalone.module.js` and served at `GET /preact.js`.
+Vendored rather than CDN-loaded because the dashboard must work offline and the whole
+UI is `include_str!`-embedded in the binary. `htm` rather than JSX so there is no
+build step — no npm toolchain in the Rust build.
+
+Class names and element ids are the contract the Playwright page objects
+(`e2e/pages/dashboard.ts`) rely on; keep them stable across markup changes.
