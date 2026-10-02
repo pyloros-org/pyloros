@@ -238,11 +238,11 @@ impl TestCa {
 
     /// Build a rustls ServerConfig for a given hostname signed by this CA (with h2 + h1 ALPN).
     pub fn server_tls_config(&self, hostname: &str) -> Arc<ServerConfig> {
-        let (cert, key) = self.ca.generate_cert_for_host(hostname).unwrap();
-        let cert_chain = vec![cert, self.cert_der.clone()];
+        let issued = self.ca.generate_cert_for_host(hostname).unwrap();
+        let cert_chain = vec![issued.cert, self.cert_der.clone()];
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
+            .with_single_cert(cert_chain, issued.key)
             .unwrap();
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Arc::new(config)
@@ -250,11 +250,11 @@ impl TestCa {
 
     /// Build a rustls ServerConfig that only advertises HTTP/1.1 ALPN.
     pub fn server_tls_config_h1_only(&self, hostname: &str) -> Arc<ServerConfig> {
-        let (cert, key) = self.ca.generate_cert_for_host(hostname).unwrap();
-        let cert_chain = vec![cert, self.cert_der.clone()];
+        let issued = self.ca.generate_cert_for_host(hostname).unwrap();
+        let cert_chain = vec![issued.cert, self.cert_der.clone()];
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
+            .with_single_cert(cert_chain, issued.key)
             .unwrap();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Arc::new(config)

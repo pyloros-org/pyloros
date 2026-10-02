@@ -206,6 +206,21 @@ Tests write a new config, send on the trigger, and `await` the `Notify` to ensur
 the reload is fully applied before making assertions. A new `reqwest::Client` must
 be created after reload because reqwest pools CONNECT tunnels.
 
+## Certificate Validity and Cache Expiry
+
+Per-host certificates are valid for 30 days, CA certificates for 10 years, and both are backdated
+1 hour.
+
+The cert cache has no TTL of its own: it stores the `not_after` that `generate_cert_for_host`
+returns and evicts an entry once `now + 1h > not_after`, checked against `SystemTime`. An
+independent TTL measured with `Instant` is wrong on hosts that suspend, since `Instant` does not
+advance across a suspend while certificate validity does — see
+devdocs/lessons/cert-cache-wall-clock-expiry.md. Keeping the deadline in one place also stops the
+cache and the certificate drifting apart.
+
+The backdate exists because `not_before = now` leaves no tolerance for a client whose clock trails
+the proxy's.
+
 ## Upstream TLS Root CAs
 
 By default, the proxy trusts both `webpki-roots` (Mozilla's bundled root CA bundle) and

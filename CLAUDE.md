@@ -160,6 +160,7 @@ across parallel worktrees:
 - `x509_strict_test.rs` — generated certs pass OpenSSL strict X.509 validation (Python `ssl.VERIFY_X509_STRICT`)
 - `git_lfs_test.rs` — Git-LFS batch endpoint filtering: operation checks, merged-scan, plain HTTP blocking
 - `audit_log_test.rs` — Structured JSONL audit log: allowed/blocked/auth entries, credential info, HTTP vs HTTPS
+- `cert_validity_test.rs` — cert validity windows: clock-skew backdating, 30-day host certs
 
 Shared test infrastructure (TestCa, TestProxy, TestUpstream, handlers) lives in
 `tests/common/mod.rs`.

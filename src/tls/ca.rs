@@ -9,8 +9,35 @@ use rustls_pemfile;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::error::{Error, Result};
+
+/// Backdate certificates by this much, so a client whose clock lags the proxy's still accepts them.
+const CLOCK_SKEW_BACKDATE: time::Duration = time::Duration::hours(1);
+
+/// Validity period of a generated CA certificate.
+const CA_VALIDITY: time::Duration = time::Duration::days(3650);
+
+/// Validity period of a generated per-host certificate.
+const HOST_CERT_VALIDITY: time::Duration = time::Duration::days(30);
+
+/// A certificate issued for a single host, with the expiry callers cache against
+pub struct HostCert {
+    pub cert: CertificateDer<'static>,
+    pub key: PrivateKeyDer<'static>,
+    pub not_after: SystemTime,
+}
+
+impl Clone for HostCert {
+    fn clone(&self) -> Self {
+        Self {
+            cert: self.cert.clone(),
+            key: self.key.clone_key(),
+            not_after: self.not_after,
+        }
+    }
+}
 
 /// A generated CA certificate and key pair
 pub struct GeneratedCa {
@@ -47,9 +74,8 @@ impl GeneratedCa {
         // certificates lack an Authority Key Identifier.
         params.use_authority_key_identifier_extension = true;
 
-        // Valid for 10 years
-        params.not_before = time::OffsetDateTime::now_utc();
-        params.not_after = params.not_before + time::Duration::days(3650);
+        params.not_before = time::OffsetDateTime::now_utc() - CLOCK_SKEW_BACKDATE;
+        params.not_after = params.not_before + CA_VALIDITY;
 
         // Generate key pair
         let key_pair = KeyPair::generate().map_err(|e| Error::certificate(e.to_string()))?;
@@ -150,10 +176,7 @@ impl CertificateAuthority {
     }
 
     /// Generate a certificate for a specific hostname
-    pub fn generate_cert_for_host(
-        &self,
-        hostname: &str,
-    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    pub fn generate_cert_for_host(&self, hostname: &str) -> Result<HostCert> {
         let mut params = CertificateParams::default();
 
         // Set common name
@@ -180,9 +203,9 @@ impl CertificateAuthority {
         // Required by strict RFC 5280 validation (ssl.VERIFY_X509_STRICT)
         params.use_authority_key_identifier_extension = true;
 
-        // Valid for 1 day (short-lived MITM certs)
-        params.not_before = time::OffsetDateTime::now_utc();
-        params.not_after = params.not_before + time::Duration::days(1);
+        params.not_before = time::OffsetDateTime::now_utc() - CLOCK_SKEW_BACKDATE;
+        params.not_after = params.not_before + HOST_CERT_VALIDITY;
+        let not_after = SystemTime::from(params.not_after);
 
         // Generate new key pair for this cert
         let cert_key_pair = KeyPair::generate().map_err(|e| Error::certificate(e.to_string()))?;
@@ -199,7 +222,11 @@ impl CertificateAuthority {
         let cert_der = CertificateDer::from(cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key_pair.serialize_der()));
 
-        Ok((cert_der, key_der))
+        Ok(HostCert {
+            cert: cert_der,
+            key: key_der,
+            not_after,
+        })
     }
 
     /// Get the CA certificate in DER format
@@ -235,9 +262,9 @@ mod tests {
         let generated = GeneratedCa::generate().unwrap();
         let ca = CertificateAuthority::from_pem(&generated.cert_pem, &generated.key_pem).unwrap();
 
-        let (cert_der, key_der) = ca.generate_cert_for_host("example.com").unwrap();
-        t.assert_true("cert not empty", !cert_der.is_empty());
-        t.assert_true("key not empty", !key_der.secret_der().is_empty());
+        let issued = ca.generate_cert_for_host("example.com").unwrap();
+        t.assert_true("cert not empty", !issued.cert.is_empty());
+        t.assert_true("key not empty", !issued.key.secret_der().is_empty());
     }
 
     #[test]
@@ -246,8 +273,8 @@ mod tests {
         let generated = GeneratedCa::generate().unwrap();
         let ca = CertificateAuthority::from_pem(&generated.cert_pem, &generated.key_pem).unwrap();
 
-        let (cert_der, _) = ca.generate_cert_for_host("api.example.com").unwrap();
-        t.assert_true("cert not empty", !cert_der.is_empty());
+        let issued = ca.generate_cert_for_host("api.example.com").unwrap();
+        t.assert_true("cert not empty", !issued.cert.is_empty());
     }
 
     #[test]
@@ -263,7 +290,7 @@ mod tests {
 
         t.action("Load CA from saved files");
         let ca = CertificateAuthority::from_files(&cert_path, &key_path).unwrap();
-        let (cert_der, _) = ca.generate_cert_for_host("test.com").unwrap();
-        t.assert_true("cert from loaded CA not empty", !cert_der.is_empty());
+        let issued = ca.generate_cert_for_host("test.com").unwrap();
+        t.assert_true("cert from loaded CA not empty", !issued.cert.is_empty());
     }
 }

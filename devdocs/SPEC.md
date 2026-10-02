@@ -201,7 +201,11 @@ Lock endpoints are plain pass-through rules (no body inspection needed):
 
 ### Certificate Management
 - User-provided or auto-generated CA certificate/key
-- Per-host certificate generation with in-memory LRU cache (1000 entries, 12h TTL)
+- Per-host certificate generation with in-memory LRU cache (1000 entries)
+- Certificate validity: 10 years for CA certificates, 30 days for per-host ones, both backdated
+  1 hour to tolerate client clock skew
+- Cached certificates expire on wall-clock time against their own `not_after`, evicted 1 hour
+  before it; the cache has no independent TTL
 - CLI command to generate CA cert/key pair
 - Generated certificates carry Subject Key Identifier and Authority Key Identifier extensions, so
   they pass strict RFC 5280 validation (OpenSSL `X509_V_FLAG_X509_STRICT`, which Python 3.12+
