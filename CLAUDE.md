@@ -105,6 +105,15 @@ IMPORTANT: Always run `lefthook install` in new worktrees. Without this, the pre
 
 **Finishing**: default to `gh pr create`. For trivial changes where a PR would be overkill, merge locally with `--no-ff` for clearer history. Ask the user if unclear.
 
+`main` is protected by a merge queue, so `gh pr merge` cannot merge a PR (even with `--admin`). Enqueue it instead:
+
+```bash
+PRID=$(gh pr view <N> --json id -q .id)
+gh api graphql -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){mergeQueueEntry{position state}}}' -f id="$PRID"
+```
+
+Then poll `gh pr view <N> --json state -q .state` until `MERGED`.
+
 **Cleanup** (after merge/PR):
 
 ```bash
