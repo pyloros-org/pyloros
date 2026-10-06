@@ -33,9 +33,23 @@ Cut a new release of pyloros. Arguments: `$ARGUMENTS` — optional explicit vers
    git push -u origin claude/release-vX.Y.Z
    gh pr create --title "release: vX.Y.Z" --body "Bump version to X.Y.Z. Release notes auto-generated on tag push."
    ```
-   Wait for CI to go green, then merge (squash or merge-commit — project default).
+   Wait for CI to go green, then merge via the merge queue (see step 6).
 
-6. **Tag and push** (AFTER the PR is merged to main):
+6. **Merge through the merge queue**
+
+   `main` is protected by a GitHub merge queue, and `gh pr merge` cannot enqueue
+   (it fails with "Auto merge is not allowed for this repository", and `--admin`
+   with "Changes must be made through the merge queue"). Enqueue via GraphQL:
+
+   ```bash
+   PRID=$(gh pr view <N> --json id -q .id)
+   gh api graphql -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){mergeQueueEntry{position state}}}' -f id="$PRID"
+   ```
+
+   Then poll `gh pr view <N> --json state -q .state` until `MERGED`. The branch is
+   deleted automatically; `--delete-branch` is rejected with a merge queue enabled.
+
+7. **Tag and push** (AFTER the PR is merged to main):
    ```bash
    git checkout main && git pull
    git tag vX.Y.Z
@@ -43,9 +57,9 @@ Cut a new release of pyloros. Arguments: `$ARGUMENTS` — optional explicit vers
    ```
    The `release.yml` workflow validates `tag == Cargo.toml version`, builds the musl binary, creates the GitHub Release with auto-generated notes, and pushes `ghcr.io/pyloros-org/pyloros:vX.Y.Z` + `:latest`.
 
-7. **Verify**: `gh release view vX.Y.Z` and confirm the tarball + SHA256SUMS + docker image are present.
+8. **Verify**: `gh release view vX.Y.Z` and confirm the tarball + SHA256SUMS + docker image are present.
 
-8. **Cleanup**:
+9. **Cleanup**:
    ```bash
    git worktree remove ../pyloros-worktrees/release-vX.Y.Z
    git branch -d claude/release-vX.Y.Z
