@@ -508,19 +508,30 @@ impl FilterEngine {
         !matches!(self.check(request), FilterResult::Blocked)
     }
 
-    /// Return the redirect patterns of the first matching rule, if any.
+    /// Return the redirect patterns of every matching rule, unioned.
     /// Used after a request is allowed to determine whether a 3xx response
-    /// should extend the whitelist.
+    /// should extend the whitelist. Rules without `allow_redirects`
+    /// contribute nothing rather than shadowing later rules that have them —
+    /// otherwise a broad base rule would suppress a narrower rule (typically
+    /// one added by an approval) that exists precisely to allow the redirect.
     pub fn redirect_policy_for(&self, request: &RequestInfo) -> Option<Arc<Vec<UrlPattern>>> {
+        let mut found: Option<Arc<Vec<UrlPattern>>> = None;
+        let mut merged: Option<Vec<UrlPattern>> = None;
         for rule in &self.rules {
-            if rule.matches(request) {
-                if rule.allow_redirects.is_empty() {
-                    return None;
+            if rule.allow_redirects.is_empty() || !rule.matches(request) {
+                continue;
+            }
+            match (&found, &mut merged) {
+                (None, _) => found = Some(rule.allow_redirects.clone()),
+                (Some(first), None) => {
+                    let mut v = first.as_ref().clone();
+                    v.extend(rule.allow_redirects.iter().cloned());
+                    merged = Some(v);
                 }
-                return Some(rule.allow_redirects.clone());
+                (Some(_), Some(v)) => v.extend(rule.allow_redirects.iter().cloned()),
             }
         }
-        None
+        merged.map(Arc::new).or(found)
     }
 
     /// Like `check()` but consults the dynamic whitelist first. If the request's
@@ -1510,6 +1521,62 @@ mod tests {
         let policy = engine.redirect_policy_for(&req);
         t.assert_true("policy present", policy.is_some());
         t.assert_eq("one pattern", &policy.unwrap().len(), &1usize);
+    }
+
+    #[test]
+    fn test_redirect_policy_not_shadowed_by_earlier_broad_rule() {
+        // Engine order is base_rules ++ approval_rules, so a broad base rule
+        // without allow_redirects sits in front of the approval rule that has
+        // them. It must not suppress them.
+        let t = test_report!("Broad rule without allow_redirects doesn't shadow a later one");
+        let engine = FilterEngine::new(vec![
+            make_rule("GET", "https://a.example.com/*"),
+            rule_with_redirects(
+                "GET",
+                "https://a.example.com/dl/*",
+                &["https://cdn.example.com/*"],
+            ),
+        ])
+        .unwrap();
+        let req = RequestInfo::http("GET", "https", "a.example.com", None, "/dl/f", None);
+        let policy = engine.redirect_policy_for(&req);
+        t.assert_true("policy present", policy.is_some());
+        t.assert_eq("one pattern", &policy.unwrap().len(), &1usize);
+    }
+
+    #[test]
+    fn test_redirect_policy_unions_matching_rules() {
+        let t = test_report!("redirect_policy_for unions patterns from all matching rules");
+        let engine = FilterEngine::new(vec![
+            rule_with_redirects(
+                "GET",
+                "https://a.example.com/*",
+                &["https://cdn1.example.com/*"],
+            ),
+            rule_with_redirects(
+                "GET",
+                "https://a.example.com/dl/*",
+                &["https://cdn2.example.com/*"],
+            ),
+        ])
+        .unwrap();
+        let req = RequestInfo::http("GET", "https", "a.example.com", None, "/dl/f", None);
+        let policy = engine.redirect_policy_for(&req).unwrap();
+        t.assert_eq("two patterns", &policy.len(), &2usize);
+        t.assert_true(
+            "cdn2 matches",
+            crate::filter::dynamic_whitelist::url_matches_any(
+                "https://cdn2.example.com/obj",
+                &policy,
+            ),
+        );
+        t.assert_true(
+            "cdn1 still matches",
+            crate::filter::dynamic_whitelist::url_matches_any(
+                "https://cdn1.example.com/obj",
+                &policy,
+            ),
+        );
     }
 
     #[test]

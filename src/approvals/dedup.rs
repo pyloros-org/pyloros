@@ -12,7 +12,7 @@
 //! operation — not just the info/refs preamble.
 
 use crate::config::Rule;
-use crate::filter::{FilterEngine, RequestInfo};
+use crate::filter::{FilterEngine, FilterResult, RequestInfo};
 
 use super::types::TriggeredBy;
 
@@ -24,19 +24,32 @@ struct Probe {
     port: Option<u16>,
     path: String,
     query: Option<String>,
+    websocket: bool,
 }
 
 impl Probe {
     fn run(&self, engine: &FilterEngine) -> bool {
-        let info = RequestInfo::http(
-            &self.method,
-            &self.scheme,
-            &self.host,
-            self.port,
-            &self.path,
-            self.query.as_deref(),
-        );
-        engine.is_allowed(&info)
+        let info = if self.websocket {
+            RequestInfo::websocket(
+                &self.scheme,
+                &self.host,
+                self.port,
+                &self.path,
+                self.query.as_deref(),
+            )
+        } else {
+            RequestInfo::http(
+                &self.method,
+                &self.scheme,
+                &self.host,
+                self.port,
+                &self.path,
+                self.query.as_deref(),
+            )
+        };
+        // Only a plain `Allowed` attests full coverage: a covering rule that
+        // demands branch or LFS body inspection may still block the request.
+        matches!(engine.check(&info), FilterResult::Allowed { .. })
     }
 }
 
@@ -49,6 +62,11 @@ impl Probe {
 /// for the first proposed rule when that rule is plain method-based.
 /// Git rules ignore `triggered_by` because one endpoint isn't enough
 /// to attest coverage of all the smart-HTTP endpoints they expand to.
+///
+/// A proposal carrying `allow_redirects`, `branches` or `log_body` asks
+/// for behaviour an allow/block probe cannot attest, so it is never
+/// subsumed — those go to the human even when the method+URL is already
+/// allowed.
 pub fn all_subsumed(
     engine: &FilterEngine,
     proposed_rules: &[Rule],
@@ -58,9 +76,12 @@ pub fn all_subsumed(
         return false;
     }
     for (i, rule) in proposed_rules.iter().enumerate() {
+        if !rule.allow_redirects.is_empty() || rule.branches.is_some() || rule.log_body {
+            return false;
+        }
         let probes = if i == 0 && rule.git.is_none() {
             triggered_by
-                .and_then(probe_from_triggered_by)
+                .and_then(|tb| probe_from_triggered_by(tb, rule.websocket))
                 .map(|p| vec![p])
                 .or_else(|| probes_from_rule(rule))
         } else {
@@ -81,7 +102,7 @@ pub fn all_subsumed(
     true
 }
 
-fn probe_from_triggered_by(tb: &TriggeredBy) -> Option<Probe> {
+fn probe_from_triggered_by(tb: &TriggeredBy, websocket: bool) -> Option<Probe> {
     let url = url::Url::parse(&tb.url).ok()?;
     Some(Probe {
         method: tb.method.clone(),
@@ -90,6 +111,7 @@ fn probe_from_triggered_by(tb: &TriggeredBy) -> Option<Probe> {
         port: url.port(),
         path: url.path().to_string(),
         query: url.query().map(|q| q.to_string()),
+        websocket,
     })
 }
 
@@ -115,6 +137,7 @@ fn probes_from_rule(rule: &Rule) -> Option<Vec<Probe>> {
         port,
         path,
         query: None,
+        websocket: rule.websocket,
     }])
 }
 
@@ -165,6 +188,7 @@ fn probes_for_git(
             port,
             path: format!("{}/info/refs", base),
             query: Some("service=git-upload-pack".into()),
+            websocket: false,
         });
         probes.push(Probe {
             method: "POST".into(),
@@ -173,6 +197,7 @@ fn probes_for_git(
             port,
             path: format!("{}/git-upload-pack", base),
             query: None,
+            websocket: false,
         });
     }
     if want_push {
@@ -183,6 +208,7 @@ fn probes_for_git(
             port,
             path: format!("{}/info/refs", base),
             query: Some("service=git-receive-pack".into()),
+            websocket: false,
         });
         probes.push(Probe {
             method: "POST".into(),
@@ -191,6 +217,7 @@ fn probes_for_git(
             port,
             path: format!("{}/git-receive-pack", base),
             query: None,
+            websocket: false,
         });
     }
 
@@ -288,6 +315,94 @@ mod tests {
             !all_subsumed(
                 &engine,
                 &[mk_method_rule("POST", "https://api.foo.com/*")],
+                None,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_option_fields_never_subsumed() {
+        let t = test_report!("Proposals carrying extra options are never deduped");
+        let engine =
+            FilterEngine::new(vec![mk_method_rule("GET", "https://api.foo.com/*")]).unwrap();
+
+        let mut redirects = mk_method_rule("GET", "https://api.foo.com/*");
+        redirects.allow_redirects = vec!["https://cdn.foo.com/*".to_string()];
+        t.assert_true(
+            "allow_redirects not subsumed",
+            !all_subsumed(&engine, &[redirects], None),
+        );
+
+        let mut log_body = mk_method_rule("GET", "https://api.foo.com/*");
+        log_body.log_body = true;
+        t.assert_true(
+            "log_body not subsumed",
+            !all_subsumed(&engine, &[log_body], None),
+        );
+
+        let mut branches = mk_git_rule("push", "https://github.com/foo/bar");
+        branches.branches = Some(vec!["main".to_string()]);
+        t.assert_true(
+            "branches not subsumed",
+            !all_subsumed(
+                &FilterEngine::new(vec![mk_git_rule("push", "https://github.com/foo/bar")])
+                    .unwrap(),
+                &[branches],
+                None,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_option_fields_not_subsumed_even_with_triggered_by() {
+        // triggered_by supplies the probe URL for the first rule — it must not
+        // let an allow_redirects proposal slip past the option check.
+        let t = test_report!("triggered_by doesn't bypass the extra-options check");
+        let engine =
+            FilterEngine::new(vec![mk_method_rule("GET", "https://api.foo.com/*")]).unwrap();
+        let mut rule = mk_method_rule("GET", "https://api.foo.com/dl/*");
+        rule.allow_redirects = vec!["https://cdn.foo.com/*".to_string()];
+        let tb = TriggeredBy {
+            method: "GET".to_string(),
+            url: "https://api.foo.com/dl/x".to_string(),
+        };
+        t.assert_true("not subsumed", !all_subsumed(&engine, &[rule], Some(&tb)));
+    }
+
+    #[test]
+    fn test_websocket_rule_not_subsumed_by_http_rule() {
+        let t = test_report!("WebSocket proposal isn't covered by a plain HTTP rule");
+        let engine =
+            FilterEngine::new(vec![mk_method_rule("GET", "https://api.foo.com/*")]).unwrap();
+        let mut ws = mk_method_rule("GET", "https://api.foo.com/socket");
+        ws.websocket = true;
+        t.assert_true(
+            "ws not subsumed by http",
+            !all_subsumed(&engine, &[ws], None),
+        );
+
+        let mut ws_rule = mk_method_rule("GET", "https://api.foo.com/*");
+        ws_rule.websocket = true;
+        let ws_engine = FilterEngine::new(vec![ws_rule.clone()]).unwrap();
+        t.assert_true(
+            "ws subsumed by ws",
+            all_subsumed(&ws_engine, &[ws_rule], None),
+        );
+    }
+
+    #[test]
+    fn test_branch_restricted_rule_is_not_full_coverage() {
+        // Active rule only permits pushes to main; a proposal for unrestricted
+        // push must still reach the human.
+        let t = test_report!("Branch-restricted active rule doesn't subsume an open push");
+        let mut restricted = mk_git_rule("push", "https://github.com/foo/bar");
+        restricted.branches = Some(vec!["main".to_string()]);
+        let engine = FilterEngine::new(vec![restricted]).unwrap();
+        t.assert_true(
+            "open push not subsumed",
+            !all_subsumed(
+                &engine,
+                &[mk_git_rule("push", "https://github.com/foo/bar")],
                 None,
             ),
         );
