@@ -12,6 +12,9 @@ bind_address = "127.0.0.1:8080"
 ca_cert = "./certs/ca.crt"
 ca_key = "./certs/ca.key"
 
+# Path for generated local credential secrets (required when using local_generated)
+generated_secrets_file = "/tmp/pyloros-secrets.env"
+
 [logging]
 # Log level: error, warn, info, debug, trace
 level = "info"
@@ -74,24 +77,37 @@ websocket = true
 # Inject API keys and tokens into outgoing requests so the AI agent
 # never sees real secrets. Credentials are only injected for HTTPS.
 # All string values support ${ENV_VAR} placeholders.
+#
+# Every credential requires a local credential — a substitute value the
+# sandbox uses. The proxy verifies the local credential before injecting
+# the real one. Two sources:
+#   local_value = "${ENV_VAR}"   — from an environment variable
+#   local_generated = true       — proxy generates at startup, writes to
+#                                  generated_secrets_file
 
-# Inject an API key header (type defaults to "header" if omitted)
+# Inject an API key header with a generated local credential.
+# The proxy generates a random value and writes it to the secrets file
+# using the env var name from `value` (ANTHROPIC_API_KEY).
 [[credentials]]
 url = "https://api.anthropic.com/*"
 header = "x-api-key"
 value = "${ANTHROPIC_API_KEY}"
+local_generated = true
 
-# Inject a bearer token for a private API
+# Inject a bearer token with a local credential from an env var
 # [[credentials]]
 # url = "https://internal.example.com/*"
 # header = "Authorization"
 # value = "Bearer ${INTERNAL_TOKEN}"
+# local_value = "${LOCAL_INTERNAL_TOKEN}"
 
 # Re-sign AWS requests with real credentials (AWS SigV4)
-# The agent can use dummy AWS keys; the proxy re-signs transparently.
+# The agent uses generated fake AWS keys; the proxy verifies the signature
+# and re-signs with real credentials.
 # [[credentials]]
 # type = "aws-sigv4"
 # url = "https://*.amazonaws.com/*"
 # access_key_id = "${AWS_ACCESS_KEY_ID}"
 # secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # session_token = "${AWS_SESSION_TOKEN}"
+# local_generated = true

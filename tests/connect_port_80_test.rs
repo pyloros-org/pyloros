@@ -7,7 +7,7 @@
 mod common;
 
 use common::{TestCa, TestProxy, read_audit_entries, rule};
-use pyloros::config::Credential;
+use pyloros::config::{Credential, LocalHeaderConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
@@ -207,6 +207,7 @@ async fn test_port_80_connect_does_not_inject_credentials() {
             url: url_pattern.clone(),
             header: "x-api-key".to_string(),
             value: "should-not-inject".to_string(),
+            local: LocalHeaderConfig::Value("local-token".to_string()),
         }])
         .report(&t)
         .start()

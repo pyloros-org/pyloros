@@ -171,11 +171,13 @@ url = "https://api.example.com/*"
 url = "https://api.example.com/*"
 header = "x-api-key"
 value = "literal-key"
+local_value = "local-key"
 
 [[credentials]]
 url = "https://other.com/*"
 header = "authorization"
 value = "Bearer tok"
+local_value = "local-tok"
 "#,
     )
     .unwrap();
