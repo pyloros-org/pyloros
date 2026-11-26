@@ -911,6 +911,88 @@ async fn test_dedup_auto_approves_subsumed_rule() {
 }
 
 #[tokio::test]
+async fn test_redirect_rule_is_not_deduped_against_plain_rule() {
+    let t = test_report!("A rule adding allow_redirects on top of an allowed URL still asks");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let rules_file = tempfile::NamedTempFile::new().unwrap();
+    let permanent_rules_path = rules_file.path().to_string_lossy().into_owned();
+    let proxy = TestProxy::builder(
+        &ca,
+        vec![method_rule("GET", "https://api.foo.com/*")],
+        upstream.port(),
+    )
+    .with_approvals(&permanent_rules_path)
+    .report(&t)
+    .start()
+    .await;
+    let manager = proxy.approvals.clone().unwrap();
+
+    let client = ReportingClient::new(&t, proxy.addr(), &ca);
+    let resp = client
+        .post_with_body(
+            "https://pyloros.internal/approvals",
+            json!({"rules": [{
+                "method": "GET",
+                "url": "https://api.foo.com/dl/*",
+                "allow_redirects": ["https://cdn.foo.com/*"]
+            }]})
+            .to_string(),
+        )
+        .await;
+    t.assert_eq(
+        "status is 202, not deduped",
+        &resp.status().as_u16(),
+        &202u16,
+    );
+    t.assert_eq("pending created", &manager.list_pending().len(), &1usize);
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
+async fn test_identical_rule_approved_twice_is_stored_once() {
+    let t = test_report!("Approving the same rule twice doesn't duplicate the active entry");
+
+    let ca = TestCa::generate();
+    let upstream = TestUpstream::builder(&ca, ok_handler("unused"))
+        .report(&t, "unused")
+        .start()
+        .await;
+    let (proxy, _rules_file) = start_proxy_with_approvals(&t, &ca, upstream.port()).await;
+    let manager = proxy.approvals.clone().unwrap();
+
+    let rule = method_rule("GET", "https://api.foo.com/*");
+    manager
+        .add_rules(vec![rule.clone()], Lifetime::Permanent)
+        .unwrap();
+    manager
+        .add_rules(vec![rule.clone()], Lifetime::Permanent)
+        .unwrap();
+    t.assert_eq("stored once", &manager.active_rules().len(), &1usize);
+
+    // A rule differing only in options is a different rule and is kept.
+    let mut with_redirects = rule;
+    with_redirects.allow_redirects = vec!["https://cdn.foo.com/*".to_string()];
+    manager
+        .add_rules(vec![with_redirects], Lifetime::Permanent)
+        .unwrap();
+    t.assert_eq(
+        "option variant kept",
+        &manager.active_rules().len(),
+        &2usize,
+    );
+
+    proxy.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test]
 async fn test_rate_limit_returns_429() {
     let t = test_report!("Bursting past 60 POSTs in <60s eventually returns 429");
 

@@ -100,6 +100,8 @@ If all proposed rules are already matched by the active ruleset, the approval au
 
 Implementation: synthesize probe URLs from each proposed rule and run them through the existing `FilterEngine`. Plain method rules need one probe; git rules probe each direction (`/info/refs?service=git-{upload,receive}-pack` AND `/git-{upload,receive}-pack`) so a partial method-rule doesn't falsely subsume a `git=fetch`. Wildcard hosts → probe synthesis bails → not subsumed (ask the human). See `src/approvals/dedup.rs`.
 
+Dedup only short-circuits for plain allow-rules. A proposal carrying `allow_redirects`, `branches` or `log_body` asks for behaviour an allow/block probe cannot attest — it is never subsumed, even if its method+URL is already allowed. Likewise, coverage requires the probe to come back as a plain `Allowed`: a covering rule that demands branch or LFS body inspection is not full coverage. Dedup is an optimization, so erring towards the human is the safe side.
+
 ## Open questions (post-v1)
 
 1. **Session-only rules** — currently "session" means the proxy process lifetime. A narrower notion (one run of the agent) would require the agent to identify its session, which we said we don't trust. Live with the wider scope unless a real problem appears.
